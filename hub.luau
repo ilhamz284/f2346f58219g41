@@ -26,7 +26,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.11",
+	version = "0.4.12",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -387,8 +387,6 @@ local Factory = {
 	cycle = false,
 	seedId = nil,
 	seedName = nil,
-	storageWorld = type(_G.__HumanHubFactorySettings) == "table"
-		and _G.__HumanHubFactorySettings.storageWorld or nil,
 	baseId = nil,
 	baseName = nil,
 	baseLayer = nil,
@@ -1721,14 +1719,16 @@ local function factoryTreeRipe(W, x, y, seedId)
 	if tileId(x, y) ~= seedId or type(W.treeLook) ~= "function" then
 		return false
 	end
-	if not Factory.treeMap then
+	local key = y * W.w + x
+	local cached = Factory.treeMap and Factory.treeMap[key]
+	if not Factory.treeMap or type(cached) ~= "table" or cached.id ~= seedId then
+		Factory.treeMap = nil
 		local ok, upvalues = pcall(debug.getupvalues, W.treeLook)
 		if ok and type(upvalues) == "table" then
-			local key = y * W.w + x
 			for _, candidate in ipairs(upvalues) do
 				if type(candidate) == "table" then
 					local value = candidate[key]
-					if type(value) == "table" and value.id == seedId and type(value.ripe) == "boolean" then
+					if type(value) == "table" and value.id == seedId then
 						Factory.treeMap = candidate
 						break
 					end
@@ -1736,8 +1736,22 @@ local function factoryTreeRipe(W, x, y, seedId)
 			end
 		end
 	end
-	local tree = Factory.treeMap and Factory.treeMap[y * W.w + x]
+	local tree = Factory.treeMap and Factory.treeMap[key]
 	return type(tree) == "table" and tree.id == seedId and tree.ripe == true
+end
+
+local function factoryHasRipeTree(W, seedId)
+	for y = 0, (tonumber(W.h) or 60) - 1 do
+		local row = W.fg and W.fg[y]
+		if row then
+			for x = 0, (tonumber(W.w) or 100) - 1 do
+				if row[x] == seedId and factoryTreeRipe(W, x, y, seedId) then
+					return true
+				end
+			end
+		end
+	end
+	return false
 end
 
 local function factoryTarget(W, state, seedId, blocked, onlyKind)
@@ -1752,15 +1766,12 @@ local function factoryTarget(W, state, seedId, blocked, onlyKind)
 			if row then
 				for x = 0, (tonumber(W.w) or 100) - 1 do
 					local key = seedId .. ":" .. kind .. ":" .. y .. ":" .. x
-					if (not blocked[key] or blocked[key] < os.clock())
-						and (not blocked[seedId .. ":" .. kind .. ":floor:" .. y]
-							or blocked[seedId .. ":" .. kind .. ":floor:" .. y] < os.clock())
-						and not (kind == "plant" and Factory.cycle and x == Factory.workX and y == Factory.workY) then
+					if not blocked[key] or blocked[key] < os.clock() then
 						local suitable = kind == "harvest"
 							and row[x] == seedId and factoryTreeRipe(W, x, y, seedId)
 							or kind == "plant" and row[x] == 0 and Bind.solid(x, y + 1)
 						if suitable then
-							for _, standX in ipairs({ x - 1, x + 1 }) do
+							for _, standX in ipairs({ x, x - 1, x + 1 }) do
 								local standKey = keyOf(standX, y)
 								local distance = dist[standKey]
 								if distance and (not bestDistance or distance < bestDistance) then
@@ -1950,42 +1961,7 @@ local function factoryRoom(inv, itemId)
 	return ok and (tonumber(room) or 0) or 0
 end
 
-local function storageWorldName(value)
-	if type(value) ~= "string" then return nil end
-	local name = value:match("^%s*(.-)%s*$"):upper()
-	if #name < 2 or #name > 24 or not name:match("^[A-Z0-9_]+$") then return nil end
-	return name
-end
-
-local function factorySendToStorage(W, seedId)
-	local destination = storageWorldName(Factory.storageWorld)
-	if not destination then
-		setFactoryStatus("Factory: tile tanam penuh; isi nama world Display Box di pengaturan")
-		return false
-	end
-	if destination == W.name then
-		setFactoryStatus("Factory: world Display Box harus berbeda dari world farm")
-		return false
-	end
-	local transfer = {
-		kind = "factorySeedStorage",
-		phase = "deposit",
-		farmWorld = W.name,
-		storageWorld = destination,
-		seedId = seedId,
-		createdAt = os.time(),
-		phaseAt = os.time(),
-	}
-	_G.__HumanHubFactoryTransfer = transfer
-	Factory.stop("Factory: menuju " .. destination .. " untuk menyimpan seed")
-	local ok, result = pcall(W.enter, destination)
-	if not ok or result == false then
-		_G.__HumanHubFactoryTransfer = nil
-		setFactoryStatus("Factory: gagal masuk world Display Box")
-		return false
-	end
-	return true
-end
+local factoryStoreSeeds
 
 local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 	local blocks = factoryCount(inv, Factory.baseId)
@@ -2010,15 +1986,16 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 						Factory.harvested, factoryCount(inv, Factory.baseId)))
 				end
 			else
-				blocked[seedId .. ":harvest:" .. target.y .. ":" .. target.x] = os.clock() + 20
-				if reason == "path" then
-					blocked[seedId .. ":harvest:floor:" .. target.y] = os.clock() + 20
-				end
+			blocked[seedId .. ":harvest:" .. target.y .. ":" .. target.x] = os.clock() + 4
 			end
 			return 0.18
 		end
 		Factory.phase = "pnb"
-		setFactoryStatus(string.format("Factory: tidak ada tree matang yang terjangkau di world, PNB %d blok", blocks))
+		if factoryHasRipeTree(W, seedId) then
+			setFactoryStatus("Factory: tree matang ada, jalur panen sedang dicoba ulang; lanjut PNB")
+		else
+			setFactoryStatus(string.format("Factory: tidak ada tree matang yang terjangkau di world, PNB %d blok", blocks))
+		end
 		return 0.1
 	end
 
@@ -2057,16 +2034,9 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 						Factory.planted, factoryCount(inv, seedId)))
 				end
 			else
-				blocked[seedId .. ":plant:" .. target.y .. ":" .. target.x] = os.clock() + 20
-				if reason == "path" then
-					blocked[seedId .. ":plant:floor:" .. target.y] = os.clock() + 20
-				end
+			blocked[seedId .. ":plant:" .. target.y .. ":" .. target.x] = os.clock() + 4
 			end
 			return 0.18
-		end
-		if blocks <= 0 or seedFull then
-			if factorySendToStorage(W, seedId) then return 0.1 end
-			return 1
 		end
 		local ripe = factoryTarget(W, state, seedId, blocked, "harvest")
 		if ripe and not blockFull then
@@ -2078,6 +2048,16 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 			Factory.phase = "pnb"
 			setFactoryStatus("Factory: tile tanam penuh; kosongkan blok lewat PNB sebelum panen")
 			return 0.1
+		end
+		if blocks <= 0 or seedFull then
+			local stored, reason = factoryStoreSeeds(W, inv, state, seedId, gen)
+			if stored then
+				Factory.phase = "grow"
+				setFactoryStatus("Factory: seed tersimpan di Display Box; lanjut cek pohon dan blok")
+			else
+				Factory.stop("Factory: penyimpanan berhenti: " .. tostring(reason))
+			end
+			return 0.3
 		end
 		setFactoryStatus(string.format("Factory: menunggu tile tanam kosong (%d seed tersisa)", seeds))
 		collectDropsNearby(W, inv, state, 0.9)
@@ -2100,8 +2080,12 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 		Factory.stop("berhenti: seed, blok, dan pohon pilihan sudah habis")
 	else
 		Factory.phase = "grow"
-		setFactoryStatus(string.format("Factory: menunggu tree matang (panen %d, PNB %d, tanam %d)",
-			Factory.harvested, Factory.pnb, Factory.planted))
+		if factoryHasRipeTree(W, seedId) then
+			setFactoryStatus("Factory: tree matang terdeteksi, mencari jalur yang bisa dijangkau")
+		else
+			setFactoryStatus(string.format("Factory: menunggu %s matang (panen %d, PNB %d, tanam %d)",
+				Factory.seedName or "seed pilihan", Factory.harvested, Factory.pnb, Factory.planted))
+		end
 	end
 	collectDropsNearby(W, inv, state, 0.9)
 	return 1
@@ -2178,10 +2162,7 @@ local function startFactory()
 								setFactoryStatus(string.format("%s: panen %d, tanam %d (Y=%d)",
 										Factory.seedName, Factory.harvested, Factory.planted, currentFloor))
 							else
-								blocked[currentSeed .. ":" .. target.kind .. ":" .. target.y .. ":" .. target.x] = os.clock() + 20
-								if reason == "path" then
-									blocked[currentSeed .. ":" .. target.kind .. ":floor:" .. target.y] = os.clock() + 20
-								end
+								blocked[currentSeed .. ":" .. target.kind .. ":" .. target.y .. ":" .. target.x] = os.clock() + 4
 							end
 						end
 						task.wait(0.18)
@@ -2300,28 +2281,7 @@ end
 local factorySec = pnbTab:Section({ Title = "Auto Harvest & Auto Plant", Opened = true })
 factorySec:Paragraph({
 	Title = "Cara kerja",
-	Desc = "Pilih seed dari inventory. Factory panen, PNB, lalu tanam. Jika tile tanam penuh, seed disimpan ke Display Box di world tujuan.",
-})
-
-factorySec:Input({
-	Title = "World Display Box",
-	Desc = "World tujuan penyimpanan seed. Pasang Display Box di atas lantai yang bisa dijangkau bot.",
-	Placeholder = "Nama world tujuan",
-	Value = Factory.storageWorld or "",
-	Callback = function(value)
-		if type(value) == "string" and value:match("^%s*$") then
-			Factory.storageWorld = nil
-			_G.__HumanHubFactorySettings = { storageWorld = nil }
-			return
-		end
-		local name = storageWorldName(value)
-		if not name then
-			setFactoryStatus("World Display Box: gunakan 2-24 huruf, angka, atau _")
-			return
-		end
-		Factory.storageWorld = name
-		_G.__HumanHubFactorySettings = { storageWorld = name }
-	end,
+	Desc = "Pilih seed dari inventory. Factory panen, PNB, lalu tanam. Jika tile tanam penuh, seed disimpan ke Display Box yang bisa dijangkau di world ini.",
 })
 
 local seedValues, seedByLabel = Factory.seedOptions()
@@ -2411,7 +2371,7 @@ plantToggle = factorySec:Toggle({
 })
 cycleToggle = factorySec:Toggle({
 	Title = "Auto Factory",
-	Desc = "Urutan: harvest, PNB, plant. Jika tile tanam penuh, simpan seed ke Display Box di world tujuan lalu kembali.",
+	Desc = "Urutan: harvest, PNB, plant. Jika tile tanam penuh, simpan seed ke Display Box di world ini.",
 	Value = false,
 	Callback = function(on)
 		if not Factory.syncingUI then
@@ -2479,14 +2439,10 @@ local function nearestDisplayBox(W, state)
 	return best
 end
 
-local function factoryDepositSeeds(transfer)
-	local W, inv = Bind.W, Bind.inv
+factoryStoreSeeds = function(W, inv, state, seedId, gen)
 	local alive = function()
-		return _G.__HumanHub == Hub and _G.__HumanHubFactoryTransfer == transfer
-			and W.name == transfer.storageWorld
+		return factoryAlive(gen) and W.name == Bind.name
 	end
-	local state = Bind.state()
-	if not state or not state.grounded then return false, "karakter belum siap" end
 	local box = nearestDisplayBox(W, state)
 	if not box then return false, "tidak ada Display Box (id 1422) yang bisa dijangkau" end
 	setFactoryStatus(string.format("Factory: menuju Display Box (%d,%d)", box.x, box.y))
@@ -2499,101 +2455,36 @@ local function factoryDepositSeeds(transfer)
 	end
 	if type(W.displayPut) ~= "function" then return false, "fungsi Display Box tidak tersedia" end
 	for _ = 1, 20 do
-		if not alive() then return false, "world berubah saat menyimpan seed" end
-		local remaining = factoryCount(inv, transfer.seedId)
+		if not alive() then return false, "Factory dihentikan saat menyimpan seed" end
+		local remaining = factoryCount(inv, seedId)
 		if remaining <= 0 then return true end
-		local beforeBox = seedCountInDisplay(W, box.x, box.y, transfer.seedId)
+		local beforeBox = seedCountInDisplay(W, box.x, box.y, seedId)
 		if beforeBox == nil then return false, "isi Display Box tidak terbaca" end
-		local called, err = pcall(W.displayPut, box.x, box.y, transfer.seedId, remaining, box.x + 0.5)
-		if not called then return false, "gagal mengirim seed ke Display Box: " .. tostring(err) end
+		local called, err = pcall(W.displayPut, box.x, box.y, seedId, remaining, box.x + 0.5)
+		if not called then return false, "gagal mengirim seed: " .. tostring(err) end
 		local deadline = os.clock() + 8
 		local confirmed = false
 		while alive() and os.clock() < deadline do
-			local afterBox = seedCountInDisplay(W, box.x, box.y, transfer.seedId)
+			local afterBox = seedCountInDisplay(W, box.x, box.y, seedId)
 			if afterBox and afterBox > beforeBox then
 				confirmed = true
 				break
 			end
 			task.wait(0.15)
 		end
-		if not confirmed then return false, "server belum mengonfirmasi seed masuk Display Box" end
-		setFactoryStatus(string.format("Factory: seed tersimpan di Display Box; sisa %d",
-			factoryCount(inv, transfer.seedId)))
+		if not confirmed then
+			if factoryCount(inv, seedId) >= remaining then
+				return false, "server menolak Display Box; akun perlu level 10 atau Discord terverifikasi"
+			end
+			return false, "server belum mengonfirmasi seed masuk Display Box"
+		end
+		setFactoryStatus(string.format("Factory: seed masuk Display Box; sisa %d", factoryCount(inv, seedId)))
 		task.wait(0.35)
 	end
 	return false, "batas percobaan Display Box tercapai"
 end
 
-local function factoryResumeTransfer(transfer)
-	if type(transfer) ~= "table" or transfer.kind ~= "factorySeedStorage"
-		or not storageWorldName(transfer.farmWorld)
-		or not storageWorldName(transfer.storageWorld)
-		or type(transfer.seedId) ~= "number" then
-		_G.__HumanHubFactoryTransfer = nil
-		return
-	end
-	if os.time() - (tonumber(transfer.createdAt) or 0) > 1800 then
-		_G.__HumanHubFactoryTransfer = nil
-		setFactoryStatus("Factory: perpindahan penyimpanan kedaluwarsa")
-		return
-	end
-	Bind.resolve(true)
-	local W = Bind.W
-	if not W then return end
-	if transfer.phase == "deposit" and W.name == transfer.storageWorld then
-		local state = Bind.state()
-		if not state or not state.grounded then return end
-		local success, reason = factoryDepositSeeds(transfer)
-		if not success then
-			if _G.__HumanHubFactoryTransfer == transfer then
-				_G.__HumanHubFactoryTransfer = nil
-				Move.release()
-				setFactoryStatus("Factory: penyimpanan berhenti: " .. tostring(reason))
-			end
-			return
-		end
-		transfer.phase = "return"
-		transfer.phaseAt = os.time()
-		setFactoryStatus("Factory: seed tersimpan; kembali ke " .. transfer.farmWorld)
-		local ok, result = pcall(W.enter, transfer.farmWorld)
-		if not ok or result == false then
-			_G.__HumanHubFactoryTransfer = nil
-			setFactoryStatus("Factory: gagal kembali ke world farm")
-		end
-	elseif transfer.phase == "return" and W.name == transfer.farmWorld then
-		local state = Bind.state()
-		if not state or not state.grounded then return end
-		Factory.seedId = transfer.seedId
-		Factory.storageWorld = transfer.storageWorld
-		refreshSeedDropdown()
-		Factory.setMode("cycle", true)
-		if Factory.running then
-			_G.__HumanHubFactoryTransfer = nil
-			setFactoryStatus("Factory: kembali dari Display Box; lanjut harvest/PNB")
-		end
-	elseif (transfer.phase == "deposit" or transfer.phase == "return")
-		and os.time() - (tonumber(transfer.phaseAt) or tonumber(transfer.createdAt) or 0) > 60 then
-		_G.__HumanHubFactoryTransfer = nil
-		setFactoryStatus("Factory: pindah world terlalu lama; transfer dihentikan")
-	end
-end
-
-task.spawn(function()
-	local busy = false
-	while _G.__HumanHub == Hub do
-		task.wait(0.5)
-		local transfer = _G.__HumanHubFactoryTransfer
-		if transfer and not busy then
-			busy = true
-			local ok, err = pcall(factoryResumeTransfer, transfer)
-			if not ok then
-				log("Factory transfer error: " .. tostring(err))
-				setFactoryStatus("Factory: error saat pindah world (lihat console)")
-			end
-			busy = false
-		end
-	end
-end)
+Factory.storeSeeds = factoryStoreSeeds
 
 -- ---- Tab Dirt Farm ----
 local farmSec = farmTab:Section({ Title = "Auto Dirt Farm", Opened = true })
@@ -2670,7 +2561,6 @@ farmSec:Button({
 	Title = "Stop & lepas semua tombol",
 	Desc = "Menghentikan bot dan memastikan A/D/Space tidak tertahan.",
 	Callback = function()
-		_G.__HumanHubFactoryTransfer = nil
 		Farm.stop("dihentikan manual")
 		PNB.stop("dihentikan manual")
 		Factory.stop("dihentikan manual")
