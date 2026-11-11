@@ -26,7 +26,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.12",
+	version = "0.4.13",
 	conns = {},
 	unload = {},
 	ui = {},
