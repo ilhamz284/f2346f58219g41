@@ -26,7 +26,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.2",
+	version = "0.4.3",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -1363,7 +1363,7 @@ function Factory.seedOptions()
 		byLabel[label] = row.id
 	end
 	if #values == 1 then
-		table.insert(values, "Tidak ada seed di inventory")
+		table.insert(values, inv and items and "Tidak ada seed di inventory" or "Memuat daftar seed...")
 	end
 	return values, byLabel
 end
@@ -1942,29 +1942,49 @@ local seedDropdown = factorySec:Dropdown({
 	end,
 })
 
+local function refreshSeedDropdown(values, byLabel)
+	if not values then
+		values, byLabel = Factory.seedOptions()
+	end
+	seedByLabel = byLabel
+	local selected = seedPlaceholder
+	for _, label in ipairs(values) do
+		if Factory.seedId and byLabel[label] == Factory.seedId then
+			selected = label
+			break
+		end
+	end
+	seedDropdown:Refresh(values)
+	seedDropdown:Select(selected)
+	if Factory.cycle and Factory.running and byLabel[selected] ~= Factory.seedId then
+		Factory.stop("seed berubah; nyalakan Auto Factory lagi")
+	end
+	Factory.seedId = byLabel[selected]
+	local def = Factory.seedId and selectedItemDefinition(Factory.seedId)
+	Factory.seedName = def and def.name or nil
+end
+
 factorySec:Button({
 	Title = "Refresh daftar seed",
 	Desc = "Perbarui seed yang tersedia setelah inventory berubah.",
 	Callback = function()
-		local values, byLabel = Factory.seedOptions()
-		seedByLabel = byLabel
-		local selected = seedPlaceholder
-		for _, label in ipairs(values) do
-			if byLabel[label] == Factory.seedId then
-				selected = label
-				break
-			end
-		end
-		seedDropdown:Refresh(values)
-		seedDropdown:Select(selected)
-		if Factory.cycle and Factory.running and byLabel[selected] ~= Factory.seedId then
-			Factory.stop("seed berubah; nyalakan Auto Factory lagi")
-		end
-		Factory.seedId = byLabel[selected]
-		local def = Factory.seedId and selectedItemDefinition(Factory.seedId)
-		Factory.seedName = def and def.name or nil
+		refreshSeedDropdown()
 	end,
 })
+
+task.spawn(function()
+	for _ = 1, 15 do
+		task.wait(2)
+		if _G.__HumanHub ~= Hub then
+			return
+		end
+		local values, byLabel = Factory.seedOptions()
+		if next(byLabel) then
+			refreshSeedDropdown(values, byLabel)
+			return
+		end
+	end
+end)
 
 local harvestToggle, plantToggle, cycleToggle
 harvestToggle = factorySec:Toggle({
