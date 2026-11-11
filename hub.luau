@@ -1,6 +1,6 @@
 --// ============================================================
 --// Human Hub
---// Script hub dengan pergerakan seperti manusia (tanpa teleport/goTo).
+--// Script hub dengan gerak tombol; navigasi lintas lantai memakai goTo per tile bila jalur jalan terputus.
 --// Fitur #1 : Auto Dirt Farm - menggali lorong 1 block di atas lantai
 --//            (foreground + cave background), menyisir map bolak-balik
 --//            lalu turun satu lantai lewat poros di tepi, sampai jadi
@@ -13,7 +13,7 @@
 --//
 --// Prinsip gerak:
 --//   - semua gerak lewat keypress A/D + Space (VirtualInputManager)
---//   - tidak pernah memanggil world.goTo / teleport
+--//   - factory memakai world.goTo hanya untuk rute poros yang tak bisa dilalui pathfinder lantai
 --//   - ada waktu reaksi, jeda acak, dan micropause seperti orang main
 --//   - berhenti dulu sebelum memukul tile, lalu lanjut jalan
 --//
@@ -26,7 +26,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.5",
+	version = "0.4.6",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -1514,6 +1514,32 @@ function Path.explore(sx, sy, maxNodes)
 	return dist, parent
 end
 
+-- Jalur cadangan melalui ruang kosong, termasuk poros vertikal di tepi world.
+function Path.airExplore(sx, sy)
+	local W = Bind.getW()
+	if not W then return nil, nil end
+	local w, h = tonumber(W.w) or 100, tonumber(W.h) or 60
+	local start = keyOf(sx, sy)
+	local dist, parent = { [start] = 0 }, {}
+	local queue, head = { { x = sx, y = sy } }, 1
+	while head <= #queue do
+		local node = queue[head]
+		head += 1
+		for _, delta in ipairs({ { -1, 0 }, { 1, 0 }, { 0, -1 }, { 0, 1 } }) do
+			local nx, ny = node.x + delta[1], node.y + delta[2]
+			if nx >= 0 and nx < w and ny >= 0 and ny < h then
+				local k = keyOf(nx, ny)
+				if dist[k] == nil and not Bind.solid(nx, ny) then
+					dist[k] = dist[keyOf(node.x, node.y)] + 1
+					parent[k] = keyOf(node.x, node.y)
+					table.insert(queue, { x = nx, y = ny })
+				end
+			end
+		end
+	end
+	return dist, parent
+end
+
 function Path.reconstruct(parent, startKey, goalKey)
 	local path = {}
 	local k = goalKey
@@ -1620,6 +1646,44 @@ function Path.moveTo(tx, ty, aliveFn)
 	Move.release()
 	return false
 end
+
+function Path.airMoveTo(tx, ty, aliveFn)
+	local W = Bind.getW()
+	if not W or type(W.goTo) ~= "function" then return false end
+	Move.release()
+	for _ = 1, 3 do
+		if not aliveFn() then return false end
+		local state = Bind.state()
+		if not state then return false end
+		local sx, sy = math.floor(state.x), math.floor(state.y - 0.0001)
+		if sx == tx and sy == ty and state.grounded then return true end
+		local dist, parent = Path.airExplore(sx, sy)
+		if not dist or not dist[keyOf(tx, ty)] then return false end
+		local route = Path.reconstruct(parent, keyOf(sx, sy), keyOf(tx, ty))
+		local diverged = false
+		for _, step in ipairs(route) do
+			if not aliveFn() then return false end
+			local ok = pcall(W.goTo, step.x, step.y)
+			if not ok then return false end
+			task.wait(0.18)
+			local current = Bind.state()
+			if not current then return false end
+			if math.abs(current.x - (step.x + 0.5)) > 0.75
+				or math.abs(current.y - (step.y + 0.999)) > 0.75 then
+				diverged = true
+				break
+			end
+		end
+		if not diverged then
+			local arrived = Bind.state()
+			if arrived and math.floor(arrived.x) == tx
+				and math.floor(arrived.y - 0.0001) == ty and arrived.grounded then
+				return true
+			end
+		end
+	end
+	return false
+end
 local function factoryTreeRipe(W, x, y, seedId)
 	if tileId(x, y) ~= seedId or type(W.treeLook) ~= "function" then
 		return false
@@ -1645,7 +1709,8 @@ end
 
 local function factoryTarget(W, state, seedId, blocked, onlyKind)
 	local dist = Path.explore(math.floor(state.x), math.floor(state.y - 0.0001), 6000)
-	if not dist then
+	local airDist = Path.airExplore(math.floor(state.x), math.floor(state.y - 0.0001))
+	if not dist and not airDist then
 		return nil
 	end
 	local function closest(kind)
@@ -1662,7 +1727,11 @@ local function factoryTarget(W, state, seedId, blocked, onlyKind)
 							or kind == "plant" and row[x] == 0 and Bind.solid(x, y + 1)
 						if suitable then
 							for _, standX in ipairs({ x - 1, x + 1 }) do
-								local distance = dist[keyOf(standX, y)]
+								local standKey = keyOf(standX, y)
+								local distance = dist and dist[standKey]
+								if not distance and airDist and airDist[standKey] then
+									distance = 10000 + airDist[standKey]
+								end
 								if distance and (not bestDistance or distance < bestDistance) then
 									best = { kind = kind, x = x, y = y, standX = standX, standY = y }
 									bestDistance = distance
@@ -1695,9 +1764,11 @@ local function factoryTarget(W, state, seedId, blocked, onlyKind)
 end
 
 local function factoryWork(W, inv, target, seedId, gen)
-	if not Path.moveTo(target.standX, target.standY, function()
+	local alive = function()
 		return factoryAlive(gen) and W.name == Bind.name
-	end) then
+	end
+	if not Path.moveTo(target.standX, target.standY, alive)
+		and not Path.airMoveTo(target.standX, target.standY, alive) then
 		return false
 	end
 	local arrived = Bind.state()
@@ -1755,7 +1826,8 @@ end
 
 local function factoryWorkSpot(W, state)
 	local dist = Path.explore(math.floor(state.x), math.floor(state.y - 0.0001), 6000)
-	if not dist then return nil end
+	local airDist = Path.airExplore(math.floor(state.x), math.floor(state.y - 0.0001))
+	if not dist and not airDist then return nil end
 	local bestX, bestStandX, bestY, bestDistance
 	for y = 0, (tonumber(W.h) or 60) - 2 do
 		for x = 0, (tonumber(W.w) or 100) - 1 do
@@ -1763,7 +1835,11 @@ local function factoryWorkSpot(W, state)
 				and (Factory.baseLayer ~= "bg" or bgId(x, y) == 0) then
 				local candidates = Factory.baseAtSelf and { x } or { x - 1, x + 1 }
 				for _, standX in ipairs(candidates) do
-					local distance = dist[keyOf(standX, y)]
+					local standKey = keyOf(standX, y)
+					local distance = dist and dist[standKey]
+					if not distance and airDist and airDist[standKey] then
+						distance = 10000 + airDist[standKey]
+					end
 					if distance and (not bestDistance or distance < bestDistance) then
 						bestX, bestStandX, bestY, bestDistance = x, standX, y, distance
 					end
@@ -1791,9 +1867,10 @@ local function factoryPNBOne(W, inv, gen)
 	if not x or not standX or not y then
 		return false
 	end
-	if not Path.moveTo(standX, y, function()
+	local alive = function()
 		return factoryAlive(gen) and W.name == Bind.name
-	end) then
+	end
+	if not Path.moveTo(standX, y, alive) and not Path.airMoveTo(standX, y, alive) then
 		return false
 	end
 	local arrived = Bind.state()
@@ -2436,7 +2513,7 @@ moveSec:Button({
 
 moveSec:Paragraph({
 	Title = "Cara kerja",
-	Desc = "Semua gerak memakai keypress A/D dan Space. Tidak ada goTo/teleport. Bot berhenti dulu sebelum memukul, lalu jalan lagi. Jeda dan waktu reaksi diacak supaya tidak polanya tetap.",
+	Desc = "Gerak biasa memakai A/D dan Space. Saat factory perlu melewati poros antar lantai, navigasi cadangan bergerak satu tile setiap 0,18 detik.",
 })
 
 -- ---- Penjaga world ----
@@ -2631,6 +2708,7 @@ Hub.debug = {
 	Factory = Factory,
 	Dig = Dig,
 	Place = Place,
+	Path = Path,
 	startFarm = startFarm,
 	startPNB = startPNB,
 	startFactory = startFactory,
