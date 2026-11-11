@@ -26,7 +26,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.13",
+	version = "0.4.14",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -2402,6 +2402,9 @@ Factory.onMode = function()
 		pcall(cycleToggle.Set, cycleToggle, Factory.cycle)
 	end
 	Factory.syncingUI = false
+	if Factory.onCycleChanged then
+		pcall(Factory.onCycleChanged, Factory.running and Factory.cycle)
+	end
 end
 
 local function seedCountInDisplay(W, x, y, seedId)
@@ -2729,16 +2732,18 @@ local function randomWorldName()
 	return table.concat(letters)
 end
 
-guardSec:Toggle({
-	Title = "Auto keluar / ban pemain",
-	Desc = "Staf grup masuk: pindah ke world acak 7 huruf. Pemain biasa baru masuk: kirim /ban jika punya akses world.",
-	Value = false,
-	Callback = function(on)
-		Guard.enabled = on
-		Guard.world, Guard.seen, Guard.baseline, Guard.busy = nil, {}, false, false
-		guardMessage(on and "memantau pemain di world" or "nonaktif")
-	end,
+guardSec:Paragraph({
+	Title = "Mengikuti Auto Factory",
+	Desc = "Aktif selama Auto Factory berjalan. Staf grup: keluar ke world acak; pemain biasa baru: /ban bila punya akses world.",
 })
+
+Factory.onCycleChanged = function(on)
+	if Guard.enabled == on then return end
+	Guard.enabled = on
+	Guard.world, Guard.seen, Guard.baseline, Guard.busy = nil, {}, false, false
+	guardMessage(on and "memantau pemain selama Auto Factory berjalan" or "nonaktif")
+end
+Factory.onCycleChanged(Factory.running and Factory.cycle)
 
 task.spawn(function()
 	while _G.__HumanHub == Hub do
@@ -2766,12 +2771,11 @@ task.spawn(function()
 							if Factory.running then Factory.stop("staf masuk world") end
 							local destination = randomWorldName()
 							guardMessage("staf terdeteksi; pindah ke " .. destination)
-							local called, result = false, false
+						local called = false
 							if type(W.enter) == "function" then
-								called, result = pcall(W.enter, destination)
+							called = pcall(W.enter, destination)
 							end
-							local moved = called and result ~= false
-							if not moved then
+						if not called then
 								guardMessage("gagal pindah world; bot dihentikan")
 								Guard.enabled = false
 							end
