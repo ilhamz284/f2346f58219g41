@@ -26,7 +26,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.4",
+	version = "0.4.5",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -401,6 +401,7 @@ local Factory = {
 	baseLayer = nil,
 	baseAtSelf = nil,
 	workX = nil,
+	workY = nil,
 	workStandX = nil,
 	pnb = 0,
 	phase = "idle",
@@ -1372,6 +1373,253 @@ local function factoryAlive(gen)
 	return Factory.running and Factory.gen == gen
 end
 
+--// ===== 5. PATHFINDER TILE (JALAN / LOMPAT / JATUH) =====
+-- Dipakai factory untuk menjangkau seluruh world, bukan cuma 1 baris.
+local Path = {}
+
+local function keyOf(x, y)
+	return y * 1000 + x
+end
+
+function Path.standable(x, y)
+	local W = Bind.getW()
+	if not W then
+		return false
+	end
+	local w = tonumber(W.w) or 100
+	local h = tonumber(W.h) or 60
+	if x < 0 or x >= w or y < 0 or y >= h - 1 then
+		return false
+	end
+	return (not Bind.solid(x, y)) and Bind.solid(x, y + 1)
+end
+
+-- Dijkstra kecil dari tile pemain. Hasil: dist[key], parent[key].
+-- Biaya: jalan 1, jatuh = jarak jatuh, lompat = 2 + |dx| + tinggi.
+function Path.explore(sx, sy, maxNodes)
+	local W = Bind.getW()
+	if not W then
+		return nil, nil
+	end
+	local w = tonumber(W.w) or 100
+	local h = tonumber(W.h) or 60
+	maxNodes = maxNodes or 2500
+
+	local solidCache = {}
+	local function isSolid(x, y)
+		if x < 0 or x >= w or y < 0 or y >= h then
+			return true
+		end
+		local k = keyOf(x, y)
+		local v = solidCache[k]
+		if v == nil then
+			v = Bind.solid(x, y)
+			solidCache[k] = v
+		end
+		return v
+	end
+	local function canStand(x, y)
+		if x < 0 or x >= w or y < 0 or y >= h - 1 then
+			return false
+		end
+		return (not isSolid(x, y)) and isSolid(x, y + 1)
+	end
+
+	local dist, parent = {}, {}
+	local startKey = keyOf(sx, sy)
+	dist[startKey] = 0
+	local open = {}
+	local visited = {}
+	local count = 0
+	local function enqueue(node)
+		local i = #open + 1
+		while i > 1 do
+			local parentIndex = math.floor(i / 2)
+			if open[parentIndex].c <= node.c then break end
+			open[i] = open[parentIndex]
+			i = parentIndex
+		end
+		open[i] = node
+	end
+	local function dequeue()
+		local first = open[1]
+		local last = table.remove(open)
+		if #open > 0 then
+			local i = 1
+			while i * 2 <= #open do
+				local child = i * 2
+				if child < #open and open[child + 1].c < open[child].c then child += 1 end
+				if last.c <= open[child].c then break end
+				open[i] = open[child]
+				i = child
+			end
+			open[i] = last
+		end
+		return first
+	end
+	enqueue({ x = sx, y = sy, c = 0, key = startKey })
+
+	local function push(cx, cy, cc, nx, ny, cost)
+		if nx < 0 or nx >= w or ny < 0 or ny >= h - 1 then
+			return
+		end
+		if not canStand(nx, ny) then
+			return
+		end
+		local k = keyOf(nx, ny)
+		local nc = cc + cost
+		if dist[k] == nil or nc < dist[k] then
+			dist[k] = nc
+			parent[k] = keyOf(cx, cy)
+			enqueue({ x = nx, y = ny, c = nc, key = k })
+		end
+	end
+
+	while #open > 0 and count < maxNodes do
+		local cur = dequeue()
+		if not visited[cur.key] then
+			visited[cur.key] = true
+			count += 1
+			local cx, cy, cc = cur.x, cur.y, cur.c
+
+			-- jalan kiri/kanan
+			push(cx, cy, cc, cx - 1, cy, 1)
+			push(cx, cy, cc, cx + 1, cy, 1)
+
+			-- jatuh lurus ke bawah
+			for ny = cy + 1, h - 2 do
+				if isSolid(cx, ny) then
+					break
+				end
+				if canStand(cx, ny) then
+					push(cx, cy, cc, cx, ny, ny - cy)
+					break
+				end
+			end
+
+			-- lompat naik 1..3 tile, geser 0..2 tile
+			if not isSolid(cx, cy - 1) then
+				for up = 1, 3 do
+					for dx = -2, 2 do
+						local nx, ny = cx + dx, cy - up
+						-- kepala di titik lompat dan titik mendarat harus kosong
+						if not isSolid(nx, ny - 1) then
+							push(cx, cy, cc, nx, ny, 2 + math.abs(dx) + up)
+						end
+					end
+				end
+			end
+		end
+	end
+	return dist, parent
+end
+
+function Path.reconstruct(parent, startKey, goalKey)
+	local path = {}
+	local k = goalKey
+	local guard = 0
+	while k and k ~= startKey and guard < 500 do
+		guard += 1
+		local x = k % 1000
+		local y = math.floor(k / 1000)
+		table.insert(path, 1, { x = x, y = y })
+		k = parent[k]
+	end
+	return path
+end
+
+-- Gerak menyusuri satu langkah jalur.
+local function pathStep(cx, cy, step, aliveFn)
+	if step.y == cy then
+		Move.walkTo(step.x + 0.5, { timeout = 6, tol = 0.35 })
+		return true
+	elseif step.y > cy then
+		-- jatuh: jalan ke kolom lubang, lalu tunggu sampai turun
+		Move.walkTo(step.x + 0.5, { timeout = 6, tol = 0.35 })
+		local t0 = os.clock()
+		while os.clock() - t0 < 2.5 and aliveFn() do
+			local s = Bind.state()
+			if not s then
+				break
+			end
+			if math.floor(s.y - 0.0001) > cy then
+				return true
+			end
+			task.wait(0.04)
+		end
+		return true
+	else
+		-- lompat naik
+		if step.x ~= cx then
+			Move.hold(step.x > cx and KeyRight or KeyLeft)
+		else
+			Move.release()
+		end
+		task.wait(rnd(0.03, 0.08))
+		Move.jump()
+		local t0 = os.clock()
+		while os.clock() - t0 < 1.3 and aliveFn() do
+			local s = Bind.state()
+			if not s then
+				break
+			end
+			if math.floor(s.y - 0.0001) <= step.y and s.grounded then
+				break
+			end
+			task.wait(0.03)
+		end
+		Move.release()
+		return true
+	end
+end
+
+-- Jalan ke tile (tx, ty). Return true kalau sampai.
+function Path.moveTo(tx, ty, aliveFn)
+	aliveFn = aliveFn or function()
+		return true
+	end
+	local goalKey = keyOf(tx, ty)
+	local path, idx, expect = nil, 1, nil
+	for _ = 1, 400 do
+		if not aliveFn() then
+			Move.release()
+			return false
+		end
+		local s = Bind.state()
+		if not s then
+			Move.release()
+			return false
+		end
+		local cx, cy = math.floor(s.x), math.floor(s.y - 0.0001)
+		if cx == tx and cy == ty and s.grounded then
+			Move.release()
+			return true
+		end
+		if path and expect and (cx ~= expect.x or cy ~= expect.y) then
+			path = nil
+		end
+		if not path then
+			local dist, parent = Path.explore(cx, cy, 6000)
+			if not dist or dist[goalKey] == nil then
+				Move.release()
+				return false
+			end
+			path = Path.reconstruct(parent, keyOf(cx, cy), goalKey)
+			idx = 1
+		end
+		local step = path[idx]
+		if not step then
+			Move.release()
+			return true
+		end
+		pathStep(cx, cy, step, aliveFn)
+		expect = { x = step.x, y = step.y }
+		idx += 1
+		task.wait(0.04)
+	end
+	Move.release()
+	return false
+end
 local function factoryTreeRipe(W, x, y, seedId)
 	if tileId(x, y) ~= seedId or type(W.treeLook) ~= "function" then
 		return false
@@ -1395,50 +1643,31 @@ local function factoryTreeRipe(W, x, y, seedId)
 	return type(tree) == "table" and tree.id == seedId and tree.ripe == true
 end
 
-local function factoryStandX(state, floorY, targetX)
-	local rowY = floorY - 1
-	local bestX, bestDistance
-	for _, standX in ipairs({ targetX - 1, targetX + 1 }) do
-		if standX >= 0 and standX < (tonumber(Bind.W.w) or 100)
-			and Bind.solid(standX, floorY) and not Bind.solid(standX, rowY) then
-			local clear = true
-			for x = math.min(math.floor(state.x), standX), math.max(math.floor(state.x), standX) do
-				if not Bind.solid(x, floorY) or Bind.solid(x, rowY) then
-					clear = false
-					break
-				end
-			end
-			local distance = math.abs(standX + 0.5 - state.x)
-			if clear and (not bestDistance or distance < bestDistance) then
-				bestX, bestDistance = standX, distance
-			end
-		end
-	end
-	return bestX
-end
-
-local function factoryTarget(W, state, floorY, seedId, blocked, onlyKind)
-	local y = floorY - 1
-	local row = W.fg and W.fg[y]
-	if not row then
+local function factoryTarget(W, state, seedId, blocked, onlyKind)
+	local dist = Path.explore(math.floor(state.x), math.floor(state.y - 0.0001), 6000)
+	if not dist then
 		return nil
 	end
 	local function closest(kind)
 		local best, bestDistance
-		for x = 0, (tonumber(W.w) or 100) - 1 do
-			local key = seedId .. ":" .. kind .. x
-			if (not blocked[key] or blocked[key] < os.clock())
-				and not (kind == "plant" and Factory.cycle and x == Factory.workX) then
-				local suitable = kind == "harvest"
-					and row[x] == seedId and factoryTreeRipe(W, x, y, seedId)
-					or kind == "plant" and row[x] == 0 and Bind.solid(x, floorY)
-				if suitable then
-					local standX = factoryStandX(state, floorY, x)
-					if standX then
-						local distance = math.abs(standX + 0.5 - state.x)
-						if not bestDistance or distance < bestDistance then
-							best = { kind = kind, x = x, y = y, standX = standX }
-							bestDistance = distance
+		for y = 0, (tonumber(W.h) or 60) - 2 do
+			local row = W.fg and W.fg[y]
+			if row then
+				for x = 0, (tonumber(W.w) or 100) - 1 do
+					local key = seedId .. ":" .. kind .. ":" .. y .. ":" .. x
+					if (not blocked[key] or blocked[key] < os.clock())
+						and not (kind == "plant" and Factory.cycle and x == Factory.workX and y == Factory.workY) then
+						local suitable = kind == "harvest"
+							and row[x] == seedId and factoryTreeRipe(W, x, y, seedId)
+							or kind == "plant" and row[x] == 0 and Bind.solid(x, y + 1)
+						if suitable then
+							for _, standX in ipairs({ x - 1, x + 1 }) do
+								local distance = dist[keyOf(standX, y)]
+								if distance and (not bestDistance or distance < bestDistance) then
+									best = { kind = kind, x = x, y = y, standX = standX, standY = y }
+									bestDistance = distance
+								end
+							end
 						end
 					end
 				end
@@ -1466,10 +1695,9 @@ local function factoryTarget(W, state, floorY, seedId, blocked, onlyKind)
 end
 
 local function factoryWork(W, inv, target, seedId, gen)
-	local walkX = target.standX + 0.5
-	local state = Bind.state()
-	local timeout = math.min(30, math.abs(walkX - state.x) / 5 + 5)
-	if not Move.walkTo(walkX, { timeout = timeout, tol = 0.32 }) then
+	if not Path.moveTo(target.standX, target.standY, function()
+		return factoryAlive(gen) and W.name == Bind.name
+	end) then
 		return false
 	end
 	local arrived = Bind.state()
@@ -1525,32 +1753,28 @@ local function factoryCount(inv, itemId)
 	return ok and (tonumber(count) or 0) or 0
 end
 
-local function factoryWorkSpot(W, state, floorY)
-	local y = floorY - 1
-	local bestX, bestStandX, bestDistance
-	for x = 0, (tonumber(W.w) or 100) - 1 do
-		if tileId(x, y) == 0 and Bind.solid(x, floorY)
-			and (Factory.baseLayer ~= "bg" or bgId(x, y) == 0) then
-			local standX = Factory.baseAtSelf and x or factoryStandX(state, floorY, x)
-			if standX and not Bind.solid(standX, y) then
-				local clear = true
-				for px = math.min(math.floor(state.x), standX), math.max(math.floor(state.x), standX) do
-					if not Bind.solid(px, floorY) or Bind.solid(px, y) then
-						clear = false
-						break
+local function factoryWorkSpot(W, state)
+	local dist = Path.explore(math.floor(state.x), math.floor(state.y - 0.0001), 6000)
+	if not dist then return nil end
+	local bestX, bestStandX, bestY, bestDistance
+	for y = 0, (tonumber(W.h) or 60) - 2 do
+		for x = 0, (tonumber(W.w) or 100) - 1 do
+			if tileId(x, y) == 0 and Bind.solid(x, y + 1)
+				and (Factory.baseLayer ~= "bg" or bgId(x, y) == 0) then
+				local candidates = Factory.baseAtSelf and { x } or { x - 1, x + 1 }
+				for _, standX in ipairs(candidates) do
+					local distance = dist[keyOf(standX, y)]
+					if distance and (not bestDistance or distance < bestDistance) then
+						bestX, bestStandX, bestY, bestDistance = x, standX, y, distance
 					end
-				end
-				local distance = math.abs(standX + 0.5 - state.x)
-				if clear and (not bestDistance or distance < bestDistance) then
-					bestX, bestStandX, bestDistance = x, standX, distance
 				end
 			end
 		end
 	end
-	return bestX, bestStandX
+	return bestX, bestStandX, bestY
 end
 
-local function factoryPNBOne(W, inv, floorY, gen)
+local function factoryPNBOne(W, inv, gen)
 	local baseId = Factory.baseId
 	if factoryCount(inv, baseId) < 1 then
 		return false
@@ -1559,22 +1783,21 @@ local function factoryPNBOne(W, inv, floorY, gen)
 	if not s then
 		return false
 	end
-	local x, standX = Factory.workX, Factory.workStandX
-	local y = floorY - 1
-	if not x or pnbTileId(W, Factory.baseLayer, x, y) ~= 0 or tileId(x, y) ~= 0 then
-		x, standX = factoryWorkSpot(W, s, floorY)
-		Factory.workX, Factory.workStandX = x, standX
+	local x, standX, y = Factory.workX, Factory.workStandX, Factory.workY
+	if not x or not y or pnbTileId(W, Factory.baseLayer, x, y) ~= 0 or tileId(x, y) ~= 0 then
+		x, standX, y = factoryWorkSpot(W, s)
+		Factory.workX, Factory.workStandX, Factory.workY = x, standX, y
 	end
-	if not x or not standX then
+	if not x or not standX or not y then
 		return false
 	end
-	local walkX = standX + 0.5
-	local timeout = math.min(30, math.abs(walkX - s.x) / 5 + 5)
-	if not Move.walkTo(walkX, { timeout = timeout, tol = 0.3 }) then
+	if not Path.moveTo(standX, y, function()
+		return factoryAlive(gen) and W.name == Bind.name
+	end) then
 		return false
 	end
 	local arrived = Bind.state()
-	if not factoryAlive(gen) or not arrived or standingFloor(arrived) ~= floorY
+	if not factoryAlive(gen) or not arrived or standingFloor(arrived) ~= y + 1
 		or pnbTileId(W, Factory.baseLayer, x, y) ~= 0 or tileId(x, y) ~= 0 then
 		return false
 	end
@@ -1598,19 +1821,21 @@ local function factoryPNBOne(W, inv, floorY, gen)
 	end
 	Factory.pnb += 1
 	task.wait(0.3)
-	if factoryAlive(gen) and not Factory.baseAtSelf and Bind.solid(x, floorY) then
+	if factoryAlive(gen) and not Factory.baseAtSelf and Bind.solid(x, y + 1) then
 		Move.walkTo(x + 0.5, { timeout = 3, tol = 0.28 })
 	end
 	collectDropsNearby(W, inv, Bind.state(), 0.9)
 	return true
 end
 
-local function factoryHasTrees(W, floorY, seedId)
-	local row = W.fg and W.fg[floorY - 1]
-	if row then
-		for x = 0, (tonumber(W.w) or 100) - 1 do
-			if row[x] == seedId then
-				return true
+local function factoryHasTrees(W, seedId)
+	for y = 0, (tonumber(W.h) or 60) - 1 do
+		local row = W.fg and W.fg[y]
+		if row then
+			for x = 0, (tonumber(W.w) or 100) - 1 do
+				if row[x] == seedId then
+					return true
+				end
 			end
 		end
 	end
@@ -1622,7 +1847,7 @@ local function factoryRoom(inv, itemId)
 	return ok and (tonumber(room) or 0) or 0
 end
 
-local function factoryCycleStep(W, inv, state, floorY, seedId, blocked, gen)
+local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 	local blocks = factoryCount(inv, Factory.baseId)
 	local seeds = factoryCount(inv, seedId)
 	local blockFull = blocks >= 200 or factoryRoom(inv, Factory.baseId) == 0
@@ -1634,7 +1859,7 @@ local function factoryCycleStep(W, inv, state, floorY, seedId, blocked, gen)
 			setFactoryStatus(string.format("Factory: blok penuh (%d), lanjut PNB", blocks))
 			return 0.1
 		end
-		local target = factoryTarget(W, state, floorY, seedId, blocked, "harvest")
+		local target = factoryTarget(W, state, seedId, blocked, "harvest")
 		if target then
 			if factoryWork(W, inv, target, seedId, gen) then
 				task.wait(0.25)
@@ -1644,12 +1869,12 @@ local function factoryCycleStep(W, inv, state, floorY, seedId, blocked, gen)
 						Factory.harvested, factoryCount(inv, Factory.baseId)))
 				end
 			else
-				blocked[seedId .. ":harvest" .. target.x] = os.clock() + 20
+				blocked[seedId .. ":harvest:" .. target.y .. ":" .. target.x] = os.clock() + 20
 			end
 			return 0.18
 		end
 		Factory.phase = "pnb"
-		setFactoryStatus(string.format("Factory: tidak ada tree matang, PNB %d blok", blocks))
+		setFactoryStatus(string.format("Factory: tidak ada tree matang yang terjangkau di world, PNB %d blok", blocks))
 		return 0.1
 	end
 
@@ -1659,13 +1884,13 @@ local function factoryCycleStep(W, inv, state, floorY, seedId, blocked, gen)
 			setFactoryStatus(string.format("Factory: PNB selesai | blok %d, seed %d; mulai tanam", blocks, seeds))
 			return 0.1
 		end
-		if factoryPNBOne(W, inv, floorY, gen) then
+		if factoryPNBOne(W, inv, gen) then
 			if factoryAlive(gen) then
 				setFactoryStatus(string.format("Factory: PNB %d | blok %d, seed %d",
 					Factory.pnb, factoryCount(inv, Factory.baseId), factoryCount(inv, seedId)))
 			end
 		else
-			Factory.workX, Factory.workStandX = nil, nil
+			Factory.workX, Factory.workStandX, Factory.workY = nil, nil, nil
 			if factoryAlive(gen) then
 				setFactoryStatus("Factory: mencari tile kerja PNB yang kosong")
 			end
@@ -1679,7 +1904,7 @@ local function factoryCycleStep(W, inv, state, floorY, seedId, blocked, gen)
 			setFactoryStatus("Factory: seed habis; cek tree dan sisa blok")
 			return 0.1
 		end
-		local target = factoryTarget(W, state, floorY, seedId, blocked, "plant")
+		local target = factoryTarget(W, state, seedId, blocked, "plant")
 		if target then
 			if factoryWork(W, inv, target, seedId, gen) then
 				if factoryAlive(gen) then
@@ -1687,11 +1912,11 @@ local function factoryCycleStep(W, inv, state, floorY, seedId, blocked, gen)
 						Factory.planted, factoryCount(inv, seedId)))
 				end
 			else
-				blocked[seedId .. ":plant" .. target.x] = os.clock() + 20
+				blocked[seedId .. ":plant:" .. target.y .. ":" .. target.x] = os.clock() + 20
 			end
 			return 0.18
 		end
-		local ripe = factoryTarget(W, state, floorY, seedId, blocked, "harvest")
+		local ripe = factoryTarget(W, state, seedId, blocked, "harvest")
 		if ripe and not blockFull then
 			Factory.phase = "harvest"
 			setFactoryStatus("Factory: tile tanam penuh; panen tree matang untuk membuka ruang")
@@ -1709,7 +1934,7 @@ local function factoryCycleStep(W, inv, state, floorY, seedId, blocked, gen)
 
 	-- Setelah seed habis, mulai lagi dari panen bila ada tree matang.
 	-- Jika belum ada, lanjut PNB sisa blok atau tunggu pohon tumbuh.
-	local ripe = factoryTarget(W, state, floorY, seedId, blocked, "harvest")
+	local ripe = factoryTarget(W, state, seedId, blocked, "harvest")
 	if ripe and not blockFull then
 		Factory.phase = "harvest"
 		setFactoryStatus("Factory: tree matang; mulai harvest lagi")
@@ -1719,7 +1944,7 @@ local function factoryCycleStep(W, inv, state, floorY, seedId, blocked, gen)
 	elseif seeds > 0 then
 		Factory.phase = "plant"
 		setFactoryStatus(string.format("Factory: tanam %d seed yang tersedia", seeds))
-	elseif not factoryHasTrees(W, floorY, seedId) and blocks <= 0 then
+	elseif not factoryHasTrees(W, seedId) and blocks <= 0 then
 		Factory.stop("berhenti: seed, blok, dan pohon pilihan sudah habis")
 	else
 		Factory.phase = "grow"
@@ -1773,9 +1998,9 @@ local function startFactory()
 	Factory.baseId, Factory.baseName = baseId, baseDef and baseDef.name or nil
 	Factory.baseLayer = baseDef and (baseDef.background == true and "bg" or "fg") or nil
 	Factory.baseAtSelf = baseDef and (baseDef.background == true or baseDef.solid == false) or nil
-	Factory.workX, Factory.workStandX = nil, nil
+	Factory.workX, Factory.workStandX, Factory.workY = nil, nil, nil
 	if Factory.cycle then
-		Factory.workX, Factory.workStandX = factoryWorkSpot(W, state, floorY)
+		Factory.workX, Factory.workStandX, Factory.workY = factoryWorkSpot(W, state)
 	end
 	local gen, worldName = Factory.gen, W.name
 	local blocked = {}
@@ -1784,23 +2009,24 @@ local function startFactory()
 		local ok, err = pcall(function()
 			while factoryAlive(gen) do
 				local s = Bind.state()
-				if not s or W.name ~= worldName or standingFloor(s) ~= floorY then
+				if not s or W.name ~= worldName or not standingFloor(s) then
 					Factory.stop("berhenti: posisi pemain atau world berubah")
 					break
 				end
 				local currentSeed = Factory.seedId
+				local currentFloor = standingFloor(s)
 				if Factory.cycle then
-					task.wait(factoryCycleStep(W, inv, s, floorY, currentSeed, blocked, gen))
+					task.wait(factoryCycleStep(W, inv, s, currentSeed, blocked, gen))
 				else
-					local target = factoryTarget(W, s, floorY, currentSeed, blocked)
+					local target = factoryTarget(W, s, currentSeed, blocked)
 					if target then
 						local worked = factoryWork(W, inv, target, currentSeed, gen)
 						if factoryAlive(gen) then
 							if worked then
 								setFactoryStatus(string.format("%s: panen %d, tanam %d (Y=%d)",
-										Factory.seedName, Factory.harvested, Factory.planted, floorY))
+										Factory.seedName, Factory.harvested, Factory.planted, currentFloor))
 							else
-								blocked[currentSeed .. ":" .. target.kind .. target.x] = os.clock() + 20
+								blocked[currentSeed .. ":" .. target.kind .. ":" .. target.y .. ":" .. target.x] = os.clock() + 20
 							end
 						end
 						task.wait(0.18)
@@ -1989,7 +2215,7 @@ end)
 local harvestToggle, plantToggle, cycleToggle
 harvestToggle = factorySec:Toggle({
 	Title = "Auto Harvest",
-	Desc = "Panen pohon matang dari seed yang dipilih pada lantai saat ini.",
+	Desc = "Panen pohon matang dari seed yang dipilih di seluruh world yang bisa dijangkau.",
 	Value = false,
 	Callback = function(on)
 		if not Factory.syncingUI then
