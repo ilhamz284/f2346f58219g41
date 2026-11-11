@@ -26,7 +26,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.16",
+	version = "0.4.18",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -1401,7 +1401,7 @@ function Path.standable(x, y)
 	end
 	local w = tonumber(W.w) or 100
 	local h = tonumber(W.h) or 60
-	if x < 0 or x >= w or y < 0 or y >= h - 1 then
+	if x < 0 or x >= w - 1 or y < 0 or y >= h - 1 then
 		return false
 	end
 	return (not Bind.solid(x, y)) and Bind.solid(x, y + 1)
@@ -1432,7 +1432,7 @@ function Path.explore(sx, sy, maxNodes)
 		return v
 	end
 	local function canStand(x, y)
-		if x < 0 or x >= w or y < 0 or y >= h - 1 then
+		if x < 0 or x >= w - 1 or y < 0 or y >= h - 1 then
 			return false
 		end
 		return (not isSolid(x, y)) and isSolid(x, y + 1)
@@ -1536,7 +1536,9 @@ function Path.explore(sx, sy, maxNodes)
 			if cy >= 2 then
 				for _, dir in ipairs({ -1, 1 }) do
 					local shaftX = cx + dir
-					if shaftX >= 0 and shaftX < w
+					-- Poros kanan ada di data tile, tetapi batas fisik world
+					-- menahan tubuh pemain sebelum titik lompatnya.
+					if shaftX >= 0 and shaftX < w - 1
 						and not isSolid(shaftX, cy - 1)
 						and not isSolid(shaftX, cy - 2)
 						and canStand(cx, cy - 2) then
@@ -1843,9 +1845,12 @@ local function factoryTarget(W, state, seedId, blocked, onlyKind)
 				for x = 0, (tonumber(W.w) or 100) - 1 do
 					local key = seedId .. ":" .. kind .. ":" .. y .. ":" .. x
 					if not blocked[key] or blocked[key] < os.clock() then
+						-- Kolom paling kanan terlihat kosong di peta, tetapi tubuh
+						-- pemain tertahan batas world sebelum bisa menanam di sana.
+						local edgeTile = kind == "plant" and x >= (tonumber(W.w) or 100) - 1
 						local reserved = Factory.cycle and kind == "plant"
 							and Factory.workX == x and Factory.workY == y
-						local suitable = not reserved and (kind == "harvest"
+						local suitable = not edgeTile and not reserved and (kind == "harvest"
 							and row[x] == seedId and factoryTreeRipe(W, x, y, seedId)
 							or kind == "plant" and row[x] == 0 and Bind.solid(x, y + 1))
 						if suitable then
@@ -1957,7 +1962,7 @@ local function factoryWorkSpot(W, state)
 	if not dist then return nil end
 	local bestX, bestStandX, bestY, bestDistance
 	for y = 0, (tonumber(W.h) or 60) - 2 do
-		for x = 0, (tonumber(W.w) or 100) - 1 do
+		for x = 0, (tonumber(W.w) or 100) - 2 do
 			if tileId(x, y) == 0 and Bind.solid(x, y + 1)
 				and (Factory.baseLayer ~= "bg" or bgId(x, y) == 0) then
 				local candidates = Factory.baseAtSelf and { x } or { x - 1, x + 1 }
@@ -2133,7 +2138,11 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 						Factory.planted, factoryCount(inv, seedId)))
 				end
 			else
-			blocked[seedId .. ":plant:" .. target.y .. ":" .. target.x] = os.clock() + 4
+				blocked[seedId .. ":plant:" .. target.y .. ":" .. target.x] = os.clock() + 10
+				if factoryAlive(gen) then
+					setFactoryStatus(string.format("Factory: gagal ke tile tanam X=%d Y=%d (%s); coba tile lain",
+						target.x, target.y, tostring(reason or "tile berubah")))
+				end
 			end
 			return 0.18
 		end
