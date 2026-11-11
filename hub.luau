@@ -14,7 +14,7 @@
 --// Prinsip gerak:
 --//   - semua gerak lewat keypress A/D + Space (VirtualInputManager)
 --//   - factory berjalan ke poros, jatuh, atau melompat dengan input game
---//   - ada waktu reaksi, jeda acak, dan micropause seperti orang main
+--//   - jalan lurus tetap mulus; jeda hanya saat berganti aksi
 --//   - berhenti dulu sebelum memukul tile, lalu lanjut jalan
 --//
 --// Catatan game (terverifikasi 2026):
@@ -26,7 +26,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.9",
+	version = "0.4.10",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -241,9 +241,6 @@ local Move = {
 	cfg = {
 		reactMin = 0.07,
 		reactMax = 0.18,
-		pauseChance = 0.14,
-		pauseMin = 0.08,
-		pauseMax = 0.28,
 	},
 }
 
@@ -291,19 +288,6 @@ function Move.idle(a, b)
 	task.wait(rnd(a, b))
 end
 
--- Jeda kecil acak: tombol dilepas sebentar lalu ditekan lagi. Ini yang
--- membuat jalannya tidak terlihat seperti mesin (konstan, presisi frame).
-function Move.microPause()
-	if Move.held and math.random() < Move.cfg.pauseChance then
-		local was = Move.held
-		Move.release()
-		Move.idle(Move.cfg.pauseMin, Move.cfg.pauseMax)
-		Move.hold(was)
-		return true
-	end
-	return false
-end
-
 function Move.stop()
 	Move.gen += 1
 	Move.release()
@@ -317,7 +301,9 @@ function Move.walkTo(targetX, opts)
 	local myGen = Move.gen
 	local lastX, lastT = nil, os.clock()
 
-	Move.idle(Move.cfg.reactMin, Move.cfg.reactMax)
+	if not Move.held then
+		Move.idle(Move.cfg.reactMin, Move.cfg.reactMax)
+	end
 
 	while Move.gen == myGen and os.clock() < deadline do
 		local s = Bind.state()
@@ -360,7 +346,6 @@ function Move.walkTo(targetX, opts)
 			end
 		end
 
-		Move.microPause()
 	end
 
 	Move.release()
@@ -740,7 +725,6 @@ local function sweepFloor(floorY, dir, gen)
 
 		if not worked then
 			Move.hold(dir > 0 and KeyRight or KeyLeft)
-			Move.microPause()
 		end
 
 		-- deteksi macet: posisi tidak berubah cukup lama (bisa karena blok
@@ -1694,6 +1678,23 @@ function Path.moveTo(tx, ty, aliveFn)
 			Move.release()
 			return true
 		end
+		local stepCount = 1
+		if step.kind == "walk" then
+			local direction = step.x > cx and 1 or -1
+			local endX = step.x
+			while path[idx + stepCount] do
+				local nextStep = path[idx + stepCount]
+				if nextStep.kind ~= "walk" or nextStep.y ~= cy
+					or nextStep.x ~= endX + direction then
+					break
+				end
+				endX = nextStep.x
+				stepCount += 1
+			end
+			if stepCount > 1 then
+				step = path[idx + stepCount - 1]
+			end
+		end
 		if not pathStep(cx, cy, step, aliveFn) then
 			Move.release()
 			local landed = Bind.state()
@@ -1707,8 +1708,7 @@ function Path.moveTo(tx, ty, aliveFn)
 			task.wait(0.3)
 		else
 			expect = { x = step.x, y = step.y }
-			idx += 1
-			task.wait(0.04)
+			idx += stepCount
 		end
 	end
 	Move.release()
@@ -2486,27 +2486,6 @@ moveSec:Slider({
 	Callback = function(v)
 		Move.cfg.reactMin = math.max(0.02, v - 0.03)
 		Move.cfg.reactMax = v + 0.04
-	end,
-})
-
-moveSec:Slider({
-	Title = "Peluang jeda saat jalan (%)",
-	Desc = "Semakin besar, semakin sering tombol dilepas sebentar (jalan jadi tidak kaku).",
-	Value = { Min = 0, Max = 40, Default = 14 },
-	Step = 1,
-	Callback = function(v)
-		Move.cfg.pauseChance = v / 100
-	end,
-})
-
-moveSec:Slider({
-	Title = "Lama jeda (detik)",
-	Desc = "Durasi micropause saat jalan.",
-	Value = { Min = 0.04, Max = 0.45, Default = 0.14 },
-	Step = 0.01,
-	Callback = function(v)
-		Move.cfg.pauseMin = math.max(0.03, v * 0.7)
-		Move.cfg.pauseMax = v + 0.06
 	end,
 })
 
