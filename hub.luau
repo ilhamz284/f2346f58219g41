@@ -26,7 +26,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.14",
+	version = "0.4.15",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -1525,6 +1525,20 @@ function Path.explore(sx, sy, maxNodes)
 					end
 				end
 			end
+
+			-- Lantai penuh punya langit-langit tepat di atas pemain. Naik lewat
+			-- celah tepi: keluar sedikit, lompat di poros, lalu masuk lagi.
+			if cy >= 2 then
+				for _, dir in ipairs({ -1, 1 }) do
+					local shaftX = cx + dir
+					if shaftX >= 0 and shaftX < w
+						and not isSolid(shaftX, cy - 1)
+						and not isSolid(shaftX, cy - 2)
+						and canStand(cx, cy - 2) then
+						push(cx, cy, cc, cx, cy - 2, 7, "edgeJump", shaftX)
+					end
+				end
+			end
 		end
 	end
 	return dist, parent
@@ -1607,6 +1621,63 @@ local function pathStep(cx, cy, step, aliveFn)
 			if landed() then return true end
 			task.wait(0.03)
 		end
+		return false
+	end
+	if step.kind == "edgeJump" then
+		local outward = step.shaftX < cx and KeyLeft or KeyRight
+		local inward = step.shaftX < cx and KeyRight or KeyLeft
+		local takeoffX = step.shaftX < cx and step.shaftX + 0.76 or step.shaftX + 0.24
+		local brakeX = step.shaftX < cx and step.shaftX + 0.85 or step.shaftX + 0.15
+		local readyAt = (Move.lastJumpAt or 0) + 0.7
+		if os.clock() < readyAt then
+			task.wait(readyAt - os.clock() + 0.05)
+		end
+		if not aliveFn() then return false end
+		Move.hold(outward)
+		local deadline = os.clock() + 1.5
+		local ready = false
+		while aliveFn() and os.clock() < deadline do
+			local s = Bind.state()
+			if not s or not s.grounded then
+				Move.release()
+				return false
+			end
+			if (step.shaftX < cx and s.x <= takeoffX)
+					or (step.shaftX > cx and s.x >= takeoffX) then
+				ready = true
+				break
+			end
+			task.wait(0.01)
+		end
+		if not ready or not aliveFn() then
+			Move.release()
+			return false
+		end
+		if not Move.jump() then
+			Move.release()
+			return false
+		end
+		Move.hold(inward)
+		deadline = os.clock() + 1.2
+		local braking = false
+		while aliveFn() and os.clock() < deadline do
+			local s = Bind.state()
+			if not s then break end
+			if not braking and ((step.shaftX < cx and s.x >= brakeX)
+				or (step.shaftX > cx and s.x <= brakeX)) then
+				Move.release()
+				braking = true
+			end
+			if s.grounded then
+				Move.release()
+				if math.floor(s.y - 0.0001) == step.y then
+					return Move.walkTo(step.x + 0.5, { timeout = 2, tol = 0.35 }) and landed()
+				end
+				return false
+			end
+			task.wait(0.02)
+		end
+		Move.release()
 		return false
 	end
 	if step.kind == "jump" then
