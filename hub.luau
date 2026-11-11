@@ -26,7 +26,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.32",
+	version = "0.4.33",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -211,6 +211,30 @@ function Bind.state()
 		return s
 	end
 	return nil
+end
+
+local function worldPickerVisible()
+	local menu = Players.LocalPlayer and Players.LocalPlayer:FindFirstChild("PlayerGui")
+	menu = menu and menu:FindFirstChild("MenuGui")
+	local picker = menu and menu:FindFirstChild("WorldPicker")
+	return picker ~= nil and picker.Visible == true, picker
+end
+
+local function closeWorldPicker(picker)
+	if not picker then return end
+	picker.Visible = false
+	-- Menu game memanggil closeDialogs() setelah enter berhasil untuk
+	-- menampilkan HUD lagi. Panel saja ditutup akan menyembunyikan HUD.
+	local ok, matches = pcall(filtergc, "table", { Keys = { "layers", "closeDialogs" } }, false)
+	if not ok or type(matches) ~= "table" then return end
+	if type(matches[1]) ~= "table" then matches = { matches } end
+	for _, menu in ipairs(matches) do
+		if type(menu) == "table" and type(menu.layers) == "table"
+			and menu.layers.WorldPicker == picker and type(menu.closeDialogs) == "function" then
+			pcall(menu.closeDialogs)
+			break
+		end
+	end
 end
 
 function Bind.solid(x, y)
@@ -2529,14 +2553,15 @@ local function startFactory()
 			while factoryAlive(gen) do
 				local s = Bind.state()
 				local currentW = Bind.getW()
-				if s and s.dead == true then
+				local inLobby, picker = worldPickerVisible()
+				if not inLobby and s and s.dead == true then
 					-- Karakter mati: jangan terus memukul dari posisi terakhir.
 					Move.release()
 					if Factory.status ~= "Factory: karakter mati; menunggu respawn" then
 						setFactoryStatus("Factory: karakter mati; menunggu respawn")
 					end
 					task.wait(0.5)
-				elseif not s or not standingFloor(s) or not currentW or currentW.name ~= worldName then
+				elseif inLobby or not s or not standingFloor(s) or not currentW or currentW.name ~= worldName then
 					Move.release()
 					missingSince = missingSince or os.clock()
 					if not Factory.cycle then
@@ -2549,8 +2574,15 @@ local function startFactory()
 						setFactoryStatus("Factory: kembali dari lobby ke " .. worldName)
 						local enterWorld = currentW and currentW.enter or W.enter
 						if type(enterWorld) == "function" then
-							local joined, joinErr = pcall(enterWorld, worldName)
-							if not joined then log("Factory rejoin: " .. tostring(joinErr)) end
+							local called, joined, reason, teleporting = pcall(enterWorld, worldName)
+							if called and joined == true and not teleporting then
+								closeWorldPicker(picker)
+								log("Factory rejoin: berhasil ke " .. worldName)
+							else
+								local why = called and reason or joined
+								log("Factory rejoin: " .. tostring(why))
+								setFactoryStatus("Factory: masuk ulang " .. worldName .. " gagal; mencoba lagi")
+							end
 						end
 						Bind.resolve(true)
 					end
@@ -3208,7 +3240,7 @@ Factory.onCycleChanged(Factory.running and Factory.cycle)
 task.spawn(function()
 	while _G.__HumanHub == Hub do
 		task.wait(1)
-		if Guard.enabled and not Guard.busy then
+		if Guard.enabled and not Guard.busy and not worldPickerVisible() then
 			local W = Bind.W
 			local others = W and worldPlayers()
 			if W and type(W.name) == "string" and others then
