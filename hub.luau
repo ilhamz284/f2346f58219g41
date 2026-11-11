@@ -26,7 +26,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.3",
+	version = "0.4.4",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -2212,6 +2212,167 @@ moveSec:Paragraph({
 	Title = "Cara kerja",
 	Desc = "Semua gerak memakai keypress A/D dan Space. Tidak ada goTo/teleport. Bot berhenti dulu sebelum memukul, lalu jalan lagi. Jeda dan waktu reaksi diacak supaya tidak polanya tetap.",
 })
+
+-- ---- Penjaga world ----
+local guardSec = pnbTab:Section({ Title = "Penjaga World", Opened = false })
+local Guard = { enabled = false, world = nil, seen = {}, baseline = false, busy = false }
+local guardStatus = guardSec:Paragraph({ Title = "Status penjaga", Desc = "nonaktif" })
+
+local function guardMessage(message)
+	if guardStatus.SetDesc then
+		pcall(guardStatus.SetDesc, guardStatus, message)
+	end
+end
+
+local function worldPlayers()
+	local ok, matches = pcall(filtergc, "table", { Keys = { "reset", "showNames", "list" } }, false)
+	if not ok or type(matches) ~= "table" then
+		return nil
+	end
+	if type(matches[1]) ~= "table" then
+		matches = { matches }
+	end
+	for _, ctrl in ipairs(matches) do
+		if type(ctrl) == "table" and type(ctrl.reset) == "function" and type(ctrl.update) == "function" then
+			local okUps, ups = pcall(debug.getupvalues, ctrl.reset)
+			if okUps and type(ups) == "table" and type(ups[1]) == "table" then
+				return ups[1]
+			end
+		end
+	end
+	return nil
+end
+
+local function staffRole(player)
+	if game.CreatorType ~= Enum.CreatorType.Group or not game.CreatorId then
+		return nil
+	end
+	local okRole, role = pcall(player.GetRoleInGroup, player, game.CreatorId)
+	local okRank, rank = pcall(player.GetRankInGroup, player, game.CreatorId)
+	if not okRole or not okRank then
+		return nil
+	end
+	local name = string.lower(tostring(role))
+	return tonumber(rank) >= 200 or name:find("mod", 1, true) ~= nil
+		or name:find("dev", 1, true) ~= nil or name:find("admin", 1, true) ~= nil
+		or name:find("owner", 1, true) ~= nil or name:find("staff", 1, true) ~= nil
+end
+
+local function worldAuthority(W, userId)
+	local lock = W.lock
+	if type(lock) ~= "table" then
+		return false
+	end
+	if tonumber(lock.owner) == userId then
+		return true
+	end
+	if type(lock.access) == "table" then
+		for _, entry in pairs(lock.access) do
+			if type(entry) == "table" and tonumber(entry[1]) == userId then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+local function canBanInWorld(W)
+	local myId = Players.LocalPlayer and Players.LocalPlayer.UserId
+	return myId ~= nil and worldAuthority(W, myId)
+end
+
+local function banWorldPlayer(name)
+	local ok, matches = pcall(filtergc, "table", { Keys = { "setShown", "setWorld", "isTyping", "add", "onCommand" } }, false)
+	if not ok or type(matches) ~= "table" or not name:match("^[%w_]+$") then
+		return false
+	end
+	if type(matches[1]) ~= "table" then
+		matches = { matches }
+	end
+	for _, chat in ipairs(matches) do
+		if type(chat) == "table" and type(chat.onCommand) == "function" then
+			local sent, handled = pcall(chat.onCommand, "/ban " .. name)
+			return sent and handled ~= false
+		end
+	end
+	return false
+end
+
+local function randomWorldName()
+	local letters = {}
+	for i = 1, 7 do
+		letters[i] = string.char(math.random(65, 90))
+	end
+	return table.concat(letters)
+end
+
+guardSec:Toggle({
+	Title = "Auto keluar / ban pemain",
+	Desc = "Staf grup masuk: pindah ke world acak 7 huruf. Pemain biasa baru masuk: kirim /ban jika punya akses world.",
+	Value = false,
+	Callback = function(on)
+		Guard.enabled = on
+		Guard.world, Guard.seen, Guard.baseline, Guard.busy = nil, {}, false, false
+		guardMessage(on and "memantau pemain di world" or "nonaktif")
+	end,
+})
+
+task.spawn(function()
+	while _G.__HumanHub == Hub do
+		task.wait(1)
+		if Guard.enabled and not Guard.busy then
+			local W = Bind.W
+			local others = W and worldPlayers()
+			if W and type(W.name) == "string" and others then
+				if Guard.world ~= W.name then
+					Guard.world, Guard.seen, Guard.baseline = W.name, {}, false
+				end
+				local present = {}
+				for uid, data in pairs(others) do
+					local id = tonumber(type(data) == "table" and data.userId or uid)
+					if id and id ~= Players.LocalPlayer.UserId then
+						present[id] = true
+						local player = Players:GetPlayerByUserId(id)
+						local isStaff = player and staffRole(player)
+						if worldAuthority(W, id) then
+							Guard.seen[id] = true
+						elseif isStaff == true then
+							Guard.busy = true
+							if Farm.running then Farm.stop("staf masuk world") end
+							if PNB.running then PNB.stop("staf masuk world") end
+							if Factory.running then Factory.stop("staf masuk world") end
+							local destination = randomWorldName()
+							guardMessage("staf terdeteksi; pindah ke " .. destination)
+							local called, result = false, false
+							if type(W.enter) == "function" then
+								called, result = pcall(W.enter, destination)
+							end
+							local moved = called and result ~= false
+							if not moved then
+								guardMessage("gagal pindah world; bot dihentikan")
+								Guard.enabled = false
+							end
+							break
+						elseif isStaff == false and Guard.baseline and not Guard.seen[id] then
+							if canBanInWorld(W) then
+								local name = type(data) == "table" and data.name or nil
+								name = type(name) == "string" and name ~= "" and name or player.Name
+								guardMessage(banWorldPlayer(name) and ("perintah ban dikirim: " .. name) or ("gagal mengirim ban: " .. name))
+							else
+								guardMessage("pemain masuk, tetapi tidak punya akses ban di world")
+							end
+						end
+						if isStaff ~= nil or not Guard.baseline then Guard.seen[id] = true end
+					end
+				end
+				for id in pairs(Guard.seen) do
+					if not present[id] then Guard.seen[id] = nil end
+				end
+				Guard.baseline = true
+			end
+		end
+	end
+end)
 
 -- ---- Tab Info ----
 infoTab:Section({ Title = "Fitur", Opened = true }):Paragraph({
