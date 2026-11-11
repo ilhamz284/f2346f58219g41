@@ -26,7 +26,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.8",
+	version = "0.4.9",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -237,6 +237,7 @@ end
 local Move = {
 	held = nil,
 	gen = 0,
+	lastJumpAt = 0,
 	cfg = {
 		reactMin = 0.07,
 		reactMax = 0.18,
@@ -1116,18 +1117,40 @@ local function pnbTileId(W, layer, x, y)
 	return (grid and grid[y] and grid[y][x]) or 0
 end
 
+local itemDBCache
+local function itemDBCandidate(candidate)
+	return type(candidate) == "table" and type(candidate[2]) == "table"
+		and candidate[2].name == "Dirt" and type(candidate[3]) == "table"
+		and candidate[3].kind == "seed" and type(candidate[14]) == "table"
+		and candidate[14].background == true
+end
+
 local function findItemDB()
-	if type(Bind.hit) ~= "function" then
+	if itemDBCandidate(itemDBCache) then
+		return itemDBCache
+	end
+	if type(Bind.hit) == "function" then
+		local ok, upvalues = pcall(debug.getupvalues, Bind.hit)
+		if ok and type(upvalues) == "table" then
+			for _, candidate in ipairs(upvalues) do
+				if itemDBCandidate(candidate) then
+					itemDBCache = candidate
+					return candidate
+				end
+			end
+		end
+	end
+	local ok, candidates = pcall(filtergc, "table", { Keys = { 2, 3, 14 } }, false)
+	if not ok or type(candidates) ~= "table" then
 		return nil
 	end
-	local ok, upvalues = pcall(debug.getupvalues, Bind.hit)
-	if not ok or type(upvalues) ~= "table" then
-		return nil
+	if itemDBCandidate(candidates) then
+		itemDBCache = candidates
+		return candidates
 	end
-	for _, candidate in ipairs(upvalues) do
-		if type(candidate) == "table" and type(candidate[2]) == "table"
-			and candidate[2].name == "Dirt" and type(candidate[14]) == "table"
-			and candidate[14].background == true then
+	for _, candidate in ipairs(candidates) do
+		if itemDBCandidate(candidate) then
+			itemDBCache = candidate
 			return candidate
 		end
 	end
