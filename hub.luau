@@ -26,7 +26,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.15",
+	version = "0.4.16",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -394,6 +394,7 @@ local Factory = {
 	workX = nil,
 	workY = nil,
 	workStandX = nil,
+	pnbPathFailures = 0,
 	pnb = 0,
 	phase = "idle",
 	treeMap = nil,
@@ -1521,7 +1522,11 @@ function Path.explore(sx, sy, maxNodes)
 				for up = 1, 3 do
 					for dx = -2, 2 do
 						local nx, ny = cx + dx, cy - up
-						push(cx, cy, cc, nx, ny, 2 + math.abs(dx) + up, "jump")
+						-- Dinding di samping poros menahan gerak mendatar sejak
+						-- awal lompatan. Gunakan edgeJump dari lantai itu.
+						if up == 1 or dx == 0 or not isSolid(nx, cy - 1) then
+							push(cx, cy, cc, nx, ny, 2 + math.abs(dx) + up, "jump")
+						end
 					end
 				end
 			end
@@ -1838,9 +1843,11 @@ local function factoryTarget(W, state, seedId, blocked, onlyKind)
 				for x = 0, (tonumber(W.w) or 100) - 1 do
 					local key = seedId .. ":" .. kind .. ":" .. y .. ":" .. x
 					if not blocked[key] or blocked[key] < os.clock() then
-						local suitable = kind == "harvest"
+						local reserved = Factory.cycle and kind == "plant"
+							and Factory.workX == x and Factory.workY == y
+						local suitable = not reserved and (kind == "harvest"
 							and row[x] == seedId and factoryTreeRipe(W, x, y, seedId)
-							or kind == "plant" and row[x] == 0 and Bind.solid(x, y + 1)
+							or kind == "plant" and row[x] == 0 and Bind.solid(x, y + 1))
 						if suitable then
 							for _, standX in ipairs({ x, x - 1, x + 1 }) do
 								local standKey = keyOf(standX, y)
@@ -1904,6 +1911,15 @@ local function factoryWork(W, inv, target, seedId, gen)
 			return false
 		end
 		Factory.harvested += 1
+		if Factory.cycle and not Factory.workX and tileId(x, y) == 0
+			and Bind.solid(x, y + 1) and (Factory.baseLayer ~= "bg" or bgId(x, y) == 0) then
+			local standX = Factory.baseAtSelf and x
+				or (Path.standable(x - 1, y) and x - 1)
+				or (Path.standable(x + 1, y) and x + 1)
+			if standX then
+				Factory.workX, Factory.workStandX, Factory.workY = x, standX, y
+			end
+		end
 		if factoryAlive(gen) and Bind.solid(x, y + 1) then
 			Move.walkTo(x + 0.5, { timeout = 3, tol = 0.28 })
 		end
@@ -1961,35 +1977,35 @@ end
 local function factoryPNBOne(W, inv, gen)
 	local baseId = Factory.baseId
 	if factoryCount(inv, baseId) < 1 then
-		return false
+		return false, "blocks"
 	end
 	local s = Bind.state()
 	if not s then
-		return false
+		return false, "state"
 	end
 	local x, standX, y = Factory.workX, Factory.workStandX, Factory.workY
-	if not x or not y or pnbTileId(W, Factory.baseLayer, x, y) ~= 0 or tileId(x, y) ~= 0 then
-		x, standX, y = factoryWorkSpot(W, s)
-		Factory.workX, Factory.workStandX, Factory.workY = x, standX, y
-	end
 	if not x or not standX or not y then
-		return false
+		return false, "station"
+	end
+	if pnbTileId(W, Factory.baseLayer, x, y) ~= 0 or tileId(x, y) ~= 0
+		or not Bind.solid(x, y + 1) then
+		return false, "occupied"
 	end
 	local alive = function()
 		return factoryAlive(gen) and W.name == Bind.name
 	end
 	if not Path.moveTo(standX, y, alive) then
-		return false
+		return false, "path"
 	end
 	local arrived = Bind.state()
 	if not factoryAlive(gen) or not arrived or standingFloor(arrived) ~= y + 1
 		or pnbTileId(W, Factory.baseLayer, x, y) ~= 0 or tileId(x, y) ~= 0 then
-		return false
+		return false, "position"
 	end
 	pcall(inv.select, inv, baseId)
 	local placed = pcall(Bind.setTile, Factory.baseLayer, x, y, baseId, false, false)
 	if not placed or pnbTileId(W, Factory.baseLayer, x, y) ~= baseId then
-		return false
+		return false, "place"
 	end
 	pcall(inv.remove, inv, baseId, 1)
 	W.punchReady = os.clock() + 0.15
@@ -2002,7 +2018,7 @@ local function factoryPNBOne(W, inv, gen)
 		task.wait(0.07)
 	end
 	if pnbTileId(W, Factory.baseLayer, x, y) ~= 0 then
-		return false
+		return false, "break"
 	end
 	Factory.pnb += 1
 	task.wait(0.3)
@@ -2076,18 +2092,30 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 			setFactoryStatus(string.format("Factory: PNB selesai | blok %d, seed %d; mulai tanam", blocks, seeds))
 			return 0.1
 		end
-		if factoryPNBOne(W, inv, gen) then
+		local worked, reason = factoryPNBOne(W, inv, gen)
+		if worked then
+			Factory.pnbPathFailures = 0
 			if factoryAlive(gen) then
 				setFactoryStatus(string.format("Factory: PNB %d | blok %d, seed %d",
 					Factory.pnb, factoryCount(inv, Factory.baseId), factoryCount(inv, seedId)))
 			end
 		else
-			Factory.workX, Factory.workStandX, Factory.workY = nil, nil, nil
-			if factoryAlive(gen) then
-				setFactoryStatus("Factory: mencari tile kerja PNB yang kosong")
+			if reason == "path" or reason == "position" then
+				Factory.pnbPathFailures += 1
+				if Factory.pnbPathFailures >= 2 then
+					Factory.stop("Factory: jalur ke tile PNB gagal; bot berhenti di posisi sekarang")
+				else
+					setFactoryStatus("Factory: mengulang jalur tile PNB sekali")
+				end
+			elseif reason == "station" then
+				Factory.stop("Factory: tidak ada tile kosong untuk PNB; sisakan satu tile di atas lantai")
+			elseif reason == "occupied" then
+				Factory.stop("Factory: tile PNB yang disimpan sudah terisi")
+			else
+				Factory.stop("Factory: PNB gagal (" .. tostring(reason) .. ")")
 			end
 		end
-		return 0.3
+		return worked and 0.3 or 2
 	end
 
 	if Factory.phase == "plant" then
@@ -2206,6 +2234,7 @@ local function startFactory()
 	Factory.baseLayer = baseDef and (baseDef.background == true and "bg" or "fg") or nil
 	Factory.baseAtSelf = baseDef and (baseDef.background == true or baseDef.solid == false) or nil
 	Factory.workX, Factory.workStandX, Factory.workY = nil, nil, nil
+	Factory.pnbPathFailures = 0
 	if Factory.cycle then
 		Factory.workX, Factory.workStandX, Factory.workY = factoryWorkSpot(W, state)
 	end
