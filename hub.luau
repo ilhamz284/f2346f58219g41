@@ -26,7 +26,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.31",
+	version = "0.4.32",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -1605,10 +1605,10 @@ function Path.explore(sx, sy, maxNodes)
 				for up = 1, 3 do
 					for dx = -2, 2 do
 						local nx, ny = cx + dx, cy - up
-						-- Dinding setinggi 1 tile di samping pemain bukan penghalang:
-						-- pemain naik dulu, baru bergeser di puncak lompatan.
-						-- Lompat 3 tile ke samping tetap dibatasi karena marginnya nol.
-						if dx == 0 or up <= 2 or not isSolid(nx, cy - 1) then
+						-- Jangan pilih lompatan diagonal yang harus menembus lantai
+						-- solid di samping poros. Masuk dulu ke tepi lantai, lalu
+						-- gunakan edgeJump untuk naik lagi.
+						if dx == 0 or up == 1 or not isSolid(nx, cy - 1) then
 							push(cx, cy, cc, nx, ny, 2 + math.abs(dx) + up, "jump")
 						end
 					end
@@ -1717,7 +1717,10 @@ local function pathStep(cx, cy, step, aliveFn)
 	if step.kind == "edgeJump" then
 		local outward = step.shaftX < cx and KeyLeft or KeyRight
 		local inward = step.shaftX < cx and KeyRight or KeyLeft
-		local takeoffX = step.shaftX < cx and step.shaftX + 0.76 or step.shaftX + 0.24
+		-- Lompat sebelum pusat pemain melewati tepi pijakan. Pada poros
+		-- bertingkat, menunggu sampai x=0.76 sering membuat grounded hilang
+		-- sebelum Space terkirim (terutama pada lompatan kedua).
+		local takeoffX = step.shaftX < cx and step.shaftX + 0.92 or step.shaftX + 0.08
 		local brakeX = step.shaftX < cx and step.shaftX + 0.85 or step.shaftX + 0.15
 		local readyAt = (Move.lastJumpAt or 0) + 0.7
 		if os.clock() < readyAt then
@@ -2212,6 +2215,21 @@ local function factoryRoom(inv, itemId)
 	return ok and (tonumber(room) or 0) or 0
 end
 
+local function factoryHasPlantTile(W)
+	for y = 0, (tonumber(W.h) or 60) - 2 do
+		local row = W.fg and W.fg[y]
+		if row then
+			for x = 0, (tonumber(W.w) or 100) - 2 do
+				if row[x] == 0 and Bind.solid(x, y + 1)
+					and not (Factory.workX == x and Factory.workY == y) then
+					return true
+				end
+			end
+		end
+	end
+	return false
+end
+
 local factoryStoreSeeds
 
 -- Kosongkan seluruh blok sebelum fase tanam.
@@ -2224,7 +2242,6 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 	local blocks = factoryCount(inv, Factory.baseId)
 	local seeds = factoryCount(inv, seedId)
 	local blockFull = blocks >= 200 or factoryRoom(inv, Factory.baseId) == 0
-	local seedFull = seeds >= 200 or factoryRoom(inv, seedId) == 0
 
 	if Factory.phase == "harvest" then
 		local cy = math.floor(state.y - 0.0001)
@@ -2366,11 +2383,6 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 	end
 
 	if Factory.phase == "plant" then
-		if blocks > 0 then
-			beginPNB(blocks)
-			setFactoryStatus(string.format("Factory: PNB %d blok dulu sebelum tanam", blocks))
-			return 0.1
-		end
 		if seeds <= 0 then
 			Factory.phase = "grow"
 			setFactoryStatus("Factory: seed habis; cek tree dan sisa blok")
@@ -2392,9 +2404,9 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 					blocked[seedId .. ":plant:" .. target.y .. ":" .. target.x] =
 						os.clock() + (pathFail and 45 or 10)
 				else
-					-- Lantai lain: jalur turun/jatuh tidak bisa diandalkan,
-					-- blok seluruh baris supaya tidak dicoba tile demi tile.
-					blocked["plant:row:" .. target.y] = os.clock() + (pathFail and 180 or 60)
+					-- Tahan baris sebentar agar jalur lain dicoba, kemudian coba
+					-- lagi selama seed masih ada. Timeout lama membuat Plant diam.
+					blocked["plant:row:" .. target.y] = os.clock() + (pathFail and 25 or 10)
 				end
 				if factoryAlive(gen) then
 					setFactoryStatus(string.format("Factory: gagal ke tile tanam X=%d Y=%d (%s); coba tile lain",
@@ -2403,30 +2415,18 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 			end
 			return 0.18
 		end
-		local ripe = factoryTarget(W, state, seedId, blocked, "harvest")
-		if ripe and not blockFull then
-			Factory.phase = "harvest"
-			setFactoryStatus("Factory: tile tanam penuh; panen tree matang untuk membuka ruang")
-			return 0.1
+		if factoryHasPlantTile(W) then
+			setFactoryStatus(string.format("Factory: menunggu jalur tile tanam terbuka (%d seed tersisa)", seeds))
+			return 2
 		end
-		if ripe and blockFull and blocks > 0 and not seedFull then
-			beginPNB(blocks)
-			setFactoryStatus("Factory: tile tanam penuh; kosongkan blok lewat PNB sebelum panen")
-			return 0.1
+		local stored, reason = factoryStoreSeeds(W, inv, state, seedId, gen)
+		if stored then
+			Factory.phase = "grow"
+			setFactoryStatus("Factory: tile tanam penuh; seed tersimpan di Display Box")
+		else
+			Factory.stop("Factory: penyimpanan berhenti: " .. tostring(reason))
 		end
-		if seedFull or (Factory.baseId and blocks <= 0) then
-			local stored, reason = factoryStoreSeeds(W, inv, state, seedId, gen)
-			if stored then
-				Factory.phase = "grow"
-				setFactoryStatus("Factory: seed tersimpan di Display Box; lanjut cek pohon dan blok")
-			else
-				Factory.stop("Factory: penyimpanan berhenti: " .. tostring(reason))
-			end
-			return 0.3
-		end
-		setFactoryStatus(string.format("Factory: tidak ada tile tanam kosong terjangkau; menunggu pohon matang (%d seed)", seeds))
-		collectDropsNearby(W, inv, state, 0.9)
-		return 1
+		return 0.3
 	end
 
 	-- Setelah seed habis, mulai lagi dari panen bila ada tree matang.
