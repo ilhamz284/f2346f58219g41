@@ -5,6 +5,11 @@
 --//            (foreground + cave background), menyisir map bolak-balik
 --//            lalu turun satu lantai lewat poros di tepi, sampai jadi
 --//            lantai bertingkat.
+--// Fitur #2 : PNB (Place and Break): blok solid di depan pemain,
+--//            background dan blok non-solid pada tile pemain, dengan Auto Collect.
+--// Fitur #3 : Auto Harvest / Auto Plant dengan seed pilihan dari inventory.
+--// Fitur #4 : Auto Factory: panen sampai blok penuh / tree habis,
+--//            PNB sampai blok habis / seed penuh, tanam sampai seed habis.
 --//
 --// Prinsip gerak:
 --//   - semua gerak lewat keypress A/D + Space (VirtualInputManager)
@@ -21,7 +26,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.1.0",
+	version = "0.4.2",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -151,7 +156,9 @@ local function findInventory()
 		list = { list }
 	end
 	for _, t in ipairs(list) do
-		if type(t) == "table" and type(t.slots) == "table" then
+		if type(t) == "table" and type(t.slots) == "table"
+			and type(t.count) == "function" and type(t.select) == "function"
+			and type(t.remove) == "function" and type(t.room) == "function" then
 			return t
 		end
 	end
@@ -366,6 +373,45 @@ local Farm = {
 	status = "idle",
 	onStatus = nil,
 }
+local PNB = {
+	running = false,
+	gen = 0,
+	itemId = nil,
+	layer = nil,
+	atSelf = false,
+	targetX = nil,
+	targetY = nil,
+	autoCollect = true,
+	collectRadius = 0.9,
+	searchRadius = 2.5,
+	cycles = 0,
+	status = "idle",
+	onStatus = nil,
+}
+local Factory = {
+	running = false,
+	gen = 0,
+	harvest = false,
+	plant = false,
+	cycle = false,
+	seedId = nil,
+	seedName = nil,
+	baseId = nil,
+	baseName = nil,
+	baseLayer = nil,
+	baseAtSelf = nil,
+	workX = nil,
+	workStandX = nil,
+	pnb = 0,
+	phase = "idle",
+	treeMap = nil,
+	harvested = 0,
+	planted = 0,
+	status = "idle",
+	onStatus = nil,
+	onMode = nil,
+	syncingUI = false,
+}
 local Dig = { protectedIds = { [6] = true, [8] = true, [202] = true, [204] = true, [206] = true, [240] = true, [242] = true, [1796] = true, [7188] = true, [9640] = true } }
 
 function Dig.isProtected(id, x, y)
@@ -383,7 +429,7 @@ function Dig.isProtected(id, x, y)
 end
 
 -- Pukul satu tile satu kali. Return true kalau panggilan game berhasil.
-function Dig.punch(x, y, isTree, skipAim, allowLava)
+function Dig.punch(x, y, isTree, skipAim, allowLava, forceBg)
 	local W = Bind.getW()
 	if not W or not Bind.hit then
 		return false
@@ -406,7 +452,7 @@ function Dig.punch(x, y, isTree, skipAim, allowLava)
 	else
 		-- foreground sudah kosong: yang tersisa cave background
 		local bg = W.bg and W.bg[y] and W.bg[y][x] or 0
-		if bg == 0 or not Farm.breakBg then
+		if bg == 0 or (not Farm.breakBg and not forceBg) then
 			return true
 		end
 		if Dig.isProtected(bg, x, y) then
@@ -833,6 +879,14 @@ local function startFarm()
 	if Farm.running then
 		return
 	end
+	if PNB.running then
+		setStatus("gagal: matikan PNB terlebih dahulu")
+		return
+	end
+	if Factory.running then
+		setStatus("gagal: matikan Auto Harvest / Plant terlebih dahulu")
+		return
+	end
 	Bind.resolve(true)
 	if not Bind.W or not Bind.CT or not Bind.hit then
 		setStatus("gagal: binding game tidak lengkap (coba rejoin lalu jalankan ulang)")
@@ -957,7 +1011,837 @@ function Farm.stop(reason)
 	setStatus(reason or "dihentikan")
 end
 
---// ===== 6. UI (WindUI) =====
+--// ===== 6. PNB (PLACE AND BREAK) + AUTO COLLECT =====
+local function setPNBStatus(message)
+	PNB.status = message
+	if PNB.onStatus then
+		pcall(PNB.onStatus, message)
+	end
+end
+
+function PNB.stop(reason)
+	if not PNB.running then
+		return
+	end
+	PNB.running = false
+	PNB.gen += 1
+	Move.stop()
+	setPNBStatus(reason or "dihentikan")
+end
+
+local function collectDropsNearby(W, inv, state, radius)
+	if not state or type(W.dropList) ~= "function" or type(W.takeDrop) ~= "function" then
+		return 0
+	end
+	if type(inv.room) ~= "function" or type(inv.add) ~= "function" then
+		return 0
+	end
+	local ok, drops = pcall(W.dropList)
+	if not ok or type(drops) ~= "table" then
+		return 0
+	end
+	local collected = 0
+	for _, drop in ipairs(drops) do
+		if type(drop) == "table" and type(drop.uid) == "number" and type(drop.id) == "number"
+			and type(drop.n) == "number" and type(drop.x) == "number" and type(drop.y) == "number" then
+			local dx, dy = drop.x - state.x, drop.y - state.y
+			if dx * dx + dy * dy <= radius * radius then
+				local roomOK, room = pcall(inv.room, inv, drop.id)
+				local want = roomOK and math.min(drop.n, tonumber(room) or 0) or 0
+				if want > 0 then
+					local takeOK, taken = pcall(W.takeDrop, drop.uid, want)
+					taken = takeOK and tonumber(taken) or 0
+					if taken > 0 then
+						pcall(inv.add, inv, drop.id, taken)
+						collected += taken
+					end
+				end
+			end
+		end
+	end
+	return collected
+end
+
+local function collectNearby(W, inv, state)
+	if not PNB.autoCollect then
+		return 0
+	end
+	return collectDropsNearby(W, inv, state, PNB.collectRadius)
+end
+
+local function nearestCollectibleDrop(W, inv, state)
+	if not PNB.autoCollect or type(W.dropList) ~= "function" or type(inv.room) ~= "function" then
+		return nil
+	end
+	local ok, drops = pcall(W.dropList)
+	if not ok or type(drops) ~= "table" then
+		return nil
+	end
+	local floorY = standingFloor(state)
+	local bestX, bestDistance
+	for _, drop in ipairs(drops) do
+		if type(drop) == "table" and type(drop.id) == "number" and type(drop.n) == "number"
+			and type(drop.x) == "number" and type(drop.y) == "number" and drop.n > 0
+			and math.abs(drop.y - state.y) <= 1.1 then
+			local distance = math.abs(drop.x - state.x)
+			if distance > PNB.collectRadius and distance <= PNB.searchRadius
+				and (not bestDistance or distance < bestDistance) then
+				local roomOK, room = pcall(inv.room, inv, drop.id)
+				if roomOK and (tonumber(room) or 0) > 0 then
+					local pathClear = true
+					for tx = math.min(math.floor(state.x), math.floor(drop.x)), math.max(math.floor(state.x), math.floor(drop.x)) do
+						if not Bind.solid(tx, floorY) or tileId(tx, floorY - 1) ~= 0 then
+							pathClear = false
+							break
+						end
+					end
+					if pathClear then
+						bestX, bestDistance = drop.x, distance
+					end
+				end
+			end
+		end
+	end
+	return bestX
+end
+
+local function pnbTileId(W, layer, x, y)
+	local grid = W[layer]
+	return (grid and grid[y] and grid[y][x]) or 0
+end
+
+local function findItemDB()
+	if type(Bind.hit) ~= "function" then
+		return nil
+	end
+	local ok, upvalues = pcall(debug.getupvalues, Bind.hit)
+	if not ok or type(upvalues) ~= "table" then
+		return nil
+	end
+	for _, candidate in ipairs(upvalues) do
+		if type(candidate) == "table" and type(candidate[2]) == "table"
+			and candidate[2].name == "Dirt" and type(candidate[14]) == "table"
+			and candidate[14].background == true then
+			return candidate
+		end
+	end
+	return nil
+end
+
+local function selectedItemDefinition(itemId)
+	local items = findItemDB()
+	return items and items[itemId] or nil
+end
+
+local function findPNBTarget(W, state, layer, atSelf)
+	local floorY = standingFloor(state)
+	if not floorY or not Bind.solid(math.floor(state.x), floorY) then
+		return nil
+	end
+	local y = floorY - 1
+	if atSelf then
+		local x = math.floor(state.x)
+		if x >= 0 and x < (tonumber(W.w) or 100) and y >= 0 and y < (tonumber(W.h) or 60)
+			and pnbTileId(W, "fg", x, y) == 0 and pnbTileId(W, layer, x, y) == 0 then
+			return x, y
+		end
+		return nil
+	end
+	local dir = state.facing == -1 and -1 or 1
+	local baseX = math.floor(state.x)
+	for step = 1, 2 do
+		local x = baseX + dir * step
+		local distance = math.abs(x + 0.5 - state.x)
+		if x >= 0 and x < (tonumber(W.w) or 100) and y >= 0 and y < (tonumber(W.h) or 60)
+			and distance >= 1.05 and distance <= 2.2
+			and tileId(x, y) == 0 and Bind.solid(x, floorY) then
+			return x, y
+		end
+	end
+	return nil
+end
+
+local function startPNB()
+	if PNB.running then
+		return
+	end
+	if Farm.running then
+		setPNBStatus("gagal: matikan Auto Dirt Farm terlebih dahulu")
+		return
+	end
+	if Factory.running then
+		setPNBStatus("gagal: matikan Auto Harvest / Plant terlebih dahulu")
+		return
+	end
+	Bind.resolve(true)
+	local W = Bind.W
+	local inv = Bind.inv
+	if not (W and Bind.CT and Bind.hit and Bind.setTile and inv) then
+		setPNBStatus("gagal: binding game belum lengkap")
+		return
+	end
+	if type(inv.count) ~= "function" or type(inv.select) ~= "function" or type(inv.remove) ~= "function" then
+		setPNBStatus("gagal: fungsi inventory tidak lengkap")
+		return
+	end
+	local state = Bind.state()
+	if not state or type(state.x) ~= "number" or type(state.y) ~= "number" then
+		setPNBStatus("gagal: posisi pemain tidak terbaca")
+		return
+	end
+	local itemId = tonumber(inv.selected)
+	if not itemId or itemId <= 0 or itemId == 18 or itemId == 32 or Dig.protectedIds[itemId] then
+		setPNBStatus("gagal: pilih blok yang dapat dipasang di hotbar")
+		return
+	end
+	local itemDef = selectedItemDefinition(itemId)
+	if type(itemDef) == "table" and itemDef.kind == "seed" then
+		setPNBStatus("gagal: yang dipilih adalah seed; pilih item bloknya (mis. Pepper Tree, bukan Pepper Tree Seed)")
+		return
+	end
+	if type(itemDef) ~= "table" or itemDef.farmable ~= true then
+		setPNBStatus("gagal: item yang dipilih bukan blok farmable")
+		return
+	end
+	local layer = itemDef.background == true and "bg" or "fg"
+	local atSelf = layer == "bg" or itemDef.solid == false
+	local countOK, count = pcall(inv.count, inv, itemId)
+	if not countOK or (tonumber(count) or 0) < 1 then
+		setPNBStatus("gagal: stok blok yang dipilih habis")
+		return
+	end
+	local x, y = findPNBTarget(W, state, layer, atSelf)
+	if not x then
+		setPNBStatus(atSelf
+			and "gagal: tile pada posisi pemain tidak kosong"
+			or "gagal: tidak ada tile kosong dengan lantai di depan pemain")
+		return
+	end
+	if Dig.isProtected(itemId, x, y) then
+		setPNBStatus("gagal: blok ini tidak cocok untuk PNB")
+		return
+	end
+
+	PNB.running = true
+	PNB.gen += 1
+	PNB.itemId, PNB.layer, PNB.atSelf, PNB.targetX, PNB.targetY = itemId, layer, atSelf, x, y
+	PNB.cycles = 0
+	local gen = PNB.gen
+	local startX = state.x
+	local startY = state.y
+	local worldName = W.name
+	setPNBStatus(string.format("berjalan: %s (%s, %s) di (%d, %d)",
+		tostring(itemDef.name or itemId), layer, atSelf and "posisi pemain" or "depan", x, y))
+
+	task.spawn(function()
+		local ok, err = pcall(function()
+			while PNB.running and PNB.gen == gen do
+				local s = Bind.state()
+				if not s or W.name ~= worldName or math.abs(s.x - startX) > 0.8 or math.abs(s.y - startY) > 0.8 then
+					PNB.stop("berhenti: posisi pemain atau world berubah")
+					break
+				end
+				if pnbTileId(W, layer, x, y) ~= 0 then
+					PNB.stop("berhenti: tile target sudah terisi")
+					break
+				end
+				collectNearby(W, inv, s)
+				local hasOK, has = pcall(inv.count, inv, itemId)
+				if not hasOK or (tonumber(has) or 0) < 1 then
+					PNB.stop("berhenti: stok blok habis")
+					break
+				end
+				local selectedOK = pcall(inv.select, inv, itemId)
+				if not selectedOK then
+					PNB.stop("berhenti: tidak bisa memilih blok")
+					break
+				end
+				local placeOK = pcall(Bind.setTile, layer, x, y, itemId, false, false)
+				if not placeOK or pnbTileId(W, layer, x, y) ~= itemId then
+					PNB.stop("berhenti: blok tidak bisa dipasang di tile target")
+					break
+				end
+				pcall(inv.remove, inv, itemId, 1)
+				W.punchReady = os.clock() + 0.15
+				task.wait(rnd(0.13, 0.21))
+
+				local hits = 0
+				while PNB.running and PNB.gen == gen and pnbTileId(W, layer, x, y) == itemId and hits < 30 do
+					if not Dig.punch(x, y, false, hits > 0, false, layer == "bg") then
+						break
+					end
+					hits += 1
+					task.wait(rnd(0.06, 0.11))
+				end
+				if not PNB.running or PNB.gen ~= gen then
+					break
+				end
+				if pnbTileId(W, layer, x, y) ~= 0 then
+					PNB.stop("berhenti: blok tidak berhasil dihancurkan")
+					break
+				end
+				task.wait(rnd(0.32, 0.48))
+				local afterBreak = Bind.state() or s
+				collectNearby(W, inv, afterBreak)
+				local dropX = not atSelf and nearestCollectibleDrop(W, inv, afterBreak) or nil
+				if dropX and PNB.running and PNB.gen == gen then
+					local reached = Move.walkTo(dropX, { timeout = 4, tol = 0.2 })
+					if reached and PNB.running and PNB.gen == gen then
+						collectNearby(W, inv, Bind.state() or afterBreak)
+					end
+					if PNB.running and PNB.gen == gen and not Move.walkTo(startX, { timeout = 4, tol = 0.2 }) then
+						PNB.stop("berhenti: tidak bisa kembali setelah collect")
+						break
+					end
+				end
+				PNB.cycles += 1
+				if PNB.cycles % 10 == 0 then
+					setPNBStatus(string.format("berjalan: %d siklus, item %d", PNB.cycles, itemId))
+				end
+				task.wait(rnd(0.12, 0.25))
+			end
+		end)
+		if not ok and PNB.running and PNB.gen == gen then
+			log("PNB error: " .. tostring(err))
+			PNB.stop("berhenti: terjadi error (lihat console)")
+		end
+	end)
+end
+
+--// ===== 7. AUTO HARVEST / AUTO PLANT =====
+local function setFactoryStatus(message)
+	Factory.status = message
+	if Factory.onStatus then
+		pcall(Factory.onStatus, message)
+	end
+end
+
+function Factory.stop(reason)
+	if not Factory.running then
+		return
+	end
+	Factory.running = false
+	Factory.gen += 1
+	Factory.harvest = false
+	Factory.plant = false
+	Factory.cycle = false
+	Factory.phase = "idle"
+	Move.stop()
+	setFactoryStatus(reason or "dihentikan")
+	if Factory.onMode then
+		pcall(Factory.onMode)
+	end
+end
+
+function Factory.seedOptions()
+	Bind.resolve(true)
+	local inv = Bind.inv
+	local items = findItemDB()
+	local rows, seen = {}, {}
+	if inv and items and type(inv.slots) == "table" then
+		for _, slot in ipairs(inv.slots) do
+			local def = type(slot) == "table" and items[slot.id] or nil
+			if type(def) == "table" and def.kind == "seed" and (tonumber(slot.n) or 0) > 0 then
+				table.insert(rows, { id = slot.id, name = def.name or ("Seed " .. slot.id), count = slot.n })
+				seen[slot.id] = true
+			end
+		end
+	end
+	if Factory.seedId and not seen[Factory.seedId] and items then
+		local def = items[Factory.seedId]
+		if type(def) == "table" and def.kind == "seed" then
+			table.insert(rows, { id = Factory.seedId, name = def.name or ("Seed " .. Factory.seedId), count = 0 })
+		end
+	end
+	table.sort(rows, function(a, b)
+		return a.name < b.name
+	end)
+	local values, byLabel = { "Pilih seed..." }, {}
+	for _, row in ipairs(rows) do
+		local label = string.format("%s [#%d] x%d", row.name, row.id, row.count)
+		table.insert(values, label)
+		byLabel[label] = row.id
+	end
+	if #values == 1 then
+		table.insert(values, "Tidak ada seed di inventory")
+	end
+	return values, byLabel
+end
+
+local function factoryAlive(gen)
+	return Factory.running and Factory.gen == gen
+end
+
+local function factoryTreeRipe(W, x, y, seedId)
+	if tileId(x, y) ~= seedId or type(W.treeLook) ~= "function" then
+		return false
+	end
+	if not Factory.treeMap then
+		local ok, upvalues = pcall(debug.getupvalues, W.treeLook)
+		if ok and type(upvalues) == "table" then
+			local key = y * W.w + x
+			for _, candidate in ipairs(upvalues) do
+				if type(candidate) == "table" then
+					local value = candidate[key]
+					if type(value) == "table" and value.id == seedId and type(value.ripe) == "boolean" then
+						Factory.treeMap = candidate
+						break
+					end
+				end
+			end
+		end
+	end
+	local tree = Factory.treeMap and Factory.treeMap[y * W.w + x]
+	return type(tree) == "table" and tree.id == seedId and tree.ripe == true
+end
+
+local function factoryStandX(state, floorY, targetX)
+	local rowY = floorY - 1
+	local bestX, bestDistance
+	for _, standX in ipairs({ targetX - 1, targetX + 1 }) do
+		if standX >= 0 and standX < (tonumber(Bind.W.w) or 100)
+			and Bind.solid(standX, floorY) and not Bind.solid(standX, rowY) then
+			local clear = true
+			for x = math.min(math.floor(state.x), standX), math.max(math.floor(state.x), standX) do
+				if not Bind.solid(x, floorY) or Bind.solid(x, rowY) then
+					clear = false
+					break
+				end
+			end
+			local distance = math.abs(standX + 0.5 - state.x)
+			if clear and (not bestDistance or distance < bestDistance) then
+				bestX, bestDistance = standX, distance
+			end
+		end
+	end
+	return bestX
+end
+
+local function factoryTarget(W, state, floorY, seedId, blocked, onlyKind)
+	local y = floorY - 1
+	local row = W.fg and W.fg[y]
+	if not row then
+		return nil
+	end
+	local function closest(kind)
+		local best, bestDistance
+		for x = 0, (tonumber(W.w) or 100) - 1 do
+			local key = seedId .. ":" .. kind .. x
+			if (not blocked[key] or blocked[key] < os.clock())
+				and not (kind == "plant" and Factory.cycle and x == Factory.workX) then
+				local suitable = kind == "harvest"
+					and row[x] == seedId and factoryTreeRipe(W, x, y, seedId)
+					or kind == "plant" and row[x] == 0 and Bind.solid(x, floorY)
+				if suitable then
+					local standX = factoryStandX(state, floorY, x)
+					if standX then
+						local distance = math.abs(standX + 0.5 - state.x)
+						if not bestDistance or distance < bestDistance then
+							best = { kind = kind, x = x, y = y, standX = standX }
+							bestDistance = distance
+						end
+					end
+				end
+			end
+		end
+		return best
+	end
+	if onlyKind == "harvest" or (not onlyKind and Factory.harvest) then
+		local target = closest("harvest")
+		if target then
+			return target
+		end
+	end
+	if onlyKind == "plant" or (not onlyKind and Factory.plant) then
+		local inv = Bind.inv
+		local ok, count = false, 0
+		if inv then
+			ok, count = pcall(inv.count, inv, seedId)
+		end
+		if ok and (tonumber(count) or 0) > 0 then
+			return closest("plant")
+		end
+	end
+	return nil
+end
+
+local function factoryWork(W, inv, target, seedId, gen)
+	local walkX = target.standX + 0.5
+	local state = Bind.state()
+	local timeout = math.min(30, math.abs(walkX - state.x) / 5 + 5)
+	if not Move.walkTo(walkX, { timeout = timeout, tol = 0.32 }) then
+		return false
+	end
+	local arrived = Bind.state()
+	if not factoryAlive(gen) or Factory.seedId ~= seedId or not (Factory[target.kind] or Factory.cycle)
+		or not arrived or standingFloor(arrived) ~= target.y + 1 then
+		return false
+	end
+	local x, y = target.x, target.y
+	if target.kind == "harvest" then
+		if not factoryTreeRipe(W, x, y, seedId) then
+			return false
+		end
+		for hit = 1, 12 do
+			if not factoryAlive(gen) or tileId(x, y) ~= seedId then
+				break
+			end
+			Dig.punch(x, y, true, hit > 1, false)
+			task.wait(0.06)
+		end
+		if tileId(x, y) ~= 0 then
+			return false
+		end
+		Factory.harvested += 1
+		if factoryAlive(gen) and Bind.solid(x, y + 1) then
+			Move.walkTo(x + 0.5, { timeout = 3, tol = 0.28 })
+		end
+		collectDropsNearby(W, inv, Bind.state(), 0.9)
+		return true
+	end
+	if tileId(x, y) ~= 0 or not Bind.solid(x, y + 1) then
+		return false
+	end
+	local hasOK, count = pcall(inv.count, inv, seedId)
+	if not hasOK or (tonumber(count) or 0) < 1 then
+		return false
+	end
+	pcall(inv.select, inv, seedId)
+	local placed = pcall(Bind.setTile, "fg", x, y, seedId, false, false)
+	if not placed or tileId(x, y) ~= seedId then
+		return false
+	end
+	pcall(inv.remove, inv, seedId, 1)
+	Factory.planted += 1
+	task.wait(0.16)
+	return true
+end
+
+local function factoryCount(inv, itemId)
+	if not itemId or type(inv.count) ~= "function" then
+		return 0
+	end
+	local ok, count = pcall(inv.count, inv, itemId)
+	return ok and (tonumber(count) or 0) or 0
+end
+
+local function factoryWorkSpot(W, state, floorY)
+	local y = floorY - 1
+	local bestX, bestStandX, bestDistance
+	for x = 0, (tonumber(W.w) or 100) - 1 do
+		if tileId(x, y) == 0 and Bind.solid(x, floorY)
+			and (Factory.baseLayer ~= "bg" or bgId(x, y) == 0) then
+			local standX = Factory.baseAtSelf and x or factoryStandX(state, floorY, x)
+			if standX and not Bind.solid(standX, y) then
+				local clear = true
+				for px = math.min(math.floor(state.x), standX), math.max(math.floor(state.x), standX) do
+					if not Bind.solid(px, floorY) or Bind.solid(px, y) then
+						clear = false
+						break
+					end
+				end
+				local distance = math.abs(standX + 0.5 - state.x)
+				if clear and (not bestDistance or distance < bestDistance) then
+					bestX, bestStandX, bestDistance = x, standX, distance
+				end
+			end
+		end
+	end
+	return bestX, bestStandX
+end
+
+local function factoryPNBOne(W, inv, floorY, gen)
+	local baseId = Factory.baseId
+	if factoryCount(inv, baseId) < 1 then
+		return false
+	end
+	local s = Bind.state()
+	if not s then
+		return false
+	end
+	local x, standX = Factory.workX, Factory.workStandX
+	local y = floorY - 1
+	if not x or pnbTileId(W, Factory.baseLayer, x, y) ~= 0 or tileId(x, y) ~= 0 then
+		x, standX = factoryWorkSpot(W, s, floorY)
+		Factory.workX, Factory.workStandX = x, standX
+	end
+	if not x or not standX then
+		return false
+	end
+	local walkX = standX + 0.5
+	local timeout = math.min(30, math.abs(walkX - s.x) / 5 + 5)
+	if not Move.walkTo(walkX, { timeout = timeout, tol = 0.3 }) then
+		return false
+	end
+	local arrived = Bind.state()
+	if not factoryAlive(gen) or not arrived or standingFloor(arrived) ~= floorY
+		or pnbTileId(W, Factory.baseLayer, x, y) ~= 0 or tileId(x, y) ~= 0 then
+		return false
+	end
+	pcall(inv.select, inv, baseId)
+	local placed = pcall(Bind.setTile, Factory.baseLayer, x, y, baseId, false, false)
+	if not placed or pnbTileId(W, Factory.baseLayer, x, y) ~= baseId then
+		return false
+	end
+	pcall(inv.remove, inv, baseId, 1)
+	W.punchReady = os.clock() + 0.15
+	task.wait(0.18)
+	for hit = 1, 30 do
+		if not factoryAlive(gen) or pnbTileId(W, Factory.baseLayer, x, y) ~= baseId then
+			break
+		end
+		Dig.punch(x, y, false, hit > 1, Factory.baseId == 4, Factory.baseLayer == "bg")
+		task.wait(0.07)
+	end
+	if pnbTileId(W, Factory.baseLayer, x, y) ~= 0 then
+		return false
+	end
+	Factory.pnb += 1
+	task.wait(0.3)
+	if factoryAlive(gen) and not Factory.baseAtSelf and Bind.solid(x, floorY) then
+		Move.walkTo(x + 0.5, { timeout = 3, tol = 0.28 })
+	end
+	collectDropsNearby(W, inv, Bind.state(), 0.9)
+	return true
+end
+
+local function factoryHasTrees(W, floorY, seedId)
+	local row = W.fg and W.fg[floorY - 1]
+	if row then
+		for x = 0, (tonumber(W.w) or 100) - 1 do
+			if row[x] == seedId then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+local function factoryRoom(inv, itemId)
+	local ok, room = pcall(inv.room, inv, itemId)
+	return ok and (tonumber(room) or 0) or 0
+end
+
+local function factoryCycleStep(W, inv, state, floorY, seedId, blocked, gen)
+	local blocks = factoryCount(inv, Factory.baseId)
+	local seeds = factoryCount(inv, seedId)
+	local blockFull = blocks >= 200 or factoryRoom(inv, Factory.baseId) == 0
+	local seedFull = seeds >= 200 or factoryRoom(inv, seedId) == 0
+
+	if Factory.phase == "harvest" then
+		if blockFull then
+			Factory.phase = "pnb"
+			setFactoryStatus(string.format("Factory: blok penuh (%d), lanjut PNB", blocks))
+			return 0.1
+		end
+		local target = factoryTarget(W, state, floorY, seedId, blocked, "harvest")
+		if target then
+			if factoryWork(W, inv, target, seedId, gen) then
+				task.wait(0.25)
+				collectDropsNearby(W, inv, Bind.state(), 0.9)
+				if factoryAlive(gen) then
+					setFactoryStatus(string.format("Factory: harvest %d | blok %d/200",
+						Factory.harvested, factoryCount(inv, Factory.baseId)))
+				end
+			else
+				blocked[seedId .. ":harvest" .. target.x] = os.clock() + 20
+			end
+			return 0.18
+		end
+		Factory.phase = "pnb"
+		setFactoryStatus(string.format("Factory: tidak ada tree matang, PNB %d blok", blocks))
+		return 0.1
+	end
+
+	if Factory.phase == "pnb" then
+		if blocks <= 0 or seedFull then
+			Factory.phase = "plant"
+			setFactoryStatus(string.format("Factory: PNB selesai | blok %d, seed %d; mulai tanam", blocks, seeds))
+			return 0.1
+		end
+		if factoryPNBOne(W, inv, floorY, gen) then
+			if factoryAlive(gen) then
+				setFactoryStatus(string.format("Factory: PNB %d | blok %d, seed %d",
+					Factory.pnb, factoryCount(inv, Factory.baseId), factoryCount(inv, seedId)))
+			end
+		else
+			Factory.workX, Factory.workStandX = nil, nil
+			if factoryAlive(gen) then
+				setFactoryStatus("Factory: mencari tile kerja PNB yang kosong")
+			end
+		end
+		return 0.3
+	end
+
+	if Factory.phase == "plant" then
+		if seeds <= 0 then
+			Factory.phase = "grow"
+			setFactoryStatus("Factory: seed habis; cek tree dan sisa blok")
+			return 0.1
+		end
+		local target = factoryTarget(W, state, floorY, seedId, blocked, "plant")
+		if target then
+			if factoryWork(W, inv, target, seedId, gen) then
+				if factoryAlive(gen) then
+					setFactoryStatus(string.format("Factory: plant %d | sisa seed %d",
+						Factory.planted, factoryCount(inv, seedId)))
+				end
+			else
+				blocked[seedId .. ":plant" .. target.x] = os.clock() + 20
+			end
+			return 0.18
+		end
+		local ripe = factoryTarget(W, state, floorY, seedId, blocked, "harvest")
+		if ripe and not blockFull then
+			Factory.phase = "harvest"
+			setFactoryStatus("Factory: tile tanam penuh; panen tree matang untuk membuka ruang")
+			return 0.1
+		end
+		if ripe and blockFull and blocks > 0 and not seedFull then
+			Factory.phase = "pnb"
+			setFactoryStatus("Factory: tile tanam penuh; kosongkan blok lewat PNB sebelum panen")
+			return 0.1
+		end
+		setFactoryStatus(string.format("Factory: menunggu tile tanam kosong (%d seed tersisa)", seeds))
+		collectDropsNearby(W, inv, state, 0.9)
+		return 1
+	end
+
+	-- Setelah seed habis, mulai lagi dari panen bila ada tree matang.
+	-- Jika belum ada, lanjut PNB sisa blok atau tunggu pohon tumbuh.
+	local ripe = factoryTarget(W, state, floorY, seedId, blocked, "harvest")
+	if ripe and not blockFull then
+		Factory.phase = "harvest"
+		setFactoryStatus("Factory: tree matang; mulai harvest lagi")
+	elseif blocks > 0 and not seedFull then
+		Factory.phase = "pnb"
+		setFactoryStatus(string.format("Factory: lanjut PNB %d blok sambil menunggu tree", blocks))
+	elseif seeds > 0 then
+		Factory.phase = "plant"
+		setFactoryStatus(string.format("Factory: tanam %d seed yang tersedia", seeds))
+	elseif not factoryHasTrees(W, floorY, seedId) and blocks <= 0 then
+		Factory.stop("berhenti: seed, blok, dan pohon pilihan sudah habis")
+	else
+		Factory.phase = "grow"
+		setFactoryStatus(string.format("Factory: menunggu tree matang (panen %d, PNB %d, tanam %d)",
+			Factory.harvested, Factory.pnb, Factory.planted))
+	end
+	collectDropsNearby(W, inv, state, 0.9)
+	return 1
+end
+
+local function startFactory()
+	if Factory.running then
+		return true
+	end
+	if Farm.running or PNB.running then
+		setFactoryStatus("gagal: matikan Dirt Farm atau PNB terlebih dahulu")
+		return false
+	end
+	Bind.resolve(true)
+	local W, inv = Bind.W, Bind.inv
+	local seedId = Factory.seedId
+	local def = seedId and selectedItemDefinition(seedId)
+	if not (W and inv and Bind.CT and Bind.hit and Bind.setTile and def and def.kind == "seed") then
+		setFactoryStatus("gagal: pilih seed dari daftar inventory")
+		return false
+	end
+	local baseId, baseDef
+	if Factory.cycle then
+		local items = findItemDB()
+		baseId = seedId - 1
+		baseDef = items and items[baseId]
+		if type(baseDef) ~= "table" or baseDef.farmable ~= true
+			or def.name ~= (tostring(baseDef.name) .. " Seed") or Dig.protectedIds[baseId] then
+			setFactoryStatus("gagal: seed ini tidak memiliki pasangan blok farmable untuk PNB")
+			return false
+		end
+	end
+	local state = Bind.state()
+	local floorY = state and standingFloor(state)
+	if not floorY or not Bind.solid(math.floor(state.x), floorY) then
+		setFactoryStatus("gagal: karakter harus berdiri di atas lantai")
+		return false
+	end
+	Factory.running = true
+	Factory.gen += 1
+	Factory.treeMap = nil
+	Factory.harvested, Factory.planted = 0, 0
+	Factory.pnb = 0
+	Factory.phase = Factory.cycle and "harvest" or "manual"
+	Factory.seedName = def.name or ("Seed " .. seedId)
+	Factory.baseId, Factory.baseName = baseId, baseDef and baseDef.name or nil
+	Factory.baseLayer = baseDef and (baseDef.background == true and "bg" or "fg") or nil
+	Factory.baseAtSelf = baseDef and (baseDef.background == true or baseDef.solid == false) or nil
+	Factory.workX, Factory.workStandX = nil, nil
+	if Factory.cycle then
+		Factory.workX, Factory.workStandX = factoryWorkSpot(W, state, floorY)
+	end
+	local gen, worldName = Factory.gen, W.name
+	local blocked = {}
+	setFactoryStatus(string.format("berjalan: %s, lantai Y=%d", Factory.seedName, floorY))
+	task.spawn(function()
+		local ok, err = pcall(function()
+			while factoryAlive(gen) do
+				local s = Bind.state()
+				if not s or W.name ~= worldName or standingFloor(s) ~= floorY then
+					Factory.stop("berhenti: posisi pemain atau world berubah")
+					break
+				end
+				local currentSeed = Factory.seedId
+				if Factory.cycle then
+					task.wait(factoryCycleStep(W, inv, s, floorY, currentSeed, blocked, gen))
+				else
+					local target = factoryTarget(W, s, floorY, currentSeed, blocked)
+					if target then
+						local worked = factoryWork(W, inv, target, currentSeed, gen)
+						if factoryAlive(gen) then
+							if worked then
+								setFactoryStatus(string.format("%s: panen %d, tanam %d (Y=%d)",
+										Factory.seedName, Factory.harvested, Factory.planted, floorY))
+							else
+								blocked[currentSeed .. ":" .. target.kind .. target.x] = os.clock() + 20
+							end
+						end
+						task.wait(0.18)
+					else
+						collectDropsNearby(W, inv, s, 0.9)
+						task.wait(1)
+					end
+				end
+			end
+		end)
+		if not ok and factoryAlive(gen) then
+			log("Auto Harvest/Plant error: " .. tostring(err))
+			Factory.stop("berhenti: terjadi error (lihat console)")
+		end
+	end)
+	return true
+end
+
+function Factory.setMode(mode, on)
+	if on and ((mode == "cycle" and (Factory.harvest or Factory.plant))
+		or (mode ~= "cycle" and Factory.cycle)) then
+		Factory.stop("beralih mode Auto Farming")
+	end
+	Factory[mode] = on
+	if on then
+		if startFactory() then
+			if Factory.onMode then
+				pcall(Factory.onMode)
+			end
+		else
+			Factory[mode] = false
+			if Factory.onMode then
+				pcall(Factory.onMode)
+			end
+		end
+	elseif Factory.running and not Factory.harvest and not Factory.plant and not Factory.cycle then
+		Factory.stop("dimatikan dari toggle")
+	end
+end
+
+--// ===== 8. UI (WindUI) =====
 local okLoad, WindUI = pcall(function()
 	return loadstring(game:HttpGet("https://github.com/Footagesus/WindUI/releases/latest/download/main.lua"))()
 end)
@@ -968,7 +1852,7 @@ end
 
 local Window = WindUI:CreateWindow({
 	Title = "Human Hub",
-	Author = "gerak seperti manusia - fitur #1: dirt farm",
+	Author = "Dirt Farm + PNB + Auto Factory",
 	Icon = "person-standing",
 	Size = UDim2.fromOffset(560, 460),
 	Theme = "Dark",
@@ -976,9 +1860,167 @@ local Window = WindUI:CreateWindow({
 })
 Hub.Window = Window
 
+local pnbTab = Window:Tab({ Title = "Auto Farming", Icon = "blocks" })
 local farmTab = Window:Tab({ Title = "Dirt Farm", Icon = "pickaxe" })
 local moveTab = Window:Tab({ Title = "Gerak", Icon = "footprints" })
 local infoTab = Window:Tab({ Title = "Info", Icon = "info" })
+
+-- ---- Tab Auto Farming ----
+local pnbSec = pnbTab:Section({ Title = "PNB (Place and Break)", Opened = true })
+local pnbStatusPara
+local pnbToggle
+
+pnbSec:Paragraph({
+	Title = "Cara pakai",
+	Desc = "Pilih item farmable di hotbar, lalu nyalakan PNB. Background dan item non-solid seperti Pepper Tree dipasang pada tile pemain; blok solid dipasang di depan.",
+})
+
+pnbToggle = pnbSec:Toggle({
+	Title = "PNB",
+	Desc = "Otomatis memilih layer background atau foreground dari jenis item. Auto Collect aktif secara bawaan.",
+	Value = false,
+	Callback = function(on)
+		if on then
+			startPNB()
+			if not PNB.running and pnbToggle and pnbToggle.Set then
+				pcall(pnbToggle.Set, pnbToggle, false)
+			end
+		else
+			PNB.stop("dimatikan dari toggle")
+		end
+	end,
+})
+
+pnbSec:Toggle({
+	Title = "Auto Collect",
+	Desc = "Item pada posisi pemain: ambil drop langsung. Blok solid di depan: dekati drop, ambil, lalu kembali jika inventory masih punya ruang.",
+	Value = true,
+	Callback = function(on)
+		PNB.autoCollect = on
+	end,
+})
+
+pnbStatusPara = pnbSec:Paragraph({ Title = "Status PNB", Desc = "idle" })
+
+PNB.onStatus = function(message)
+	if pnbStatusPara then
+		if pnbStatusPara.SetDesc then
+			pcall(pnbStatusPara.SetDesc, pnbStatusPara, message)
+		elseif pnbStatusPara.SetTitle then
+			pcall(pnbStatusPara.SetTitle, pnbStatusPara, "Status PNB: " .. message)
+		end
+	end
+	if not PNB.running and pnbToggle and pnbToggle.Set then
+		pcall(pnbToggle.Set, pnbToggle, false)
+	end
+end
+
+-- ---- Auto Harvest / Auto Plant ----
+local factorySec = pnbTab:Section({ Title = "Auto Harvest & Auto Plant", Opened = true })
+factorySec:Paragraph({
+	Title = "Cara kerja",
+	Desc = "Pilih seed dari inventory. Auto Factory bekerja bertahap: harvest sampai blok penuh atau tak ada tree matang, PNB sampai blok habis atau seed penuh, lalu plant sampai seed habis.",
+})
+
+local seedValues, seedByLabel = Factory.seedOptions()
+local seedPlaceholder = "Pilih seed..."
+Factory.seedId = nil
+Factory.seedName = nil
+local seedDropdown = factorySec:Dropdown({
+	Title = "Pilih seed",
+	Desc = "Pilih seed secara manual sebelum menyalakan fitur. Seed ini menentukan pohon yang dipanen dan ditanam.",
+	Values = seedValues,
+	Value = seedPlaceholder,
+	Callback = function(label)
+		local id = seedByLabel[label]
+		if Factory.cycle and Factory.running and id ~= Factory.seedId then
+			Factory.stop("seed berubah; nyalakan Auto Factory lagi")
+		end
+		Factory.seedId = id
+		local def = id and selectedItemDefinition(id)
+		Factory.seedName = def and def.name or nil
+	end,
+})
+
+factorySec:Button({
+	Title = "Refresh daftar seed",
+	Desc = "Perbarui seed yang tersedia setelah inventory berubah.",
+	Callback = function()
+		local values, byLabel = Factory.seedOptions()
+		seedByLabel = byLabel
+		local selected = seedPlaceholder
+		for _, label in ipairs(values) do
+			if byLabel[label] == Factory.seedId then
+				selected = label
+				break
+			end
+		end
+		seedDropdown:Refresh(values)
+		seedDropdown:Select(selected)
+		if Factory.cycle and Factory.running and byLabel[selected] ~= Factory.seedId then
+			Factory.stop("seed berubah; nyalakan Auto Factory lagi")
+		end
+		Factory.seedId = byLabel[selected]
+		local def = Factory.seedId and selectedItemDefinition(Factory.seedId)
+		Factory.seedName = def and def.name or nil
+	end,
+})
+
+local harvestToggle, plantToggle, cycleToggle
+harvestToggle = factorySec:Toggle({
+	Title = "Auto Harvest",
+	Desc = "Panen pohon matang dari seed yang dipilih pada lantai saat ini.",
+	Value = false,
+	Callback = function(on)
+		if not Factory.syncingUI then
+			Factory.setMode("harvest", on)
+		end
+	end,
+})
+plantToggle = factorySec:Toggle({
+	Title = "Auto Plant",
+	Desc = "Tanam seed yang dipilih di tile kosong dengan lantai solid di bawahnya.",
+	Value = false,
+	Callback = function(on)
+		if not Factory.syncingUI then
+			Factory.setMode("plant", on)
+		end
+	end,
+})
+cycleToggle = factorySec:Toggle({
+	Title = "Auto Factory",
+	Desc = "Urutan: harvest hingga blok 200/tak ada tree matang; PNB hingga blok habis/seed penuh; plant hingga seed habis. Lalu ulangi.",
+	Value = false,
+	Callback = function(on)
+		if not Factory.syncingUI then
+			Factory.setMode("cycle", on)
+		end
+	end,
+})
+
+local factoryStatusPara = factorySec:Paragraph({ Title = "Status Harvest/Plant", Desc = "idle" })
+Factory.onStatus = function(message)
+	if factoryStatusPara then
+		if factoryStatusPara.SetDesc then
+			pcall(factoryStatusPara.SetDesc, factoryStatusPara, message)
+		elseif factoryStatusPara.SetTitle then
+			pcall(factoryStatusPara.SetTitle, factoryStatusPara, "Status Harvest/Plant: " .. message)
+		end
+	end
+end
+Factory.onMode = function()
+	Factory.syncingUI = true
+	if harvestToggle and harvestToggle.Set then
+		pcall(harvestToggle.Set, harvestToggle, Factory.harvest)
+	end
+	if plantToggle and plantToggle.Set then
+		pcall(plantToggle.Set, plantToggle, Factory.plant)
+	end
+	if cycleToggle and cycleToggle.Set then
+		pcall(cycleToggle.Set, cycleToggle, Factory.cycle)
+	end
+	Factory.syncingUI = false
+end
 
 -- ---- Tab Dirt Farm ----
 local farmSec = farmTab:Section({ Title = "Auto Dirt Farm", Opened = true })
@@ -1056,6 +2098,8 @@ farmSec:Button({
 	Desc = "Menghentikan bot dan memastikan A/D/Space tidak tertahan.",
 	Callback = function()
 		Farm.stop("dihentikan manual")
+		PNB.stop("dihentikan manual")
+		Factory.stop("dihentikan manual")
 		if farmToggle and farmToggle.Set then
 			pcall(farmToggle.Set, farmToggle, false)
 		end
@@ -1109,8 +2153,8 @@ moveSec:Slider({
 })
 
 local function testWalk(dir)
-	if Farm.running then
-		WindUI:Notify({ Title = "Gerak", Content = "Matikan Auto Dirt Farm dulu.", Duration = 3 })
+	if Farm.running or PNB.running or Factory.running then
+		WindUI:Notify({ Title = "Gerak", Content = "Matikan fitur auto farming dulu.", Duration = 3 })
 		return
 	end
 	local s = Bind.state()
@@ -1152,7 +2196,7 @@ moveSec:Paragraph({
 -- ---- Tab Info ----
 infoTab:Section({ Title = "Fitur", Opened = true }):Paragraph({
 	Title = "Sudah ada",
-	Desc = "1) Auto Dirt Farm: menyisir seluruh world, menggali lorong 1 block (foreground + cave background), turun lewat poros tepi sampai tidak bisa digali lagi, dan mengganti lava di lantai dengan dirt.",
+	Desc = "1) Auto Factory: harvest hingga blok penuh/tak ada tree, PNB hingga blok habis/seed penuh, plant hingga seed habis, lalu ulangi. 2) Auto Harvest/Plant terpisah. 3) PNB. 4) Dirt Farm.",
 })
 
 infoTab:Section({ Title = "Keamanan", Opened = true }):Paragraph({
@@ -1167,38 +2211,54 @@ infoTab:Section({ Title = "Catatan", Opened = true }):Paragraph({
 
 log("loaded v" .. Hub.version)
 -- WindUI tidak auto-pilih tab: tanpa ini panel isi kelihatan kosong.
-if farmTab.Select then
-	pcall(farmTab.Select, farmTab)
+if pnbTab.Select then
+	pcall(pnbTab.Select, pnbTab)
 end
-WindUI:Notify({ Title = "Human Hub", Content = "Siap. Buka tab Dirt Farm.", Duration = 4 })
+WindUI:Notify({ Title = "Human Hub", Content = "Siap. Pilih seed di tab Auto Farming.", Duration = 4 })
 
 Hub.debug = {
 	Bind = Bind,
 	Move = Move,
 	Farm = Farm,
+	PNB = PNB,
+	Factory = Factory,
 	Dig = Dig,
 	Place = Place,
 	startFarm = startFarm,
+	startPNB = startPNB,
+	startFactory = startFactory,
 	sweepFloor = sweepFloor,
 	descendTo = descendTo,
 	rowNeedsDig = rowNeedsDig,
 }
 
---// ===== 7. HEARTBEAT / PENJAGA =====
+--// ===== 9. HEARTBEAT / PENJAGA =====
 -- kalau karakter hilang (respawn / keluar world), hentikan bot supaya
 -- tidak menekan tombol terus tanpa tujuan.
 Hub.keep(RunService.Heartbeat:Connect(function()
-	if not Farm.running then
+	if not Farm.running and not PNB.running and not Factory.running then
 		return
 	end
 	local s = Bind.state()
 	if not s then
-		Farm.stop("state hilang (respawn / pindah world)")
+		if Farm.running then
+			Farm.stop("state hilang (respawn / pindah world)")
+		end
+		if PNB.running then
+			PNB.stop("state hilang (respawn / pindah world)")
+		end
+		if Factory.running then
+			Factory.stop("state hilang (respawn / pindah world)")
+		end
 	end
 end))
 
 Hub.onUnload(function()
 	Farm.running = false
 	Farm.gen += 1
-	Move.release()
+	PNB.running = false
+	PNB.gen += 1
+	Factory.running = false
+	Factory.gen += 1
+	Move.stop()
 end)
