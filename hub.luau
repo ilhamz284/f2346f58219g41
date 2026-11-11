@@ -26,7 +26,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.7",
+	version = "0.4.8",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -1501,6 +1501,10 @@ function Path.explore(sx, sy, maxNodes)
 							push(cx, cy, cc, cx, ny, 2 + ny - cy, "drop", shaftX)
 							break
 						end
+						if canStand(shaftX, ny) then
+							push(cx, cy, cc, shaftX, ny, 2 + ny - cy, "dropShaft", shaftX)
+							break
+						end
 					end
 				end
 			end
@@ -1544,22 +1548,41 @@ local function pathStep(cx, cy, step, aliveFn)
 	if step.kind == "walk" then
 		return Move.walkTo(step.x + 0.5, { timeout = 5, tol = 0.35 }) and landed()
 	end
-	if step.kind == "drop" then
+	if step.kind == "drop" or step.kind == "dropShaft" then
 		local outward = step.shaftX < cx and KeyLeft or KeyRight
 		local inward = step.shaftX < cx and KeyRight or KeyLeft
+		local edgeStopX = step.shaftX < cx and step.shaftX + 0.88 or step.shaftX + 0.12
 		Move.hold(outward)
 		local deadline = os.clock() + 1.8
 		while aliveFn() and os.clock() < deadline do
 			local s = Bind.state()
 			if not s then break end
-			if s.y >= cy + 1.85 then break end
+			if step.kind == "dropShaft" then
+				if landed() then
+					Move.release()
+					return true
+				end
+			elseif (step.shaftX < cx and s.x <= edgeStopX)
+				or (step.shaftX > cx and s.x >= edgeStopX)
+				or s.y >= cy + 1.18 then
+				break
+			end
+			task.wait(0.03)
+		end
+		if step.kind == "dropShaft" then
+			Move.release()
+			return landed()
+		end
+		Move.release()
+		deadline = os.clock() + 0.7
+		while aliveFn() and os.clock() < deadline do
+			local s = Bind.state()
+			if not s then break end
+			if s.y >= cy + 1.18 then break end
 			task.wait(0.03)
 		end
 		local falling = Bind.state()
-		if not falling or falling.y < cy + 1.85 then
-			Move.release()
-			return false
-		end
+		if not falling or falling.y < cy + 1.18 then return false end
 		Move.hold(inward)
 		deadline = os.clock() + 1.5
 		while aliveFn() and os.clock() < deadline do
@@ -1580,6 +1603,11 @@ local function pathStep(cx, cy, step, aliveFn)
 		return false
 	end
 	if step.kind == "jump" then
+		local readyAt = (Move.lastJumpAt or 0) + 0.7
+		if os.clock() < readyAt then
+			task.wait(readyAt - os.clock() + rnd(0.04, 0.10))
+		end
+		if not aliveFn() then return false end
 		if step.x ~= cx then Move.hold(step.x > cx and KeyRight or KeyLeft) end
 		task.wait(rnd(0.03, 0.08))
 		if not Move.jump() then
@@ -1610,6 +1638,7 @@ function Path.moveTo(tx, ty, aliveFn)
 	end
 	local goalKey = keyOf(tx, ty)
 	local path, idx, expect = nil, 1, nil
+	local failedTransitions = 0
 	for _ = 1, 400 do
 		if not aliveFn() then
 			Move.release()
@@ -1644,11 +1673,20 @@ function Path.moveTo(tx, ty, aliveFn)
 		end
 		if not pathStep(cx, cy, step, aliveFn) then
 			Move.release()
-			return false
+			local landed = Bind.state()
+			if not landed or not landed.grounded
+				or (math.floor(landed.x) == cx and math.floor(landed.y - 0.0001) == cy) then
+				return false
+			end
+			failedTransitions += 1
+			if failedTransitions >= 3 then return false end
+			path, expect = nil, nil
+			task.wait(0.3)
+		else
+			expect = { x = step.x, y = step.y }
+			idx += 1
+			task.wait(0.04)
 		end
-		expect = { x = step.x, y = step.y }
-		idx += 1
-		task.wait(0.04)
 	end
 	Move.release()
 	return false
