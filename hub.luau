@@ -9,7 +9,7 @@
 --//            background dan blok non-solid pada tile pemain, dengan Auto Collect.
 --// Fitur #3 : Auto Harvest / Auto Plant dengan seed pilihan dari inventory.
 --// Fitur #4 : Auto Factory: panen sampai blok penuh / tree habis,
---//            PNB sampai blok habis / seed penuh, tanam sampai seed habis.
+--//            PNB sampai blok habis, tanam sampai seed habis.
 --//
 --// Prinsip gerak:
 --//   - semua gerak lewat keypress A/D + Space (VirtualInputManager)
@@ -26,7 +26,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.18",
+	version = "0.4.31",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -395,6 +395,13 @@ local Factory = {
 	workY = nil,
 	workStandX = nil,
 	pnbPathFailures = 0,
+	pnbSkipUntil = nil,
+	pnbLowWater = nil,
+	harvestFailures = 0,
+	harvestSkipUntil = nil,
+	harvestFailCount = {},
+	homeWorld = nil,
+	lastRejoinAt = 0,
 	pnb = 0,
 	phase = "idle",
 	treeMap = nil,
@@ -1340,6 +1347,8 @@ function Factory.stop(reason)
 	Factory.plant = false
 	Factory.cycle = false
 	Factory.phase = "idle"
+	Factory.pnbLowWater = nil
+	Factory.homeWorld = nil
 	Move.stop()
 	setFactoryStatus(reason or "dihentikan")
 	if Factory.onMode then
@@ -1392,6 +1401,73 @@ local Path = {}
 
 local function keyOf(x, y)
 	return y * 1000 + x
+end
+
+-- Transisi tile yang sudah terbukti gagal (lompat/jatuh/walk tidak sampai)
+-- disimpan sebentar supaya pathfinder tidak memilih jalur yang mustahil
+-- berulang-ulang dan factory tidak terjebak di pohon yang sama.
+Path.blockedEdges = {}
+
+local function edgeKeyOf(fx, fy, tx, ty)
+	return tostring(keyOf(fx, fy)) .. ">" .. tostring(keyOf(tx, ty))
+end
+
+function Path.blockEdge(fx, fy, tx, ty, seconds)
+	Path.blockedEdges[edgeKeyOf(fx, fy, tx, ty)] = os.clock() + (seconds or 60)
+end
+
+local function edgeBlocked(fx, fy, tx, ty)
+	local k = edgeKeyOf(fx, fy, tx, ty)
+	local untilAt = Path.blockedEdges[k]
+	if not untilAt then
+		return false
+	end
+	if untilAt > os.clock() then
+		return true
+	end
+	Path.blockedEdges[k] = nil
+	return false
+end
+
+-- Cek sekali apakah karakter benar-benar bisa lompat. Di beberapa client
+-- tombol Space tidak diteruskan ke game, sehingga semua transisi "lompat
+-- naik" di pathfinder mustahil dan factory hanya membuang waktu.
+function Path.probeJump()
+	if Path.canJump ~= nil then
+		return Path.canJump
+	end
+	local s = Bind.state()
+	if not s or not s.grounded then
+		return nil
+	end
+	local y0, minY = s.y, s.y
+	if not Move.jump() then
+		return nil
+	end
+	local deadline = os.clock() + 0.9
+	while os.clock() < deadline do
+		local now = Bind.state()
+		if now then
+			minY = math.min(minY, now.y)
+		end
+		task.wait(0.02)
+	end
+	local rise = y0 - minY
+	if rise < 0.6 then
+		-- Langit-langit rendah membuat lompatan tidak naik walau client
+		-- sebenarnya bisa lompat. Jangan simpulkan apa-apa di posisi itu.
+		local cx, cy = math.floor(s.x), math.floor(s.y - 0.0001)
+		local headroom = 0
+		for dy = 1, 3 do
+			if Bind.solid(cx, cy - dy) then break end
+			headroom += 1
+		end
+		if headroom < 3 then
+			return nil
+		end
+	end
+	Path.canJump = rise >= 0.6
+	return Path.canJump
 end
 
 function Path.standable(x, y)
@@ -1479,6 +1555,9 @@ function Path.explore(sx, sy, maxNodes)
 		if not canStand(nx, ny) then
 			return
 		end
+		if edgeBlocked(cx, cy, nx, ny) then
+			return
+		end
 		local k = keyOf(nx, ny)
 		local nc = cc + cost
 		if dist[k] == nil or nc < dist[k] then
@@ -1500,10 +1579,14 @@ function Path.explore(sx, sy, maxNodes)
 			push(cx, cy, cc, cx + 1, cy, 1, "walk")
 
 			-- Melangkah ke poros samping, lalu mendarat di lantai berikutnya.
+			-- Jatuh maksimal 3 tile: setinggi lompatan. Poros dalam yang lebih
+			-- dari itu tidak punya pijakan untuk kembali, jadi pemain bisa
+			-- terjebak di dasar poros dan factory berhenti bekerja.
 			for _, dir in ipairs({ -1, 1 }) do
 				local shaftX = cx + dir
 				if shaftX >= 0 and shaftX < w and not isSolid(shaftX, cy) then
 					for ny = cy + 1, h - 2 do
+						if ny - cy > 3 then break end
 						if isSolid(shaftX, ny) then break end
 						if canStand(cx, ny) then
 							push(cx, cy, cc, cx, ny, 2 + ny - cy, "drop", shaftX)
@@ -1518,13 +1601,14 @@ function Path.explore(sx, sy, maxNodes)
 			end
 
 			-- lompat naik 1..3 tile, geser 0..2 tile
-			if not isSolid(cx, cy - 1) then
+			if Path.canJump ~= false and not isSolid(cx, cy - 1) then
 				for up = 1, 3 do
 					for dx = -2, 2 do
 						local nx, ny = cx + dx, cy - up
-						-- Dinding di samping poros menahan gerak mendatar sejak
-						-- awal lompatan. Gunakan edgeJump dari lantai itu.
-						if up == 1 or dx == 0 or not isSolid(nx, cy - 1) then
+						-- Dinding setinggi 1 tile di samping pemain bukan penghalang:
+						-- pemain naik dulu, baru bergeser di puncak lompatan.
+						-- Lompat 3 tile ke samping tetap dibatasi karena marginnya nol.
+						if dx == 0 or up <= 2 or not isSolid(nx, cy - 1) then
 							push(cx, cy, cc, nx, ny, 2 + math.abs(dx) + up, "jump")
 						end
 					end
@@ -1533,7 +1617,7 @@ function Path.explore(sx, sy, maxNodes)
 
 			-- Lantai penuh punya langit-langit tepat di atas pemain. Naik lewat
 			-- celah tepi: keluar sedikit, lompat di poros, lalu masuk lagi.
-			if cy >= 2 then
+			if Path.canJump ~= false and cy >= 2 then
 				for _, dir in ipairs({ -1, 1 }) do
 					local shaftX = cx + dir
 					-- Poros kanan ada di data tile, tetapi batas fisik world
@@ -1756,6 +1840,7 @@ function Path.moveTo(tx, ty, aliveFn)
 			Move.release()
 			return true
 		end
+		local firstStep = step
 		local stepCount = 1
 		if step.kind == "walk" then
 			local direction = step.x > cx and 1 or -1
@@ -1775,6 +1860,9 @@ function Path.moveTo(tx, ty, aliveFn)
 		end
 		if not pathStep(cx, cy, step, aliveFn) then
 			Move.release()
+			-- Catat transisi pertama yang gagal. Tanpa ini pathfinder akan
+			-- menawarkan jalur yang sama lagi pada percobaan berikutnya.
+			Path.blockEdge(cx, cy, firstStep.x, firstStep.y, 45)
 			local landed = Bind.state()
 			if not landed or not landed.grounded
 				or (math.floor(landed.x) == cx and math.floor(landed.y - 0.0001) == cy) then
@@ -1833,33 +1921,50 @@ local function factoryHasRipeTree(W, seedId)
 end
 
 local function factoryTarget(W, state, seedId, blocked, onlyKind)
-	local dist = Path.explore(math.floor(state.x), math.floor(state.y - 0.0001), 6000)
+	local cy = math.floor(state.y - 0.0001)
+	local dist = Path.explore(math.floor(state.x), cy, 6000)
 	if not dist then
 		return nil
 	end
-	local function closest(kind)
+	local function closest(kind, floorMode, allowSelf)
 		local best, bestDistance
 		for y = 0, (tonumber(W.h) or 60) - 2 do
-			local row = W.fg and W.fg[y]
-			if row then
-				for x = 0, (tonumber(W.w) or 100) - 1 do
-					local key = seedId .. ":" .. kind .. ":" .. y .. ":" .. x
-					if not blocked[key] or blocked[key] < os.clock() then
-						-- Kolom paling kanan terlihat kosong di peta, tetapi tubuh
-						-- pemain tertahan batas world sebelum bisa menanam di sana.
-						local edgeTile = kind == "plant" and x >= (tonumber(W.w) or 100) - 1
-						local reserved = Factory.cycle and kind == "plant"
-							and Factory.workX == x and Factory.workY == y
-						local suitable = not edgeTile and not reserved and (kind == "harvest"
-							and row[x] == seedId and factoryTreeRipe(W, x, y, seedId)
-							or kind == "plant" and row[x] == 0 and Bind.solid(x, y + 1))
-						if suitable then
-							for _, standX in ipairs({ x, x - 1, x + 1 }) do
-								local standKey = keyOf(standX, y)
-								local distance = dist[standKey]
-								if distance and (not bestDistance or distance < bestDistance) then
-									best = { kind = kind, x = x, y = y, standX = standX, standY = y }
-									bestDistance = distance
+			local inFloor = floorMode == nil
+				or (floorMode == "same" and y == cy)
+				or (floorMode == "below" and y > cy)
+				or (floorMode == "above" and y < cy)
+			local rowBlocked = blocked[kind .. ":row:" .. y]
+			if inFloor and not (rowBlocked and rowBlocked > os.clock()) then
+				local row = W.fg and W.fg[y]
+				if row then
+					for x = 0, (tonumber(W.w) or 100) - 1 do
+						local key = seedId .. ":" .. kind .. ":" .. y .. ":" .. x
+						if not blocked[key] or blocked[key] < os.clock() then
+							-- Kolom paling kanan terlihat kosong di peta, tetapi tubuh
+							-- pemain tertahan batas world sebelum bisa menanam di sana.
+							local edgeTile = kind == "plant" and x >= (tonumber(W.w) or 100) - 1
+							local reserved = Factory.cycle and kind == "plant"
+								and Factory.workX == x and Factory.workY == y
+							local suitable = not edgeTile and not reserved and (kind == "harvest"
+								and row[x] == seedId and factoryTreeRipe(W, x, y, seedId)
+								or kind == "plant" and row[x] == 0 and Bind.solid(x, y + 1))
+							if suitable then
+								-- Panen: berdiri di samping pohon, bukan di tile pohonnya
+								-- (Sugar Cane tidak solid, jadi tile pohon terlihat bisa
+								-- diinjak dan bot bisa memukul dari dalam pohon).
+								local stands = (kind == "harvest" and not allowSelf)
+									and { x - 1, x + 1 } or { x, x - 1, x + 1 }
+								for _, standX in ipairs(stands) do
+									-- Kolom paling kanan tidak bisa dipakai berdiri:
+									-- tubuh pemain tertahan batas world. Tepi kiri
+									-- masih bisa (pemain berdiri di x=0.3).
+									local edgeStand = standX < 0 or standX >= (tonumber(W.w) or 100) - 1
+									local standKey = keyOf(standX, y)
+									local distance = dist[standKey]
+									if not edgeStand and distance and (not bestDistance or distance < bestDistance) then
+										best = { kind = kind, x = x, y = y, standX = standX, standY = y }
+										bestDistance = distance
+									end
 								end
 							end
 						end
@@ -1869,8 +1974,22 @@ local function factoryTarget(W, state, seedId, blocked, onlyKind)
 		end
 		return best
 	end
+	-- Target di lantai pemain didahulukan. Transisi turun/jatuh lebih bisa
+	-- diandalkan daripada lompat naik, jadi lantai bawah dicoba sebelum
+	-- lantai atas; lompat naik yang mustahil tidak dipaksakan.
+	local function pick(kind)
+		local function pass(mode)
+			if kind == "harvest" then
+				-- Samping dulu; tile pohon sendiri hanya dipakai kalau tidak
+				-- ada sisi yang bisa dipijak.
+				return closest(kind, mode, false) or closest(kind, mode, true)
+			end
+			return closest(kind, mode, true)
+		end
+		return pass("same") or pass("below") or pass("above")
+	end
 	if onlyKind == "harvest" or (not onlyKind and Factory.harvest) then
-		local target = closest("harvest")
+		local target = pick("harvest")
 		if target then
 			return target
 		end
@@ -1882,7 +2001,7 @@ local function factoryTarget(W, state, seedId, blocked, onlyKind)
 			ok, count = pcall(inv.count, inv, seedId)
 		end
 		if ok and (tonumber(count) or 0) > 0 then
-			return closest("plant")
+			return pick("plant")
 		end
 	end
 	return nil
@@ -1898,12 +2017,20 @@ local function factoryWork(W, inv, target, seedId, gen)
 	local arrived = Bind.state()
 	if not factoryAlive(gen) or Factory.seedId ~= seedId or not (Factory[target.kind] or Factory.cycle)
 		or not arrived or standingFloor(arrived) ~= target.y + 1 then
-		return false
+		return false, "floor"
 	end
 	local x, y = target.x, target.y
 	if target.kind == "harvest" then
+		-- Pukulan hanya sah dari dekat pohon. Kalau posisi pemain tidak
+		-- sesuai, jangan memukul dari jauh: laporkan sebagai gagal jalan.
+		if math.abs(math.floor(arrived.x) - x) > 1 then
+			return false, "far"
+		end
 		if not factoryTreeRipe(W, x, y, seedId) then
-			return false
+			-- Data pohon bisa basi (pohon sudah dipanen/ditanam ulang).
+			-- Buang cache supaya ripe dibaca ulang dari game.
+			Factory.treeMap = nil
+			return false, "gone"
 		end
 		for hit = 1, 12 do
 			if not factoryAlive(gen) or tileId(x, y) ~= seedId then
@@ -1913,7 +2040,7 @@ local function factoryWork(W, inv, target, seedId, gen)
 			task.wait(0.06)
 		end
 		if tileId(x, y) ~= 0 then
-			return false
+			return false, "break"
 		end
 		Factory.harvested += 1
 		if Factory.cycle and not Factory.workX and tileId(x, y) == 0
@@ -1932,16 +2059,16 @@ local function factoryWork(W, inv, target, seedId, gen)
 		return true
 	end
 	if tileId(x, y) ~= 0 or not Bind.solid(x, y + 1) then
-		return false
+		return false, "gone"
 	end
 	local hasOK, count = pcall(inv.count, inv, seedId)
 	if not hasOK or (tonumber(count) or 0) < 1 then
-		return false
+		return false, "seed"
 	end
 	pcall(inv.select, inv, seedId)
 	local placed = pcall(Bind.setTile, "fg", x, y, seedId, false, false)
 	if not placed or tileId(x, y) ~= seedId then
-		return false
+		return false, "place"
 	end
 	pcall(inv.remove, inv, seedId, 1)
 	Factory.planted += 1
@@ -1957,29 +2084,44 @@ local function factoryCount(inv, itemId)
 	return ok and (tonumber(count) or 0) or 0
 end
 
-local function factoryWorkSpot(W, state)
+-- Cari tile kosong untuk PNB. Lantai pemain dicoba dulu supaya jalurnya
+-- cuma jalan kaki (transisi turun/jatuh tidak selalu mendarat tepat).
+local function factoryWorkSpot(W, state, blocked)
 	local dist = Path.explore(math.floor(state.x), math.floor(state.y - 0.0001), 6000)
 	if not dist then return nil end
-	local bestX, bestStandX, bestY, bestDistance
-	for y = 0, (tonumber(W.h) or 60) - 2 do
-		for x = 0, (tonumber(W.w) or 100) - 2 do
-			if tileId(x, y) == 0 and Bind.solid(x, y + 1)
-				and (Factory.baseLayer ~= "bg" or bgId(x, y) == 0) then
-				local candidates = Factory.baseAtSelf and { x } or { x - 1, x + 1 }
-				for _, standX in ipairs(candidates) do
-					local standKey = keyOf(standX, y)
-					local distance = dist[standKey]
-					if distance and (not bestDistance or distance < bestDistance) then
-						bestX, bestStandX, bestY, bestDistance = x, standX, y, distance
+	local cy = math.floor(state.y - 0.0001)
+	local function scan(sameFloor)
+		local bestX, bestStandX, bestY, bestDistance
+		for y = 0, (tonumber(W.h) or 60) - 2 do
+			if not sameFloor or y == cy then
+				for x = 0, (tonumber(W.w) or 100) - 2 do
+					local blockKey = "pnb:" .. y .. ":" .. x
+					local blockedUntil = blocked and blocked[blockKey]
+					if (not blockedUntil or blockedUntil < os.clock())
+						and tileId(x, y) == 0 and Bind.solid(x, y + 1)
+						and (Factory.baseLayer ~= "bg" or bgId(x, y) == 0) then
+						local candidates = Factory.baseAtSelf and { x } or { x - 1, x + 1 }
+						for _, standX in ipairs(candidates) do
+							local standKey = keyOf(standX, y)
+							local distance = dist[standKey]
+							if distance and (not bestDistance or distance < bestDistance) then
+								bestX, bestStandX, bestY, bestDistance = x, standX, y, distance
+							end
+						end
 					end
 				end
 			end
 		end
+		return bestX, bestStandX, bestY
 	end
-	return bestX, bestStandX, bestY
+	local x, standX, y = scan(true)
+	if x then
+		return x, standX, y
+	end
+	return scan(false)
 end
 
-local function factoryPNBOne(W, inv, gen)
+local function factoryPNBOne(W, inv, gen, blocked)
 	local baseId = Factory.baseId
 	if factoryCount(inv, baseId) < 1 then
 		return false, "blocks"
@@ -1988,23 +2130,40 @@ local function factoryPNBOne(W, inv, gen)
 	if not s then
 		return false, "state"
 	end
+	-- Station dihitung saat dibutuhkan, bukan sekali di awal, supaya tidak
+	-- menunjuk tile di lantai lain yang sudah tidak terjangkau.
+	if not Factory.workX or not Factory.workY then
+		Factory.workX, Factory.workStandX, Factory.workY = factoryWorkSpot(W, s, blocked)
+	end
 	local x, standX, y = Factory.workX, Factory.workStandX, Factory.workY
 	if not x or not standX or not y then
 		return false, "station"
 	end
+	local function releaseStation()
+		Factory.workX, Factory.workStandX, Factory.workY = nil, nil, nil
+	end
 	if pnbTileId(W, Factory.baseLayer, x, y) ~= 0 or tileId(x, y) ~= 0
 		or not Bind.solid(x, y + 1) then
+		releaseStation()
 		return false, "occupied"
 	end
 	local alive = function()
 		return factoryAlive(gen) and W.name == Bind.name
 	end
 	if not Path.moveTo(standX, y, alive) then
+		if blocked then
+			blocked["pnb:" .. y .. ":" .. x] = os.clock() + 25
+		end
+		releaseStation()
 		return false, "path"
 	end
 	local arrived = Bind.state()
 	if not factoryAlive(gen) or not arrived or standingFloor(arrived) ~= y + 1
 		or pnbTileId(W, Factory.baseLayer, x, y) ~= 0 or tileId(x, y) ~= 0 then
+		if blocked then
+			blocked["pnb:" .. y .. ":" .. x] = os.clock() + 25
+		end
+		releaseStation()
 		return false, "position"
 	end
 	pcall(inv.select, inv, baseId)
@@ -2055,6 +2214,12 @@ end
 
 local factoryStoreSeeds
 
+-- Kosongkan seluruh blok sebelum fase tanam.
+local function beginPNB(_blocks)
+	Factory.phase = "pnb"
+	Factory.pnbLowWater = 0
+end
+
 local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 	local blocks = factoryCount(inv, Factory.baseId)
 	local seeds = factoryCount(inv, seedId)
@@ -2062,15 +2227,27 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 	local seedFull = seeds >= 200 or factoryRoom(inv, seedId) == 0
 
 	if Factory.phase == "harvest" then
-		if blockFull then
-			Factory.phase = "pnb"
-			setFactoryStatus(string.format("Factory: blok penuh (%d), lanjut PNB", blocks))
+		local cy = math.floor(state.y - 0.0001)
+		-- Blok penuh: panen cuma membuang drop (inv.room(id) == 0 membuat
+		-- takeDrop mengembalikan 0), jadi kosongkan dulu lewat PNB.
+		if blockFull and Factory.baseId then
+			beginPNB(blocks)
+			setFactoryStatus(string.format("Factory: blok penuh %d/200; PNB sampai habis", blocks))
 			return 0.1
+		end
+		if Factory.harvestSkipUntil and Factory.harvestSkipUntil > os.clock() then
+			-- Jalur panen gagal sementara; kosongkan sisa blok sebelum tanam.
+			if blocks > 0 then beginPNB(blocks) else Factory.phase = "plant" end
+			return 0.2
 		end
 		local target = factoryTarget(W, state, seedId, blocked, "harvest")
 		if target then
 			local worked, reason = factoryWork(W, inv, target, seedId, gen)
 			if worked then
+				Factory.harvestFailures = 0
+				if Factory.harvestFailCount then
+					Factory.harvestFailCount[seedId .. ":harvest:" .. target.y .. ":" .. target.x] = nil
+				end
 				task.wait(0.25)
 				collectDropsNearby(W, inv, Bind.state(), 0.9)
 				if factoryAlive(gen) then
@@ -2078,11 +2255,53 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 						Factory.harvested, factoryCount(inv, Factory.baseId)))
 				end
 			else
-			blocked[seedId .. ":harvest:" .. target.y .. ":" .. target.x] = os.clock() + 4
+				local sameFloor = target.y == cy
+				local key = seedId .. ":harvest:" .. target.y .. ":" .. target.x
+				Factory.harvestFailCount = Factory.harvestFailCount or {}
+				local fails = (Factory.harvestFailCount[key] or 0) + 1
+				Factory.harvestFailCount[key] = fails
+				local reasonText, blockFor
+				if reason == "path" or reason == "floor" or reason == "far" then
+					-- Karakter tidak sampai ke pohon. Ini bukan gagal panen:
+					-- pohonnya tidak pernah dipukul.
+					reasonText = "tidak bisa menjangkau pohon"
+					blockFor = sameFloor and (fails >= 3 and 600 or fails >= 2 and 120 or 45) or 600
+					if not sameFloor then
+						blocked["harvest:row:" .. target.y] = os.clock() + 240
+					end
+				elseif reason == "gone" then
+					reasonText = "pohon sudah tidak matang"
+					blockFor = 20
+				elseif reason == "break" then
+					reasonText = "pohon tidak hancur"
+					blockFor = 60
+				else
+					reasonText = "gagal panen"
+					blockFor = 20
+				end
+				blocked[key] = os.clock() + blockFor
+				Factory.harvestFailures = (Factory.harvestFailures or 0) + 1
+				-- Target di lantai lain: sekali gagal sudah cukup untuk
+				-- berhenti mencoba panen sebentar dan pindah ke PNB/tanam.
+				if not sameFloor or Factory.harvestFailures >= 5 then
+					Factory.harvestFailures = 0
+					Factory.harvestSkipUntil = os.clock() + 15
+				end
+				if factoryAlive(gen) then
+					setFactoryStatus(string.format("Factory: %s X=%d Y=%d; coba tree lain",
+						reasonText, target.x, target.y))
+				end
 			end
 			return 0.18
 		end
-		Factory.phase = "pnb"
+		-- Tidak ada tree matang: tanam dulu kalau masih ada seed + tile kosong.
+		-- Blok penuh bukan alasan untuk berhenti memanen/menanam.
+		if blocks <= 0 and seeds > 0 and factoryTarget(W, state, seedId, blocked, "plant") then
+			Factory.phase = "plant"
+			setFactoryStatus(string.format("Factory: tidak ada tree matang; lanjut tanam (%d seed)", seeds))
+			return 0.1
+		end
+		beginPNB(blocks)
 		if factoryHasRipeTree(W, seedId) then
 			setFactoryStatus("Factory: tree matang ada, jalur panen sedang dicoba ulang; lanjut PNB")
 		else
@@ -2092,12 +2311,22 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 	end
 
 	if Factory.phase == "pnb" then
-		if blocks <= 0 or seedFull then
+		if not Factory.baseId then
+			-- Seed ini tidak punya blok pasangan untuk PNB; lompati fase PNB.
 			Factory.phase = "plant"
+			return 0.2
+		end
+		if blocks <= 0 then
+			Factory.phase = "plant"
+			Factory.pnbLowWater = nil
 			setFactoryStatus(string.format("Factory: PNB selesai | blok %d, seed %d; mulai tanam", blocks, seeds))
 			return 0.1
 		end
-		local worked, reason = factoryPNBOne(W, inv, gen)
+		if Factory.pnbSkipUntil and Factory.pnbSkipUntil > os.clock() then
+			setFactoryStatus(string.format("Factory: menunggu jalur PNB; %d blok tersisa", blocks))
+			return 1
+		end
+		local worked, reason = factoryPNBOne(W, inv, gen, blocked)
 		if worked then
 			Factory.pnbPathFailures = 0
 			if factoryAlive(gen) then
@@ -2105,25 +2334,43 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 					Factory.pnb, factoryCount(inv, Factory.baseId), factoryCount(inv, seedId)))
 			end
 		else
-			if reason == "path" or reason == "position" then
+			if reason == "path" or reason == "position" or reason == "occupied" then
 				Factory.pnbPathFailures += 1
-				if Factory.pnbPathFailures >= 2 then
-					Factory.stop("Factory: jalur ke tile PNB gagal; bot berhenti di posisi sekarang")
-				else
-					setFactoryStatus("Factory: mengulang jalur tile PNB sekali")
+				if Factory.pnbPathFailures >= 8 then
+					Factory.pnbPathFailures = 0
+					Factory.workX, Factory.workStandX, Factory.workY = nil, nil, nil
+					Factory.pnbSkipUntil = os.clock() + 20
+					setFactoryStatus("Factory: jalur PNB gagal; coba lagi dalam 20 detik")
+					return 0.2
 				end
+				setFactoryStatus(string.format("Factory: tile PNB tidak terjangkau, cari tile lain (%d/8)",
+					Factory.pnbPathFailures))
 			elseif reason == "station" then
-				Factory.stop("Factory: tidak ada tile kosong untuk PNB; sisakan satu tile di atas lantai")
-			elseif reason == "occupied" then
-				Factory.stop("Factory: tile PNB yang disimpan sudah terisi")
+				Factory.pnbPathFailures = 0
+				local ripe = factoryTarget(W, state, seedId, blocked, "harvest")
+				if ripe and factoryWork(W, inv, ripe, seedId, gen) then
+					setFactoryStatus("Factory: membuka tile kerja PNB dari tree matang")
+				else
+					setFactoryStatus(string.format("Factory: menunggu tile kerja PNB (%d blok tersisa)", blocks))
+				end
+				return 2
+			elseif reason == "blocks" then
+				Factory.phase = "plant"
+				setFactoryStatus("Factory: blok PNB habis; lanjut tanam")
+				return 0.2
 			else
 				Factory.stop("Factory: PNB gagal (" .. tostring(reason) .. ")")
 			end
 		end
-		return worked and 0.3 or 2
+		return worked and 0.3 or 1
 	end
 
 	if Factory.phase == "plant" then
+		if blocks > 0 then
+			beginPNB(blocks)
+			setFactoryStatus(string.format("Factory: PNB %d blok dulu sebelum tanam", blocks))
+			return 0.1
+		end
 		if seeds <= 0 then
 			Factory.phase = "grow"
 			setFactoryStatus("Factory: seed habis; cek tree dan sisa blok")
@@ -2138,7 +2385,17 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 						Factory.planted, factoryCount(inv, seedId)))
 				end
 			else
-				blocked[seedId .. ":plant:" .. target.y .. ":" .. target.x] = os.clock() + 10
+				local now = Bind.state() or state
+				local sameFloor = target.y == math.floor(now.y - 0.0001)
+				local pathFail = reason == "path" or reason == "floor" or reason == "far"
+				if sameFloor then
+					blocked[seedId .. ":plant:" .. target.y .. ":" .. target.x] =
+						os.clock() + (pathFail and 45 or 10)
+				else
+					-- Lantai lain: jalur turun/jatuh tidak bisa diandalkan,
+					-- blok seluruh baris supaya tidak dicoba tile demi tile.
+					blocked["plant:row:" .. target.y] = os.clock() + (pathFail and 180 or 60)
+				end
 				if factoryAlive(gen) then
 					setFactoryStatus(string.format("Factory: gagal ke tile tanam X=%d Y=%d (%s); coba tile lain",
 						target.x, target.y, tostring(reason or "tile berubah")))
@@ -2153,11 +2410,11 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 			return 0.1
 		end
 		if ripe and blockFull and blocks > 0 and not seedFull then
-			Factory.phase = "pnb"
+			beginPNB(blocks)
 			setFactoryStatus("Factory: tile tanam penuh; kosongkan blok lewat PNB sebelum panen")
 			return 0.1
 		end
-		if blocks <= 0 or seedFull then
+		if seedFull or (Factory.baseId and blocks <= 0) then
 			local stored, reason = factoryStoreSeeds(W, inv, state, seedId, gen)
 			if stored then
 				Factory.phase = "grow"
@@ -2167,7 +2424,7 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 			end
 			return 0.3
 		end
-		setFactoryStatus(string.format("Factory: menunggu tile tanam kosong (%d seed tersisa)", seeds))
+		setFactoryStatus(string.format("Factory: tidak ada tile tanam kosong terjangkau; menunggu pohon matang (%d seed)", seeds))
 		collectDropsNearby(W, inv, state, 0.9)
 		return 1
 	end
@@ -2178,8 +2435,8 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 	if ripe and not blockFull then
 		Factory.phase = "harvest"
 		setFactoryStatus("Factory: tree matang; mulai harvest lagi")
-	elseif blocks > 0 and not seedFull then
-		Factory.phase = "pnb"
+	elseif blocks > 0 then
+		beginPNB(blocks)
 		setFactoryStatus(string.format("Factory: lanjut PNB %d blok sambil menunggu tree", blocks))
 	elseif seeds > 0 then
 		Factory.phase = "plant"
@@ -2220,10 +2477,14 @@ local function startFactory()
 		local items = findItemDB()
 		baseId = seedId - 1
 		baseDef = items and items[baseId]
-		if type(baseDef) ~= "table" or baseDef.farmable ~= true
+		-- Blok pasangan tidak harus bertanda "farmable": Dirt, Rock, dan Cave
+		-- Background juga bisa dipasang lalu dihancurkan. Di ItemDB hanya
+		-- Sugar Cane yang farmable = true, jadi syarat lama membuat factory
+		-- menolak jalan untuk semua seed lain.
+		if type(baseDef) ~= "table" or baseDef.kind == "seed"
 			or def.name ~= (tostring(baseDef.name) .. " Seed") or Dig.protectedIds[baseId] then
-			setFactoryStatus("gagal: seed ini tidak memiliki pasangan blok farmable untuk PNB")
-			return false
+			baseId, baseDef = nil, nil
+			log("PNB dimatikan: seed " .. tostring(seedId) .. " tidak punya pasangan blok yang bisa dipasang")
 		end
 	end
 	local state = Bind.state()
@@ -2231,6 +2492,12 @@ local function startFactory()
 	if not floorY or not Bind.solid(math.floor(state.x), floorY) then
 		setFactoryStatus("gagal: karakter harus berdiri di atas lantai")
 		return false
+	end
+	-- Sekali saja: kalau client ini tidak bisa lompat, pathfinder hanya
+	-- memakai jalan kaki dan turun supaya tidak mengejar tile di atas.
+	local canJump = Path.probeJump()
+	if canJump == false then
+		log("lompat tidak berfungsi di client ini; pathfinder dibatasi ke jalan/turun")
 	end
 	Factory.running = true
 	Factory.gen += 1
@@ -2244,40 +2511,81 @@ local function startFactory()
 	Factory.baseAtSelf = baseDef and (baseDef.background == true or baseDef.solid == false) or nil
 	Factory.workX, Factory.workStandX, Factory.workY = nil, nil, nil
 	Factory.pnbPathFailures = 0
-	if Factory.cycle then
-		Factory.workX, Factory.workStandX, Factory.workY = factoryWorkSpot(W, state)
-	end
+	Factory.pnbSkipUntil = nil
+	Factory.pnbLowWater = nil
+	Factory.harvestFailures = 0
+	Factory.harvestSkipUntil = nil
+	Factory.harvestFailCount = {}
+	Factory.homeWorld = W.name
+	Factory.lastRejoinAt = 0
+	-- Station PNB sengaja tidak dipilih di sini: lantai pemain bisa berubah
+	-- selama factory jalan, jadi station dicari saat fase PNB dimulai.
 	local gen, worldName = Factory.gen, W.name
 	local blocked = {}
+	local missingSince = nil
 	setFactoryStatus(string.format("berjalan: %s, lantai Y=%d", Factory.seedName, floorY))
 	task.spawn(function()
 		local ok, err = pcall(function()
 			while factoryAlive(gen) do
 				local s = Bind.state()
-				if not s or W.name ~= worldName or not standingFloor(s) then
-					Factory.stop("berhenti: posisi pemain atau world berubah")
-					break
-				end
-				local currentSeed = Factory.seedId
-				local currentFloor = standingFloor(s)
-				if Factory.cycle then
-					task.wait(factoryCycleStep(W, inv, s, currentSeed, blocked, gen))
-				else
-					local target = factoryTarget(W, s, currentSeed, blocked)
-					if target then
-						local worked, reason = factoryWork(W, inv, target, currentSeed, gen)
-						if factoryAlive(gen) then
-							if worked then
-								setFactoryStatus(string.format("%s: panen %d, tanam %d (Y=%d)",
-										Factory.seedName, Factory.harvested, Factory.planted, currentFloor))
-							else
-								blocked[currentSeed .. ":" .. target.kind .. ":" .. target.y .. ":" .. target.x] = os.clock() + 4
-							end
+				local currentW = Bind.getW()
+				if s and s.dead == true then
+					-- Karakter mati: jangan terus memukul dari posisi terakhir.
+					Move.release()
+					if Factory.status ~= "Factory: karakter mati; menunggu respawn" then
+						setFactoryStatus("Factory: karakter mati; menunggu respawn")
+					end
+					task.wait(0.5)
+				elseif not s or not standingFloor(s) or not currentW or currentW.name ~= worldName then
+					Move.release()
+					missingSince = missingSince or os.clock()
+					if not Factory.cycle then
+						Factory.stop("berhenti: posisi pemain atau world berubah")
+						break
+					end
+					if os.clock() - missingSince >= 2.5
+						and os.clock() - Factory.lastRejoinAt >= 5 then
+						Factory.lastRejoinAt = os.clock()
+						setFactoryStatus("Factory: kembali dari lobby ke " .. worldName)
+						local enterWorld = currentW and currentW.enter or W.enter
+						if type(enterWorld) == "function" then
+							local joined, joinErr = pcall(enterWorld, worldName)
+							if not joined then log("Factory rejoin: " .. tostring(joinErr)) end
 						end
-						task.wait(0.18)
+						Bind.resolve(true)
+					end
+					task.wait(0.5)
+				else
+					if missingSince then
+						Bind.resolve(true)
+						if Bind.W and Bind.W.name == worldName then
+							W, inv = Bind.W, Bind.inv or inv
+						end
+						blocked = {}
+						missingSince = nil
+						setFactoryStatus("Factory: kembali ke " .. worldName .. "; lanjut " .. Factory.phase)
+					end
+					local currentSeed = Factory.seedId
+					local currentFloor = standingFloor(s)
+					if Factory.cycle then
+						task.wait(factoryCycleStep(W, inv, s, currentSeed, blocked, gen))
 					else
-						collectDropsNearby(W, inv, s, 0.9)
-						task.wait(1)
+						local target = factoryTarget(W, s, currentSeed, blocked)
+						if target then
+							local worked, reason = factoryWork(W, inv, target, currentSeed, gen)
+							if factoryAlive(gen) then
+								if worked then
+									setFactoryStatus(string.format("%s: panen %d, tanam %d (Y=%d)",
+											Factory.seedName, Factory.harvested, Factory.planted, currentFloor))
+								else
+									blocked[currentSeed .. ":" .. target.kind .. ":" .. target.y .. ":" .. target.x] = os.clock() + 4
+								end
+							end
+							task.wait(0.18)
+						else
+							collectDropsNearby(W, inv, s, 0.9)
+							task.wait(1)
+						end
 					end
 				end
 			end
@@ -2313,8 +2621,50 @@ function Factory.setMode(mode, on)
 end
 
 --// ===== 8. UI (WindUI) =====
+local WINDUI_URL = "https://github.com/Footagesus/WindUI/releases/latest/download/main.lua"
+local WINDUI_CACHE = "HumanHub_WindUI.lua"
+
+-- Sumber WindUI diambil sekali lalu disimpan di workspace executor. Kalau
+-- GitHub lambat / diblokir, cache dipakai supaya window tetap muncul dan
+-- script tidak menggantung menunggu HttpGet.
+local function windUISource()
+	if type(readfile) == "function" then
+		local ok, cached = pcall(readfile, WINDUI_CACHE)
+		if ok and type(cached) == "string" and #cached > 5000 then
+			return cached, "cache"
+		end
+	end
+	local got, done = nil, false
+	task.spawn(function()
+		local ok, body = pcall(function()
+			return game:HttpGet(WINDUI_URL)
+		end)
+		if ok and type(body) == "string" and #body > 5000 then
+			got = body
+		end
+		done = true
+	end)
+	local deadline = os.clock() + 20
+	while not done and os.clock() < deadline do
+		task.wait(0.1)
+	end
+	if got and type(writefile) == "function" then
+		pcall(writefile, WINDUI_CACHE, got)
+	end
+	return got, got and "unduh" or nil
+end
+
 local okLoad, WindUI = pcall(function()
-	return loadstring(game:HttpGet("https://github.com/Footagesus/WindUI/releases/latest/download/main.lua"))()
+	local src, from = windUISource()
+	if not src then
+		error("sumber WindUI tidak tersedia (GitHub lambat/diblokir, cache belum ada)", 0)
+	end
+	log("WindUI dari " .. tostring(from) .. " (" .. tostring(#src) .. " byte)")
+	local fn, err = loadstring(src)
+	if not fn then
+		error("compile WindUI gagal: " .. tostring(err), 0)
+	end
+	return fn()
 end)
 if not okLoad or not WindUI then
 	warn("[HumanHub] gagal memuat WindUI: " .. tostring(WindUI))
@@ -2332,6 +2682,7 @@ local Window = WindUI:CreateWindow({
 Hub.Window = Window
 
 local pnbTab = Window:Tab({ Title = "Auto Farming", Icon = "blocks" })
+local guardTab = Window:Tab({ Title = "Penjaga World", Icon = "shield" })
 local farmTab = Window:Tab({ Title = "Dirt Farm", Icon = "pickaxe" })
 local moveTab = Window:Tab({ Title = "Gerak", Icon = "footprints" })
 local infoTab = Window:Tab({ Title = "Info", Icon = "info" })
@@ -2390,7 +2741,7 @@ end
 local factorySec = pnbTab:Section({ Title = "Auto Harvest & Auto Plant", Opened = true })
 factorySec:Paragraph({
 	Title = "Cara kerja",
-	Desc = "Pilih seed dari inventory. Factory panen, PNB, lalu tanam. Jika tile tanam penuh, seed disimpan ke Display Box yang bisa dijangkau di world ini.",
+	Desc = "Pilih seed dari inventory. Factory panen, habiskan blok lewat PNB, lalu tanam. Jika tile tanam penuh, seed disimpan ke Display Box yang bisa dijangkau di world ini.",
 })
 
 local seedValues, seedByLabel = Factory.seedOptions()
@@ -2480,7 +2831,7 @@ plantToggle = factorySec:Toggle({
 })
 cycleToggle = factorySec:Toggle({
 	Title = "Auto Factory",
-	Desc = "Urutan: harvest, PNB, plant. Jika tile tanam penuh, simpan seed ke Display Box di world ini.",
+	Desc = "Urutan: harvest, PNB sampai blok habis, lalu plant. Jika tile tanam penuh, simpan seed ke Display Box di world ini.",
 	Value = false,
 	Callback = function(on)
 		if not Factory.syncingUI then
@@ -2749,7 +3100,7 @@ moveSec:Paragraph({
 })
 
 -- ---- Penjaga world ----
-local guardSec = pnbTab:Section({ Title = "Penjaga World", Opened = false })
+local guardSec = guardTab:Section({ Title = "Penjaga World", Opened = true })
 local Guard = { enabled = false, world = nil, seen = {}, baseline = false, busy = false }
 local guardStatus = guardSec:Paragraph({ Title = "Status penjaga", Desc = "nonaktif" })
 
@@ -2965,7 +3316,7 @@ Hub.keep(RunService.Heartbeat:Connect(function()
 		if PNB.running then
 			PNB.stop("state hilang (respawn / pindah world)")
 		end
-		if Factory.running then
+		if Factory.running and not Factory.cycle then
 			Factory.stop("state hilang (respawn / pindah world)")
 		end
 	end
