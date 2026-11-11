@@ -1,6 +1,6 @@
 --// ============================================================
 --// Human Hub
---// Script hub dengan gerak tombol; navigasi lintas lantai memakai goTo per tile bila jalur jalan terputus.
+--// Script hub dengan gerak tombol A/D dan Space untuk lintas lantai.
 --// Fitur #1 : Auto Dirt Farm - menggali lorong 1 block di atas lantai
 --//            (foreground + cave background), menyisir map bolak-balik
 --//            lalu turun satu lantai lewat poros di tepi, sampai jadi
@@ -13,7 +13,7 @@
 --//
 --// Prinsip gerak:
 --//   - semua gerak lewat keypress A/D + Space (VirtualInputManager)
---//   - factory memakai world.goTo hanya untuk rute poros yang tak bisa dilalui pathfinder lantai
+--//   - factory berjalan ke poros, jatuh, atau melompat dengan input game
 --//   - ada waktu reaksi, jeda acak, dan micropause seperti orang main
 --//   - berhenti dulu sebelum memukul tile, lalu lanjut jalan
 --//
@@ -26,7 +26,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.6",
+	version = "0.4.7",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -275,10 +275,15 @@ function Move.hold(kc)
 end
 
 function Move.jump()
+	local state = Bind.state()
+	if not state or not state.grounded or os.clock() - (Move.lastJumpAt or 0) < 0.7 then
+		return false
+	end
+	Move.lastJumpAt = os.clock()
 	vkey(true, Enum.KeyCode.Space)
-	task.delay(rnd(0.05, 0.11), function()
-		vkey(false, Enum.KeyCode.Space)
-	end)
+	task.wait(rnd(0.14, 0.20))
+	vkey(false, Enum.KeyCode.Space)
+	return true
 end
 
 function Move.idle(a, b)
@@ -1459,7 +1464,7 @@ function Path.explore(sx, sy, maxNodes)
 	end
 	enqueue({ x = sx, y = sy, c = 0, key = startKey })
 
-	local function push(cx, cy, cc, nx, ny, cost)
+	local function push(cx, cy, cc, nx, ny, cost, kind, shaftX)
 		if nx < 0 or nx >= w or ny < 0 or ny >= h - 1 then
 			return
 		end
@@ -1470,7 +1475,7 @@ function Path.explore(sx, sy, maxNodes)
 		local nc = cc + cost
 		if dist[k] == nil or nc < dist[k] then
 			dist[k] = nc
-			parent[k] = keyOf(cx, cy)
+			parent[k] = { from = keyOf(cx, cy), kind = kind, shaftX = shaftX }
 			enqueue({ x = nx, y = ny, c = nc, key = k })
 		end
 	end
@@ -1483,17 +1488,20 @@ function Path.explore(sx, sy, maxNodes)
 			local cx, cy, cc = cur.x, cur.y, cur.c
 
 			-- jalan kiri/kanan
-			push(cx, cy, cc, cx - 1, cy, 1)
-			push(cx, cy, cc, cx + 1, cy, 1)
+			push(cx, cy, cc, cx - 1, cy, 1, "walk")
+			push(cx, cy, cc, cx + 1, cy, 1, "walk")
 
-			-- jatuh lurus ke bawah
-			for ny = cy + 1, h - 2 do
-				if isSolid(cx, ny) then
-					break
-				end
-				if canStand(cx, ny) then
-					push(cx, cy, cc, cx, ny, ny - cy)
-					break
+			-- Melangkah ke poros samping, lalu mendarat di lantai berikutnya.
+			for _, dir in ipairs({ -1, 1 }) do
+				local shaftX = cx + dir
+				if shaftX >= 0 and shaftX < w and not isSolid(shaftX, cy) then
+					for ny = cy + 1, h - 2 do
+						if isSolid(shaftX, ny) then break end
+						if canStand(cx, ny) then
+							push(cx, cy, cc, cx, ny, 2 + ny - cy, "drop", shaftX)
+							break
+						end
+					end
 				end
 			end
 
@@ -1502,37 +1510,8 @@ function Path.explore(sx, sy, maxNodes)
 				for up = 1, 3 do
 					for dx = -2, 2 do
 						local nx, ny = cx + dx, cy - up
-						-- kepala di titik lompat dan titik mendarat harus kosong
-						if not isSolid(nx, ny - 1) then
-							push(cx, cy, cc, nx, ny, 2 + math.abs(dx) + up)
-						end
+						push(cx, cy, cc, nx, ny, 2 + math.abs(dx) + up, "jump")
 					end
-				end
-			end
-		end
-	end
-	return dist, parent
-end
-
--- Jalur cadangan melalui ruang kosong, termasuk poros vertikal di tepi world.
-function Path.airExplore(sx, sy)
-	local W = Bind.getW()
-	if not W then return nil, nil end
-	local w, h = tonumber(W.w) or 100, tonumber(W.h) or 60
-	local start = keyOf(sx, sy)
-	local dist, parent = { [start] = 0 }, {}
-	local queue, head = { { x = sx, y = sy } }, 1
-	while head <= #queue do
-		local node = queue[head]
-		head += 1
-		for _, delta in ipairs({ { -1, 0 }, { 1, 0 }, { 0, -1 }, { 0, 1 } }) do
-			local nx, ny = node.x + delta[1], node.y + delta[2]
-			if nx >= 0 and nx < w and ny >= 0 and ny < h then
-				local k = keyOf(nx, ny)
-				if dist[k] == nil and not Bind.solid(nx, ny) then
-					dist[k] = dist[keyOf(node.x, node.y)] + 1
-					parent[k] = keyOf(node.x, node.y)
-					table.insert(queue, { x = nx, y = ny })
 				end
 			end
 		end
@@ -1548,55 +1527,80 @@ function Path.reconstruct(parent, startKey, goalKey)
 		guard += 1
 		local x = k % 1000
 		local y = math.floor(k / 1000)
-		table.insert(path, 1, { x = x, y = y })
-		k = parent[k]
+		local edge = parent[k]
+		table.insert(path, 1, { x = x, y = y, kind = edge and edge.kind, shaftX = edge and edge.shaftX })
+		k = edge and edge.from
 	end
 	return path
 end
 
 -- Gerak menyusuri satu langkah jalur.
 local function pathStep(cx, cy, step, aliveFn)
-	if step.y == cy then
-		Move.walkTo(step.x + 0.5, { timeout = 6, tol = 0.35 })
-		return true
-	elseif step.y > cy then
-		-- jatuh: jalan ke kolom lubang, lalu tunggu sampai turun
-		Move.walkTo(step.x + 0.5, { timeout = 6, tol = 0.35 })
-		local t0 = os.clock()
-		while os.clock() - t0 < 2.5 and aliveFn() do
+	local function landed()
+		local s = Bind.state()
+		return s and s.grounded and math.floor(s.x) == step.x
+			and math.floor(s.y - 0.0001) == step.y
+	end
+	if step.kind == "walk" then
+		return Move.walkTo(step.x + 0.5, { timeout = 5, tol = 0.35 }) and landed()
+	end
+	if step.kind == "drop" then
+		local outward = step.shaftX < cx and KeyLeft or KeyRight
+		local inward = step.shaftX < cx and KeyRight or KeyLeft
+		Move.hold(outward)
+		local deadline = os.clock() + 1.8
+		while aliveFn() and os.clock() < deadline do
 			local s = Bind.state()
-			if not s then
-				break
-			end
-			if math.floor(s.y - 0.0001) > cy then
-				return true
-			end
-			task.wait(0.04)
+			if not s then break end
+			if s.y >= cy + 1.85 then break end
+			task.wait(0.03)
 		end
-		return true
-	else
-		-- lompat naik
-		if step.x ~= cx then
-			Move.hold(step.x > cx and KeyRight or KeyLeft)
-		else
+		local falling = Bind.state()
+		if not falling or falling.y < cy + 1.85 then
 			Move.release()
+			return false
 		end
-		task.wait(rnd(0.03, 0.08))
-		Move.jump()
-		local t0 = os.clock()
-		while os.clock() - t0 < 1.3 and aliveFn() do
+		Move.hold(inward)
+		deadline = os.clock() + 1.5
+		while aliveFn() and os.clock() < deadline do
 			local s = Bind.state()
-			if not s then
-				break
-			end
-			if math.floor(s.y - 0.0001) <= step.y and s.grounded then
+			if not s then break end
+			if math.abs(s.x - (step.x + 0.5)) <= 0.32 then
+				Move.release()
 				break
 			end
 			task.wait(0.03)
 		end
 		Move.release()
-		return true
+		deadline = os.clock() + 1
+		while aliveFn() and os.clock() < deadline do
+			if landed() then return true end
+			task.wait(0.03)
+		end
+		return false
 	end
+	if step.kind == "jump" then
+		if step.x ~= cx then Move.hold(step.x > cx and KeyRight or KeyLeft) end
+		task.wait(rnd(0.03, 0.08))
+		if not Move.jump() then
+			Move.release()
+			return false
+		end
+		local deadline = os.clock() + 1.6
+		while aliveFn() and os.clock() < deadline do
+			local s = Bind.state()
+			if not s then break end
+			if math.abs(s.x - (step.x + 0.5)) <= 0.30 then Move.release() end
+			if landed() then
+				Move.release()
+				return true
+			end
+			if s.grounded and os.clock() - (Move.lastJumpAt or 0) > 0.35 then break end
+			task.wait(0.03)
+		end
+		Move.release()
+	end
+	return false
 end
 
 -- Jalan ke tile (tx, ty). Return true kalau sampai.
@@ -1638,7 +1642,10 @@ function Path.moveTo(tx, ty, aliveFn)
 			Move.release()
 			return true
 		end
-		pathStep(cx, cy, step, aliveFn)
+		if not pathStep(cx, cy, step, aliveFn) then
+			Move.release()
+			return false
+		end
 		expect = { x = step.x, y = step.y }
 		idx += 1
 		task.wait(0.04)
@@ -1647,43 +1654,6 @@ function Path.moveTo(tx, ty, aliveFn)
 	return false
 end
 
-function Path.airMoveTo(tx, ty, aliveFn)
-	local W = Bind.getW()
-	if not W or type(W.goTo) ~= "function" then return false end
-	Move.release()
-	for _ = 1, 3 do
-		if not aliveFn() then return false end
-		local state = Bind.state()
-		if not state then return false end
-		local sx, sy = math.floor(state.x), math.floor(state.y - 0.0001)
-		if sx == tx and sy == ty and state.grounded then return true end
-		local dist, parent = Path.airExplore(sx, sy)
-		if not dist or not dist[keyOf(tx, ty)] then return false end
-		local route = Path.reconstruct(parent, keyOf(sx, sy), keyOf(tx, ty))
-		local diverged = false
-		for _, step in ipairs(route) do
-			if not aliveFn() then return false end
-			local ok = pcall(W.goTo, step.x, step.y)
-			if not ok then return false end
-			task.wait(0.18)
-			local current = Bind.state()
-			if not current then return false end
-			if math.abs(current.x - (step.x + 0.5)) > 0.75
-				or math.abs(current.y - (step.y + 0.999)) > 0.75 then
-				diverged = true
-				break
-			end
-		end
-		if not diverged then
-			local arrived = Bind.state()
-			if arrived and math.floor(arrived.x) == tx
-				and math.floor(arrived.y - 0.0001) == ty and arrived.grounded then
-				return true
-			end
-		end
-	end
-	return false
-end
 local function factoryTreeRipe(W, x, y, seedId)
 	if tileId(x, y) ~= seedId or type(W.treeLook) ~= "function" then
 		return false
@@ -1709,8 +1679,7 @@ end
 
 local function factoryTarget(W, state, seedId, blocked, onlyKind)
 	local dist = Path.explore(math.floor(state.x), math.floor(state.y - 0.0001), 6000)
-	local airDist = Path.airExplore(math.floor(state.x), math.floor(state.y - 0.0001))
-	if not dist and not airDist then
+	if not dist then
 		return nil
 	end
 	local function closest(kind)
@@ -1721,6 +1690,8 @@ local function factoryTarget(W, state, seedId, blocked, onlyKind)
 				for x = 0, (tonumber(W.w) or 100) - 1 do
 					local key = seedId .. ":" .. kind .. ":" .. y .. ":" .. x
 					if (not blocked[key] or blocked[key] < os.clock())
+						and (not blocked[seedId .. ":" .. kind .. ":floor:" .. y]
+							or blocked[seedId .. ":" .. kind .. ":floor:" .. y] < os.clock())
 						and not (kind == "plant" and Factory.cycle and x == Factory.workX and y == Factory.workY) then
 						local suitable = kind == "harvest"
 							and row[x] == seedId and factoryTreeRipe(W, x, y, seedId)
@@ -1728,10 +1699,7 @@ local function factoryTarget(W, state, seedId, blocked, onlyKind)
 						if suitable then
 							for _, standX in ipairs({ x - 1, x + 1 }) do
 								local standKey = keyOf(standX, y)
-								local distance = dist and dist[standKey]
-								if not distance and airDist and airDist[standKey] then
-									distance = 10000 + airDist[standKey]
-								end
+								local distance = dist[standKey]
 								if distance and (not bestDistance or distance < bestDistance) then
 									best = { kind = kind, x = x, y = y, standX = standX, standY = y }
 									bestDistance = distance
@@ -1767,9 +1735,8 @@ local function factoryWork(W, inv, target, seedId, gen)
 	local alive = function()
 		return factoryAlive(gen) and W.name == Bind.name
 	end
-	if not Path.moveTo(target.standX, target.standY, alive)
-		and not Path.airMoveTo(target.standX, target.standY, alive) then
-		return false
+	if not Path.moveTo(target.standX, target.standY, alive) then
+		return false, "path"
 	end
 	local arrived = Bind.state()
 	if not factoryAlive(gen) or Factory.seedId ~= seedId or not (Factory[target.kind] or Factory.cycle)
@@ -1826,8 +1793,7 @@ end
 
 local function factoryWorkSpot(W, state)
 	local dist = Path.explore(math.floor(state.x), math.floor(state.y - 0.0001), 6000)
-	local airDist = Path.airExplore(math.floor(state.x), math.floor(state.y - 0.0001))
-	if not dist and not airDist then return nil end
+	if not dist then return nil end
 	local bestX, bestStandX, bestY, bestDistance
 	for y = 0, (tonumber(W.h) or 60) - 2 do
 		for x = 0, (tonumber(W.w) or 100) - 1 do
@@ -1836,10 +1802,7 @@ local function factoryWorkSpot(W, state)
 				local candidates = Factory.baseAtSelf and { x } or { x - 1, x + 1 }
 				for _, standX in ipairs(candidates) do
 					local standKey = keyOf(standX, y)
-					local distance = dist and dist[standKey]
-					if not distance and airDist and airDist[standKey] then
-						distance = 10000 + airDist[standKey]
-					end
+					local distance = dist[standKey]
 					if distance and (not bestDistance or distance < bestDistance) then
 						bestX, bestStandX, bestY, bestDistance = x, standX, y, distance
 					end
@@ -1870,7 +1833,7 @@ local function factoryPNBOne(W, inv, gen)
 	local alive = function()
 		return factoryAlive(gen) and W.name == Bind.name
 	end
-	if not Path.moveTo(standX, y, alive) and not Path.airMoveTo(standX, y, alive) then
+	if not Path.moveTo(standX, y, alive) then
 		return false
 	end
 	local arrived = Bind.state()
@@ -1938,7 +1901,8 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 		end
 		local target = factoryTarget(W, state, seedId, blocked, "harvest")
 		if target then
-			if factoryWork(W, inv, target, seedId, gen) then
+			local worked, reason = factoryWork(W, inv, target, seedId, gen)
+			if worked then
 				task.wait(0.25)
 				collectDropsNearby(W, inv, Bind.state(), 0.9)
 				if factoryAlive(gen) then
@@ -1947,6 +1911,9 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 				end
 			else
 				blocked[seedId .. ":harvest:" .. target.y .. ":" .. target.x] = os.clock() + 20
+				if reason == "path" then
+					blocked[seedId .. ":harvest:floor:" .. target.y] = os.clock() + 20
+				end
 			end
 			return 0.18
 		end
@@ -1983,13 +1950,17 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 		end
 		local target = factoryTarget(W, state, seedId, blocked, "plant")
 		if target then
-			if factoryWork(W, inv, target, seedId, gen) then
+			local worked, reason = factoryWork(W, inv, target, seedId, gen)
+			if worked then
 				if factoryAlive(gen) then
 					setFactoryStatus(string.format("Factory: plant %d | sisa seed %d",
 						Factory.planted, factoryCount(inv, seedId)))
 				end
 			else
 				blocked[seedId .. ":plant:" .. target.y .. ":" .. target.x] = os.clock() + 20
+				if reason == "path" then
+					blocked[seedId .. ":plant:floor:" .. target.y] = os.clock() + 20
+				end
 			end
 			return 0.18
 		end
@@ -2097,13 +2068,16 @@ local function startFactory()
 				else
 					local target = factoryTarget(W, s, currentSeed, blocked)
 					if target then
-						local worked = factoryWork(W, inv, target, currentSeed, gen)
+						local worked, reason = factoryWork(W, inv, target, currentSeed, gen)
 						if factoryAlive(gen) then
 							if worked then
 								setFactoryStatus(string.format("%s: panen %d, tanam %d (Y=%d)",
 										Factory.seedName, Factory.harvested, Factory.planted, currentFloor))
 							else
 								blocked[currentSeed .. ":" .. target.kind .. ":" .. target.y .. ":" .. target.x] = os.clock() + 20
+								if reason == "path" then
+									blocked[currentSeed .. ":" .. target.kind .. ":floor:" .. target.y] = os.clock() + 20
+								end
 							end
 						end
 						task.wait(0.18)
@@ -2513,7 +2487,7 @@ moveSec:Button({
 
 moveSec:Paragraph({
 	Title = "Cara kerja",
-	Desc = "Gerak biasa memakai A/D dan Space. Saat factory perlu melewati poros antar lantai, navigasi cadangan bergerak satu tile setiap 0,18 detik.",
+	Desc = "Factory berjalan dengan A/D, memakai Space bawaan game saat perlu naik, dan melangkah lewat poros untuk turun. Lompatan yang gagal tidak diulang terus-menerus.",
 })
 
 -- ---- Penjaga world ----
