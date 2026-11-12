@@ -26,7 +26,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.34",
+	version = "0.4.35",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -125,7 +125,7 @@ local function pickTable(matches, need)
 end
 
 local function findFnByWorld(fname, world)
-	local ok, list = pcall(filtergc, "function", { Name = fname }, false)
+	local ok, list = pcall(function() return filtergc("function", { Name = fname }) end)
 	if not ok or type(list) ~= "table" then
 		return nil
 	end
@@ -148,7 +148,7 @@ function Bind.invalidate()
 end
 
 local function findInventory()
-	local ok, list = pcall(filtergc, "table", { Keys = { "slots", "capacity", "changed" } }, false)
+	local ok, list = pcall(function() return filtergc("table", { Keys = { "slots", "capacity", "changed" } }) end)
 	if not ok or type(list) ~= "table" then
 		return nil
 	end
@@ -170,7 +170,7 @@ function Bind.resolve(force)
 		return true
 	end
 
-	local okW, worldList = pcall(filtergc, "table", { Keys = { "fg", "bg", "name", "w", "h" } }, false)
+	local okW, worldList = pcall(function() return filtergc("table", { Keys = { "fg", "bg", "name", "w", "h" } }) end)
 	if not okW then
 		return false
 	end
@@ -179,7 +179,7 @@ function Bind.resolve(force)
 		return false
 	end
 
-	local okC, ctList = pcall(filtergc, "table", { Keys = { "state", "onHurt", "onDie" } }, false)
+	local okC, ctList = pcall(function() return filtergc("table", { Keys = { "state", "onHurt", "onDie" } }) end)
 	local CT = okC and pickTable(ctList, { "state", "solidAt" }) or nil
 
 	local hit = findFnByWorld("hit", W)
@@ -225,7 +225,7 @@ local function closeWorldPicker(picker)
 	picker.Visible = false
 	-- Menu game memanggil closeDialogs() setelah enter berhasil untuk
 	-- menampilkan HUD lagi. Panel saja ditutup akan menyembunyikan HUD.
-	local ok, matches = pcall(filtergc, "table", { Keys = { "layers", "closeDialogs" } }, false)
+	local ok, matches = pcall(function() return filtergc("table", { Keys = { "layers", "closeDialogs" } }) end)
 	if not ok or type(matches) ~= "table" then return end
 	if type(matches[1]) ~= "table" then matches = { matches } end
 	for _, menu in ipairs(matches) do
@@ -1158,7 +1158,7 @@ local function findItemDB()
 			end
 		end
 	end
-	local ok, candidates = pcall(filtergc, "table", { Keys = { 2, 3, 14 } }, false)
+	local ok, candidates = pcall(function() return filtergc("table", { Keys = { 2, 3, 14 } }) end)
 	if not ok or type(candidates) ~= "table" then
 		return nil
 	end
@@ -1423,7 +1423,7 @@ end
 
 --// ===== 5. PATHFINDER TILE (JALAN / LOMPAT / JATUH) =====
 -- Dipakai factory untuk menjangkau seluruh world, bukan cuma 1 baris.
-local Path = {}
+local Path = { canJump = nil :: boolean? }
 
 local function keyOf(x, y)
 	return y * 1000 + x
@@ -3187,7 +3187,7 @@ local function guardMessage(message)
 end
 
 local function worldPlayers()
-	local ok, matches = pcall(filtergc, "table", { Keys = { "reset", "showNames", "list" } }, false)
+	local ok, matches = pcall(function() return filtergc("table", { Keys = { "reset", "showNames", "list" } }) end)
 	if not ok or type(matches) ~= "table" then
 		return nil
 	end
@@ -3244,7 +3244,7 @@ local function canBanInWorld(W)
 end
 
 local function banWorldPlayer(name)
-	local ok, matches = pcall(filtergc, "table", { Keys = { "setShown", "setWorld", "isTyping", "add", "onCommand" } }, false)
+	local ok, matches = pcall(function() return filtergc("table", { Keys = { "setShown", "setWorld", "isTyping", "add", "onCommand" } }) end)
 	if not ok or type(matches) ~= "table" or not name:match("^[%w_]+$") then
 		return false
 	end
