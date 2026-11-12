@@ -26,7 +26,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.33",
+	version = "0.4.34",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -411,6 +411,7 @@ local Factory = {
 	cycle = false,
 	seedId = nil,
 	seedName = nil,
+	seedGrow = nil,
 	baseId = nil,
 	baseName = nil,
 	baseLayer = nil,
@@ -429,6 +430,7 @@ local Factory = {
 	pnb = 0,
 	phase = "idle",
 	treeMap = nil,
+	treeMapWorld = nil,
 	harvested = 0,
 	planted = 0,
 	status = "idle",
@@ -1504,7 +1506,8 @@ function Path.standable(x, y)
 	if x < 0 or x >= w - 1 or y < 0 or y >= h - 1 then
 		return false
 	end
-	return (not Bind.solid(x, y)) and Bind.solid(x, y + 1)
+	local floor = W.fg and W.fg[y + 1] and W.fg[y + 1][x]
+	return (not Bind.solid(x, y)) and (Bind.solid(x, y + 1) or floor == 102)
 end
 
 -- Dijkstra kecil dari tile pemain. Hasil: dist[key], parent[key].
@@ -1535,7 +1538,8 @@ function Path.explore(sx, sy, maxNodes)
 		if x < 0 or x >= w - 1 or y < 0 or y >= h - 1 then
 			return false
 		end
-		return (not isSolid(x, y)) and isSolid(x, y + 1)
+		local floor = W.fg and W.fg[y + 1] and W.fg[y + 1][x]
+		return (not isSolid(x, y)) and (isSolid(x, y + 1) or floor == 102)
 	end
 
 	local dist, parent = {}, {}
@@ -1608,7 +1612,9 @@ function Path.explore(sx, sy, maxNodes)
 			-- terjebak di dasar poros dan factory berhenti bekerja.
 			for _, dir in ipairs({ -1, 1 }) do
 				local shaftX = cx + dir
-				if shaftX >= 0 and shaftX < w and not isSolid(shaftX, cy) then
+				-- Batas kanan menahan tubuh sebelum bisa masuk poros x=w-1.
+				if shaftX >= 0 and shaftX < w - 1
+					and not isSolid(shaftX, cy) and not canStand(shaftX, cy) then
 					for ny = cy + 1, h - 2 do
 						if ny - cy > 3 then break end
 						if isSolid(shaftX, ny) then break end
@@ -1687,7 +1693,7 @@ local function pathStep(cx, cy, step, aliveFn)
 	if step.kind == "drop" or step.kind == "dropShaft" then
 		local outward = step.shaftX < cx and KeyLeft or KeyRight
 		local inward = step.shaftX < cx and KeyRight or KeyLeft
-		local edgeStopX = step.shaftX < cx and step.shaftX + 0.88 or step.shaftX + 0.12
+		local edgeStopX = step.shaftX < cx and step.shaftX + 0.55 or step.shaftX + 0.45
 		Move.hold(outward)
 		local deadline = os.clock() + 1.8
 		while aliveFn() and os.clock() < deadline do
@@ -1804,6 +1810,26 @@ local function pathStep(cx, cy, step, aliveFn)
 			task.wait(readyAt - os.clock() + rnd(0.04, 0.10))
 		end
 		if not aliveFn() then return false end
+		-- Platform tepi harus dilompati dekat sisi poros, karena dinding
+		-- lantai atas tepat di sampingnya menahan tubuh bila terlalu tengah.
+		local center = cx + 0.5
+		local W = Bind.getW()
+		if W and W.fg and W.fg[cy + 1] and W.fg[cy + 1][cx] == 102 then
+			if Bind.solid(cx + 1, cy - 1) then
+				center = cx + 0.12
+			elseif Bind.solid(cx - 1, cy - 1) then
+				center = cx + 0.88
+			end
+		end
+		local alignUntil = os.clock() + 0.55
+		while aliveFn() and os.clock() < alignUntil do
+			local s = Bind.state()
+			if not s or not s.grounded then Move.release(); return false end
+			if math.abs(s.x - center) <= 0.08 then break end
+			Move.hold(s.x > center and KeyLeft or KeyRight)
+			task.wait(0.01)
+		end
+		Move.release()
 		if step.x ~= cx then Move.hold(step.x > cx and KeyRight or KeyLeft) end
 		task.wait(rnd(0.03, 0.08))
 		if not Move.jump() then
@@ -1818,6 +1844,11 @@ local function pathStep(cx, cy, step, aliveFn)
 			if landed() then
 				Move.release()
 				return true
+			end
+			if s.grounded and math.floor(s.y - 0.0001) == step.y
+				and math.abs(s.x - (step.x + 0.5)) < 1 then
+				Move.release()
+				return Move.walkTo(step.x + 0.5, { timeout = 2, tol = 0.28 }) and landed()
 			end
 			if s.grounded and os.clock() - (Move.lastJumpAt or 0) > 0.35 then break end
 			task.wait(0.03)
@@ -1909,19 +1940,26 @@ function Path.moveTo(tx, ty, aliveFn)
 end
 
 local function factoryTreeRipe(W, x, y, seedId)
-	if tileId(x, y) ~= seedId or type(W.treeLook) ~= "function" then
+	if tileId(x, y) ~= seedId then
 		return false
 	end
-	local key = y * W.w + x
-	local cached = Factory.treeMap and Factory.treeMap[key]
-	if not Factory.treeMap or type(cached) ~= "table" or cached.id ~= seedId then
+	if Factory.treeMapWorld ~= W then
 		Factory.treeMap = nil
-		local ok, upvalues = pcall(debug.getupvalues, W.treeLook)
+		Factory.treeMapWorld = W
+	end
+	if not Factory.treeMap then
+		-- treeLook menyimpan sprite pohon yang dekat kamera saja. Data semua
+		-- pohon ada di upvalue spliceAt; setiap entri punya waktu tanam p.
+		local fn = findFnByWorld("spliceAt", W)
+		local ok, upvalues = false, nil
+		if fn then
+			ok, upvalues = pcall(debug.getupvalues, fn)
+		end
 		if ok and type(upvalues) == "table" then
 			for _, candidate in ipairs(upvalues) do
 				if type(candidate) == "table" then
-					local value = candidate[key]
-					if type(value) == "table" and value.id == seedId then
+					local _, sample = next(candidate)
+					if type(sample) == "table" and type(sample.p) == "number" then
 						Factory.treeMap = candidate
 						break
 					end
@@ -1929,8 +1967,9 @@ local function factoryTreeRipe(W, x, y, seedId)
 			end
 		end
 	end
-	local tree = Factory.treeMap and Factory.treeMap[key]
-	return type(tree) == "table" and tree.id == seedId and tree.ripe == true
+	local tree = Factory.treeMap and Factory.treeMap[y * W.w + x]
+	return type(tree) == "table" and type(tree.p) == "number"
+		and tree.p + (Factory.seedGrow or 0) <= workspace:GetServerTimeNow()
 end
 
 local function factoryHasRipeTree(W, seedId)
@@ -2277,9 +2316,8 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 			return 0.1
 		end
 		if Factory.harvestSkipUntil and Factory.harvestSkipUntil > os.clock() then
-			-- Jalur panen gagal sementara; kosongkan sisa blok sebelum tanam.
-			if blocks > 0 then beginPNB(blocks) else Factory.phase = "plant" end
-			return 0.2
+			setFactoryStatus("Factory: menunggu jalur ke tree matang; tetap di fase harvest")
+			return 1
 		end
 		local target = factoryTarget(W, state, seedId, blocked, "harvest")
 		if target then
@@ -2334,6 +2372,10 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 				end
 			end
 			return 0.18
+		end
+		if factoryHasRipeTree(W, seedId) then
+			setFactoryStatus("Factory: tree matang ada; menunggu jalur panen bisa dilalui")
+			return 2
 		end
 		-- Tidak ada tree matang: tanam dulu kalau masih ada seed + tile kosong.
 		-- Blok penuh bukan alasan untuk berhenti memanen/menanam.
@@ -2513,7 +2555,7 @@ local function startFactory()
 	end
 	local state = Bind.state()
 	local floorY = state and standingFloor(state)
-	if not floorY or not Bind.solid(math.floor(state.x), floorY) then
+	if not floorY or not Path.standable(math.floor(state.x), floorY - 1) then
 		setFactoryStatus("gagal: karakter harus berdiri di atas lantai")
 		return false
 	end
@@ -2526,10 +2568,12 @@ local function startFactory()
 	Factory.running = true
 	Factory.gen += 1
 	Factory.treeMap = nil
+	Factory.treeMapWorld = nil
 	Factory.harvested, Factory.planted = 0, 0
 	Factory.pnb = 0
 	Factory.phase = Factory.cycle and "harvest" or "manual"
 	Factory.seedName = def.name or ("Seed " .. seedId)
+	Factory.seedGrow = tonumber(def.grow) or 0
 	Factory.baseId, Factory.baseName = baseId, baseDef and baseDef.name or nil
 	Factory.baseLayer = baseDef and (baseDef.background == true and "bg" or "fg") or nil
 	Factory.baseAtSelf = baseDef and (baseDef.background == true or baseDef.solid == false) or nil
