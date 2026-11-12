@@ -26,7 +26,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.45",
+	version = "0.4.46",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -148,18 +148,30 @@ function Bind.invalidate()
 end
 
 local function findInventory()
-	local ok, list = pcall(function() return filtergc("table", { Keys = { "slots", "capacity", "changed" } }) end)
-	if not ok or type(list) ~= "table" then
-		return nil
-	end
-	if type(list[1]) ~= "table" then
-		list = { list }
-	end
-	for _, t in ipairs(list) do
-		if type(t) == "table" and type(t.slots) == "table"
+	local function valid(t)
+		return type(t) == "table" and type(t.slots) == "table"
 			and type(t.count) == "function" and type(t.select) == "function"
-			and type(t.remove) == "function" and type(t.room) == "function" then
-			return t
+			and type(t.remove) == "function" and type(t.room) == "function"
+	end
+	for _, keys in ipairs({ { "slots", "capacity", "changed" }, { "slots", "capacity" }, { "slots" } }) do
+		local ok, list = pcall(function() return filtergc("table", { Keys = keys }) end)
+		if ok and type(list) == "table" then
+			if valid(list) then return list end
+			if type(list[1]) ~= "table" then list = { list } end
+			for _, t in ipairs(list) do
+				if valid(t) then return t end
+			end
+		end
+	end
+	-- Beberapa executor mobile tidak mengembalikan tabel inventory dari
+	-- filtergc. Scan GC dibatasi dan diberi jeda agar game tetap responsif.
+	if type(getgc) == "function" then
+		local ok, objects = pcall(function() return getgc(true) end)
+		if ok and type(objects) == "table" then
+			for i = 1, math.min(#objects, 30000) do
+				if valid(objects[i]) then return objects[i] end
+				if i % 500 == 0 then task.wait() end
+			end
 		end
 	end
 	return nil
@@ -167,7 +179,8 @@ end
 
 function Bind.resolve(force)
 	if not force and Bind.W and Bind.CT and Bind.hit and Bind.setTile then
-		return true
+		if not Bind.inv then Bind.inv = findInventory() end
+		return Bind.inv ~= nil
 	end
 
 	local okW, worldList = pcall(function() return filtergc("table", { Keys = { "fg", "bg", "name", "w", "h" } }) end)
@@ -184,12 +197,12 @@ function Bind.resolve(force)
 
 	local hit = findFnByWorld("hit", W)
 	local setTile = findFnByWorld("setTile", W)
-	local inv = findInventory()
+	local inv = findInventory() or Bind.inv
 
 	Bind.W, Bind.CT, Bind.hit, Bind.setTile, Bind.inv, Bind.name = W, CT, hit, setTile, inv, W.name
 	log(string.format("bind world=%s %sx%s hit=%s setTile=%s inv=%s", tostring(W.name), tostring(W.w), tostring(W.h),
 		hit and "ok" or "NIL", setTile and "ok" or "NIL", inv and "ok" or "NIL"))
-	return W ~= nil and CT ~= nil and hit ~= nil
+	return W ~= nil and CT ~= nil and hit ~= nil and inv ~= nil
 end
 
 function Bind.getW()
@@ -3087,10 +3100,14 @@ Factory.resolveSeedName = function()
 	if #query < 3 then
 		return nil, "Ketik nama seed (minimal 3 huruf) sebelum menyalakan Factory."
 	end
-	if not Bind.inv then Bind.resolve() end
-	local items, inv = findItemDB(), Bind.inv
-	if not items or not inv then
-		return nil, "Data seed atau inventory belum terbaca; coba lagi setelah masuk world."
+	if not Bind.inv then Bind.resolve(true) end
+	local inv = Bind.inv
+	if not inv then
+		return nil, "Inventory game belum terbaca oleh executor. Bind inv=NIL; coba jalankan ulang script di world."
+	end
+	local items = findItemDB()
+	if not items then
+		return nil, "Data nama item belum terbaca oleh executor. Bind itemDB=NIL."
 	end
 	local exact, partial = {}, {}
 	for id, def in pairs(items) do
