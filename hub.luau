@@ -26,7 +26,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.46",
+	version = "0.4.47",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -1180,18 +1180,34 @@ local function findItemDB()
 			end
 		end
 	end
-	local ok, candidates = pcall(function() return filtergc("table", { Keys = { 2, 3, 14 } }) end)
-	if not ok or type(candidates) ~= "table" then
-		return nil
+	-- Filter gabungan key numerik bisa melewatkan ItemDB di beberapa executor.
+	-- Cari dengan satu key lalu validasi isi tabel sebelum dipakai.
+	for _, key in ipairs({ 955, 14 }) do
+		local ok, candidates = pcall(function() return filtergc("table", { Keys = { key } }) end)
+		if ok and type(candidates) == "table" then
+			if itemDBCandidate(candidates) then
+				itemDBCache = candidates
+				return candidates
+			end
+			for _, candidate in ipairs(candidates) do
+				if itemDBCandidate(candidate) then
+					itemDBCache = candidate
+					return candidate
+				end
+			end
+		end
 	end
-	if itemDBCandidate(candidates) then
-		itemDBCache = candidates
-		return candidates
-	end
-	for _, candidate in ipairs(candidates) do
-		if itemDBCandidate(candidate) then
-			itemDBCache = candidate
-			return candidate
+	-- Cadangan untuk executor mobile yang tidak mendukung filtergc.
+	if type(getgc) == "function" then
+		local ok, objects = pcall(function() return getgc(true) end)
+		if ok and type(objects) == "table" then
+			for i = 1, math.min(#objects, 50000) do
+				if itemDBCandidate(objects[i]) then
+					itemDBCache = objects[i]
+					return itemDBCache
+				end
+				if i % 500 == 0 then task.wait() end
+			end
 		end
 	end
 	return nil
