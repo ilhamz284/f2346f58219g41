@@ -26,7 +26,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.35",
+	version = "0.4.38",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -1920,7 +1920,11 @@ function Path.moveTo(tx, ty, aliveFn)
 			Move.release()
 			-- Catat transisi pertama yang gagal. Tanpa ini pathfinder akan
 			-- menawarkan jalur yang sama lagi pada percobaan berikutnya.
-			Path.blockEdge(cx, cy, firstStep.x, firstStep.y, 45)
+			-- Jalan lurus bisa gagal sesaat karena input/overshoot. Menandai
+			-- edge jalan sebagai tembok membuat lantai terbuka tampak putus.
+			if firstStep.kind ~= "walk" then
+				Path.blockEdge(cx, cy, firstStep.x, firstStep.y, 12)
+			end
 			local landed = Bind.state()
 			if not landed or not landed.grounded
 				or (math.floor(landed.x) == cx and math.floor(landed.y - 0.0001) == cy) then
@@ -1999,7 +2003,7 @@ local function factoryTarget(W, state, seedId, blocked, onlyKind)
 				or (floorMode == "same" and y == cy)
 				or (floorMode == "below" and y > cy)
 				or (floorMode == "above" and y < cy)
-			local rowBlocked = blocked[kind .. ":row:" .. y]
+			local rowBlocked = kind == "plant" and blocked[kind .. ":row:" .. y]
 			if inFloor and not (rowBlocked and rowBlocked > os.clock()) then
 				local row = W.fg and W.fg[y]
 				if row then
@@ -2074,11 +2078,32 @@ local function factoryTarget(W, state, seedId, blocked, onlyKind)
 end
 
 local function factoryWork(W, inv, target, seedId, gen)
+	local startState = Bind.state()
+	local checkedFloor = startState and math.floor(startState.y - 0.0001)
+	local retargeted = false
 	local alive = function()
-		return factoryAlive(gen) and W.name == Bind.name
+		if not factoryAlive(gen) or W.name ~= Bind.name then
+			return false
+		end
+		if target.kind == "harvest" then
+			local current = Bind.state()
+			local floor = current and math.floor(current.y - 0.0001)
+			if floor and current.grounded and floor ~= checkedFloor then
+				checkedFloor = floor
+				-- Saat perjalanan pindah lantai, jangan terus mengejar
+				-- target lama di atas jika sekarang ada pohon matang di
+				-- lantai ini atau lantai bawah yang lebih dekat.
+				local alternative = factoryTarget(W, current, seedId, {}, "harvest")
+				if alternative and alternative.y >= floor and alternative.y ~= target.y then
+					retargeted = true
+					return false
+				end
+			end
+		end
+		return true
 	end
 	if not Path.moveTo(target.standX, target.standY, alive) then
-		return false, "path"
+		return false, retargeted and "retarget" or "path"
 	end
 	local arrived = Bind.state()
 	if not factoryAlive(gen) or Factory.seedId ~= seedId or not (Factory[target.kind] or Factory.cycle)
@@ -2315,10 +2340,6 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 			setFactoryStatus(string.format("Factory: blok penuh %d/200; PNB sampai habis", blocks))
 			return 0.1
 		end
-		if Factory.harvestSkipUntil and Factory.harvestSkipUntil > os.clock() then
-			setFactoryStatus("Factory: menunggu jalur ke tree matang; tetap di fase harvest")
-			return 1
-		end
 		local target = factoryTarget(W, state, seedId, blocked, "harvest")
 		if target then
 			local worked, reason = factoryWork(W, inv, target, seedId, gen)
@@ -2334,6 +2355,10 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 						Factory.harvested, factoryCount(inv, Factory.baseId)))
 				end
 			else
+				if reason == "retarget" then
+					setFactoryStatus("Factory: pindah lantai; pilih pohon matang terdekat")
+					return 0.1
+				end
 				local sameFloor = target.y == cy
 				local key = seedId .. ":harvest:" .. target.y .. ":" .. target.x
 				Factory.harvestFailCount = Factory.harvestFailCount or {}
@@ -2344,10 +2369,7 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 					-- Karakter tidak sampai ke pohon. Ini bukan gagal panen:
 					-- pohonnya tidak pernah dipukul.
 					reasonText = "tidak bisa menjangkau pohon"
-					blockFor = sameFloor and (fails >= 3 and 600 or fails >= 2 and 120 or 45) or 600
-					if not sameFloor then
-						blocked["harvest:row:" .. target.y] = os.clock() + 240
-					end
+					blockFor = sameFloor and 4 or 5
 				elseif reason == "gone" then
 					reasonText = "pohon sudah tidak matang"
 					blockFor = 20
@@ -2360,12 +2382,6 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 				end
 				blocked[key] = os.clock() + blockFor
 				Factory.harvestFailures = (Factory.harvestFailures or 0) + 1
-				-- Target di lantai lain: sekali gagal sudah cukup untuk
-				-- berhenti mencoba panen sebentar dan pindah ke PNB/tanam.
-				if not sameFloor or Factory.harvestFailures >= 5 then
-					Factory.harvestFailures = 0
-					Factory.harvestSkipUntil = os.clock() + 15
-				end
 				if factoryAlive(gen) then
 					setFactoryStatus(string.format("Factory: %s X=%d Y=%d; coba tree lain",
 						reasonText, target.x, target.y))
@@ -2373,20 +2389,40 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 			end
 			return 0.18
 		end
-		if factoryHasRipeTree(W, seedId) then
-			setFactoryStatus("Factory: tree matang ada; menunggu jalur panen bisa dilalui")
-			return 2
+		local ripeElsewhere = factoryHasRipeTree(W, seedId)
+		-- Beberapa target hanya ditunda beberapa detik setelah input gerak
+		-- gagal. Jangan langsung pindah fase selama target itu sebenarnya
+		-- bisa dicapai dari posisi sekarang.
+		if ripeElsewhere and factoryTarget(W, state, seedId, {}, "harvest") then
+			local now, soonest = os.clock(), math.huge
+			for key, untilAt in pairs(blocked) do
+				if type(key) == "string" and key:sub(1, #(seedId .. ":harvest:")) == seedId .. ":harvest:"
+					and type(untilAt) == "number" and untilAt > now then
+					soonest = math.min(soonest, untilAt - now)
+				end
+			end
+			if soonest <= 5 then
+				setFactoryStatus("Factory: mencoba ulang target panen terdekat")
+				return math.min(0.5, soonest)
+			end
 		end
-		-- Tidak ada tree matang: tanam dulu kalau masih ada seed + tile kosong.
-		-- Blok penuh bukan alasan untuk berhenti memanen/menanam.
+		-- Jika belum ada target panen yang dipilih, kerjakan blok/seed yang
+		-- tersedia; fase grow akan mencoba tree lagi pada putaran berikutnya.
 		if blocks <= 0 and seeds > 0 and factoryTarget(W, state, seedId, blocked, "plant") then
 			Factory.phase = "plant"
-			setFactoryStatus(string.format("Factory: tidak ada tree matang; lanjut tanam (%d seed)", seeds))
+			setFactoryStatus(string.format("Factory: target panen tertunda; lanjut tanam (%d seed)", seeds))
 			return 0.1
 		end
+		if blocks <= 0 then
+			Factory.phase = "grow"
+			setFactoryStatus(ripeElsewhere
+				and "Factory: target panen tertunda; coba lagi setelah jeda"
+				or "Factory: menunggu tree matang")
+			return 1
+		end
 		beginPNB(blocks)
-		if factoryHasRipeTree(W, seedId) then
-			setFactoryStatus("Factory: tree matang ada, jalur panen sedang dicoba ulang; lanjut PNB")
+		if ripeElsewhere then
+			setFactoryStatus("Factory: target panen tertunda; lanjut PNB sambil coba ulang")
 		else
 			setFactoryStatus(string.format("Factory: tidak ada tree matang yang terjangkau di world, PNB %d blok", blocks))
 		end
