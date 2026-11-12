@@ -26,7 +26,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.38",
+	version = "0.4.41",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -1065,26 +1065,30 @@ local function collectDropsNearby(W, inv, state, radius)
 	if not ok or type(drops) ~= "table" then
 		return 0
 	end
-	local collected = 0
+	local collected, needsRoom = 0, false
 	for _, drop in ipairs(drops) do
 		if type(drop) == "table" and type(drop.uid) == "number" and type(drop.id) == "number"
 			and type(drop.n) == "number" and type(drop.x) == "number" and type(drop.y) == "number" then
 			local dx, dy = drop.x - state.x, drop.y - state.y
 			if dx * dx + dy * dy <= radius * radius then
 				local roomOK, room = pcall(inv.room, inv, drop.id)
-				local want = roomOK and math.min(drop.n, tonumber(room) or 0) or 0
-				if want > 0 then
-					local takeOK, taken = pcall(W.takeDrop, drop.uid, want)
+				local available = roomOK and (tonumber(room) or 0) or 0
+				if available > 0 then
+					-- Minta satu tumpukan penuh. Game yang menentukan berapa
+					-- bagian yang diterima ketika inventory hampir penuh.
+					local takeOK, taken = pcall(W.takeDrop, drop.uid, drop.n)
 					taken = takeOK and tonumber(taken) or 0
 					if taken > 0 then
 						pcall(inv.add, inv, drop.id, taken)
 						collected += taken
+					elseif drop.id == Factory.baseId and drop.n > available then
+						needsRoom = true
 					end
 				end
 			end
 		end
 	end
-	return collected
+	return collected, needsRoom
 end
 
 local function collectNearby(W, inv, state)
@@ -2146,7 +2150,8 @@ local function factoryWork(W, inv, target, seedId, gen)
 		if factoryAlive(gen) and Bind.solid(x, y + 1) then
 			Move.walkTo(x + 0.5, { timeout = 3, tol = 0.28 })
 		end
-		collectDropsNearby(W, inv, Bind.state(), 0.9)
+		local _, needsRoom = collectDropsNearby(W, inv, Bind.state(), 0.9)
+		if needsRoom then Factory.collectNeedsRoom = true end
 		return true
 	end
 	if tileId(x, y) ~= 0 or not Bind.solid(x, y + 1) then
@@ -2303,6 +2308,63 @@ local function factoryRoom(inv, itemId)
 	return ok and (tonumber(room) or 0) or 0
 end
 
+local function factoryBaseDrops(W, baseId)
+	if not baseId or type(W.dropList) ~= "function" then return {} end
+	local ok, drops = pcall(W.dropList)
+	if not ok or type(drops) ~= "table" then return {} end
+	local result = {}
+	for _, drop in ipairs(drops) do
+		if type(drop) == "table" and drop.id == baseId and type(drop.uid) == "number"
+			and type(drop.n) == "number" and drop.n > 0
+			and type(drop.x) == "number" and type(drop.y) == "number" then
+			table.insert(result, drop)
+		end
+	end
+	return result
+end
+
+local function factoryCollectDrop(W, inv, state, blocked, gen)
+	local drops = factoryBaseDrops(W, Factory.baseId)
+	if #drops == 0 then return "done", 0 end
+	local room = factoryRoom(inv, Factory.baseId)
+	if room <= 0 then return "room", #drops end
+	local dist = Path.explore(math.floor(state.x), math.floor(state.y - 0.0001), 6000)
+	local best, bestCost, eligible = nil, nil, false
+	for _, drop in ipairs(drops) do
+		if room > 0 then
+			eligible = true
+			local y = math.floor(drop.y)
+			local x = math.floor(drop.x)
+			for _, standX in ipairs({ x, x - 1, x + 1 }) do
+				local cost = dist and dist[keyOf(standX, y)]
+				local dx, dy = drop.x - (standX + 0.5), drop.y - (y + 0.999)
+				if cost and Path.standable(standX, y)
+					and dx * dx + dy * dy <= 0.9 * 0.9
+					and (not blocked["drop:" .. drop.uid] or blocked["drop:" .. drop.uid] < os.clock())
+					and (not bestCost or cost < bestCost) then
+					best, bestCost = { drop = drop, x = standX, y = y }, cost
+				end
+			end
+		end
+	end
+	if not best then
+		return eligible and "path" or "room", #drops
+	end
+	local alive = function() return factoryAlive(gen) and W.name == Bind.name end
+	if not Path.moveTo(best.x, best.y, alive) then
+		blocked["drop:" .. best.drop.uid] = os.clock() + 15
+		return "path", #drops
+	end
+	Move.walkTo(best.x + 0.5, { timeout = 2, tol = 0.25 })
+	local collected = collectDropsNearby(W, inv, Bind.state(), 0.9)
+	if collected <= 0 then
+		if best.drop.n > room then return "room", #drops end
+		blocked["drop:" .. best.drop.uid] = os.clock() + 10
+		return "take", #drops
+	end
+	return "collected", collected
+end
+
 local function factoryHasPlantTile(W)
 	for y = 0, (tonumber(W.h) or 60) - 2 do
 		local row = W.fg and W.fg[y]
@@ -2329,15 +2391,17 @@ end
 local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 	local blocks = factoryCount(inv, Factory.baseId)
 	local seeds = factoryCount(inv, seedId)
-	local blockFull = blocks >= 200 or factoryRoom(inv, Factory.baseId) == 0
+	local room = factoryRoom(inv, Factory.baseId)
+	local blockFull = blocks >= 200 or room == 0 or Factory.collectNeedsRoom == true
 
 	if Factory.phase == "harvest" then
 		local cy = math.floor(state.y - 0.0001)
 		-- Blok penuh: panen cuma membuang drop (inv.room(id) == 0 membuat
 		-- takeDrop mengembalikan 0), jadi kosongkan dulu lewat PNB.
 		if blockFull and Factory.baseId then
+			Factory.collectNeedsRoom = false
 			beginPNB(blocks)
-			setFactoryStatus(string.format("Factory: blok penuh %d/200; PNB sampai habis", blocks))
+			setFactoryStatus(string.format("Factory: ruang blok tidak cukup (%d/200); PNB lalu ambil drop", blocks))
 			return 0.1
 		end
 		local target = factoryTarget(W, state, seedId, blocked, "harvest")
@@ -2349,7 +2413,8 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 					Factory.harvestFailCount[seedId .. ":harvest:" .. target.y .. ":" .. target.x] = nil
 				end
 				task.wait(0.25)
-				collectDropsNearby(W, inv, Bind.state(), 0.9)
+				local _, needsRoom = collectDropsNearby(W, inv, Bind.state(), 0.9)
+				if needsRoom then Factory.collectNeedsRoom = true end
 				if factoryAlive(gen) then
 					setFactoryStatus(string.format("Factory: harvest %d | blok %d/200",
 						Factory.harvested, factoryCount(inv, Factory.baseId)))
@@ -2436,9 +2501,11 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 			return 0.2
 		end
 		if blocks <= 0 then
-			Factory.phase = "plant"
+			local hasDrops = #factoryBaseDrops(W, Factory.baseId) > 0
+			Factory.phase = hasDrops and "collect" or "plant"
 			Factory.pnbLowWater = nil
-			setFactoryStatus(string.format("Factory: PNB selesai | blok %d, seed %d; mulai tanam", blocks, seeds))
+			setFactoryStatus(string.format("Factory: PNB selesai | blok %d, seed %d; %s", blocks, seeds,
+				hasDrops and "ambil drop tertinggal" or "mulai tanam"))
 			return 0.1
 		end
 		if Factory.pnbSkipUntil and Factory.pnbSkipUntil > os.clock() then
@@ -2482,6 +2549,26 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 			end
 		end
 		return worked and 0.3 or 1
+	end
+
+	if Factory.phase == "collect" then
+		local result, amount = factoryCollectDrop(W, inv, state, blocked, gen)
+		if result == "done" then
+			Factory.phase = "plant"
+			setFactoryStatus("Factory: drop blok selesai diambil; mulai tanam")
+		elseif result == "room" then
+			if blocks > 0 then
+				beginPNB(blocks)
+				setFactoryStatus(string.format("Factory: drop masih ada, ruang tidak cukup; PNB %d blok", blocks))
+			else
+				Factory.stop("Factory: inventory penuh; tidak ada blok untuk PNB")
+			end
+		elseif result == "collected" then
+			setFactoryStatus(string.format("Factory: mengambil drop blok +%d", amount))
+		else
+			setFactoryStatus(string.format("Factory: mencoba ulang drop blok (%d tersisa, %s)", amount, result))
+		end
+		return result == "collected" and 0.15 or 1
 	end
 
 	if Factory.phase == "plant" then
@@ -2607,7 +2694,7 @@ local function startFactory()
 	Factory.treeMapWorld = nil
 	Factory.harvested, Factory.planted = 0, 0
 	Factory.pnb = 0
-	Factory.phase = Factory.cycle and "harvest" or "manual"
+	Factory.phase = Factory.cycle and (#factoryBaseDrops(W, baseId) > 0 and "collect" or "harvest") or "manual"
 	Factory.seedName = def.name or ("Seed " .. seedId)
 	Factory.seedGrow = tonumber(def.grow) or 0
 	Factory.baseId, Factory.baseName = baseId, baseDef and baseDef.name or nil
@@ -2617,6 +2704,7 @@ local function startFactory()
 	Factory.pnbPathFailures = 0
 	Factory.pnbSkipUntil = nil
 	Factory.pnbLowWater = nil
+	Factory.collectNeedsRoom = false
 	Factory.harvestFailures = 0
 	Factory.harvestSkipUntil = nil
 	Factory.harvestFailCount = {}
