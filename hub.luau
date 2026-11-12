@@ -26,7 +26,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.43",
+	version = "0.4.44",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -2712,7 +2712,7 @@ local function startFactory()
 	local seedId = Factory.seedId
 	local def = seedId and selectedItemDefinition(seedId)
 	if not (W and inv and Bind.CT and Bind.hit and Bind.setTile and def and def.kind == "seed") then
-		setFactoryStatus("gagal: pilih seed dari daftar inventory")
+		setFactoryStatus("gagal: pilih seed dari inventory lewat nama atau daftar")
 		return false
 	end
 	local baseId, baseDef
@@ -3007,27 +3007,106 @@ factorySec:Paragraph({
 	Desc = "Pilih seed dari inventory. Factory panen, habiskan blok lewat PNB, lalu tanam. Jika tile tanam penuh, seed disimpan ke Display Box yang bisa dijangkau di world ini.",
 })
 
-local seedValues, seedByLabel = Factory.seedOptions()
+local mobileSeedInput = game:GetService("UserInputService").TouchEnabled
+local seedValues, seedByLabel = { "Pilih seed..." }, {}
+if not mobileSeedInput then
+	seedValues, seedByLabel = Factory.seedOptions()
+end
 local seedPlaceholder = "Pilih seed..."
 Factory.seedId = nil
 Factory.seedName = nil
-local seedDropdown = factorySec:Dropdown({
-	Title = "Pilih seed",
-	Desc = "Pilih seed secara manual sebelum menyalakan fitur. Seed ini menentukan pohon yang dipanen dan ditanam.",
-	Values = seedValues,
-	Value = seedPlaceholder,
-	Callback = function(label)
-		local id = seedByLabel[label]
-		if Factory.cycle and Factory.running and id ~= Factory.seedId then
+local seedDropdown
+if not mobileSeedInput then
+	seedDropdown = factorySec:Dropdown({
+		Title = "Pilih seed",
+		Desc = "Pilih seed secara manual sebelum menyalakan fitur. Seed ini menentukan pohon yang dipanen dan ditanam.",
+		Values = seedValues,
+		Value = seedPlaceholder,
+		Callback = function(label)
+			local id = seedByLabel[label]
+			if Factory.cycle and Factory.running and id ~= Factory.seedId then
+				Factory.stop("seed berubah; nyalakan Auto Factory lagi")
+			end
+			Factory.seedId = id
+			local def = id and selectedItemDefinition(id)
+			Factory.seedName = def and def.name or nil
+		end,
+	})
+end
+
+local seedNameTyped = ""
+local seedNameStatus = factorySec:Paragraph({
+	Title = "Seed berdasarkan nama",
+	Desc = "Ketik nama seed lalu tekan Pilih seed dari nama.",
+})
+local seedNameInput = factorySec:Input({
+	Title = "Nama seed",
+	Desc = "Contoh: Sugar Cane atau Sugar Cane Seed",
+	Placeholder = "Nama seed di inventory...",
+	Value = "",
+	Type = "Input",
+	Callback = function(value)
+		seedNameTyped = tostring(value or "")
+	end,
+})
+
+local function normalizedSeedName(value)
+	local name = tostring(value or ""):lower():gsub("%s+", " ")
+	name = name:gsub("^%s+", ""):gsub("%s+$", "")
+	return name:gsub("%s+seed$", ""):gsub("%s+tree$", "")
+end
+
+factorySec:Button({
+	Title = "Pilih seed dari nama",
+	Desc = "Gunakan ini jika daftar seed terus memuat di Android.",
+	Callback = function()
+		local typed = seedNameTyped
+		if seedNameInput and type(seedNameInput.Value) == "string" and seedNameInput.Value ~= "" then
+			typed = seedNameInput.Value
+		end
+		local query = normalizedSeedName(typed)
+		if #query < 3 then
+			seedNameStatus:SetDesc("Ketik minimal 3 huruf nama seed.")
+			return
+		end
+		if not Bind.inv then Bind.resolve() end
+		local items, inv = findItemDB(), Bind.inv
+		if not items or not inv then
+			seedNameStatus:SetDesc("Data seed atau inventory belum terbaca; coba lagi setelah masuk world.")
+			return
+		end
+		local exact, partial = {}, {}
+		for id, def in pairs(items) do
+			if type(id) == "number" and type(def) == "table" and def.kind == "seed" then
+				local ok, count = pcall(inv.count, inv, id)
+				if ok and (tonumber(count) or 0) > 0 then
+					local key = normalizedSeedName(def.name)
+					if key == query then
+						table.insert(exact, { id = id, name = def.name, count = count })
+					elseif key:find(query, 1, true) then
+						table.insert(partial, { id = id, name = def.name, count = count })
+					end
+				end
+			end
+		end
+		local matches = #exact > 0 and exact or partial
+		if #matches ~= 1 then
+			seedNameStatus:SetDesc(#matches == 0 and "Seed itu tidak ada di inventory."
+				or "Nama cocok dengan beberapa seed; ketik nama lebih lengkap.")
+			return
+		end
+		local selected = matches[1]
+		if Factory.running and selected.id ~= Factory.seedId then
 			Factory.stop("seed berubah; nyalakan Auto Factory lagi")
 		end
-		Factory.seedId = id
-		local def = id and selectedItemDefinition(id)
-		Factory.seedName = def and def.name or nil
+		Factory.seedId, Factory.seedName = selected.id, selected.name
+		seedNameStatus:SetDesc(string.format("Dipilih: %s [#%d] x%d", selected.name, selected.id, selected.count))
+		setFactoryStatus("Seed dipilih: " .. selected.name)
 	end,
 })
 
 local function refreshSeedDropdown(values, byLabel)
+	if not seedDropdown then return end
 	if not values then
 		values, byLabel = Factory.seedOptions()
 	end
@@ -3049,27 +3128,24 @@ local function refreshSeedDropdown(values, byLabel)
 	Factory.seedName = def and def.name or nil
 end
 
-factorySec:Button({
-	Title = "Refresh daftar seed",
-	Desc = "Perbarui seed yang tersedia setelah inventory berubah.",
-	Callback = function()
-		refreshSeedDropdown()
-	end,
-})
-
-task.spawn(function()
-	for _ = 1, 15 do
-		task.wait(2)
-		if _G.__HumanHub ~= Hub then
-			return
+if seedDropdown then
+	factorySec:Button({
+		Title = "Refresh daftar seed",
+		Desc = "Perbarui seed yang tersedia setelah inventory berubah.",
+		Callback = function() refreshSeedDropdown() end,
+	})
+	task.spawn(function()
+		for _ = 1, 15 do
+			task.wait(2)
+			if _G.__HumanHub ~= Hub then return end
+			local values, byLabel = Factory.seedOptions()
+			if next(byLabel) then
+				refreshSeedDropdown(values, byLabel)
+				return
+			end
 		end
-		local values, byLabel = Factory.seedOptions()
-		if next(byLabel) then
-			refreshSeedDropdown(values, byLabel)
-			return
-		end
-	end
-end)
+	end)
+end
 
 local harvestToggle, plantToggle, cycleToggle
 harvestToggle = factorySec:Toggle({
