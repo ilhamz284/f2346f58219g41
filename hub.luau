@@ -26,7 +26,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.44",
+	version = "0.4.45",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -2708,11 +2708,18 @@ local function startFactory()
 		return false
 	end
 	Bind.resolve(true)
+	if not Factory.seedId and type(Factory.resolveSeedName) == "function" then
+		local ok, selected, reason = pcall(Factory.resolveSeedName)
+		if not ok or not selected then
+			setFactoryStatus(ok and reason or "gagal membaca nama seed")
+			return false
+		end
+	end
 	local W, inv = Bind.W, Bind.inv
 	local seedId = Factory.seedId
 	local def = seedId and selectedItemDefinition(seedId)
 	if not (W and inv and Bind.CT and Bind.hit and Bind.setTile and def and def.kind == "seed") then
-		setFactoryStatus("gagal: pilih seed dari inventory lewat nama atau daftar")
+		setFactoryStatus("gagal: data world, inventory, atau definisi seed belum terbaca")
 		return false
 	end
 	local baseId, baseDef
@@ -3056,52 +3063,79 @@ local function normalizedSeedName(value)
 	return name:gsub("%s+seed$", ""):gsub("%s+tree$", "")
 end
 
+local function currentSeedNameText()
+	local typed = seedNameTyped
+	if seedNameInput and type(seedNameInput.Value) == "string" and seedNameInput.Value ~= "" then
+		typed = seedNameInput.Value
+	end
+	-- WindUI di mobile kadang belum memanggil Callback saat keyboard
+	-- ditutup. Baca isi TextBox langsung ketika tombol/toggle ditekan.
+	for _, root in ipairs({ uiRoot, Players.LocalPlayer and Players.LocalPlayer:FindFirstChild("PlayerGui") }) do
+		if root then
+			for _, child in ipairs(root:GetDescendants()) do
+				if child:IsA("TextBox") and child.PlaceholderText == "Nama seed di inventory..." then
+					return child.Text
+				end
+			end
+		end
+	end
+	return typed
+end
+
+Factory.resolveSeedName = function()
+	local query = normalizedSeedName(currentSeedNameText())
+	if #query < 3 then
+		return nil, "Ketik nama seed (minimal 3 huruf) sebelum menyalakan Factory."
+	end
+	if not Bind.inv then Bind.resolve() end
+	local items, inv = findItemDB(), Bind.inv
+	if not items or not inv then
+		return nil, "Data seed atau inventory belum terbaca; coba lagi setelah masuk world."
+	end
+	local exact, partial = {}, {}
+	for id, def in pairs(items) do
+		if type(id) == "number" and type(def) == "table" and def.kind == "seed" then
+			local ok, count = pcall(inv.count, inv, id)
+			if ok and (tonumber(count) or 0) > 0 then
+				local key = normalizedSeedName(def.name)
+				if key == query then
+					table.insert(exact, { id = id, name = def.name, count = count })
+				elseif key:find(query, 1, true) then
+					table.insert(partial, { id = id, name = def.name, count = count })
+				end
+			end
+		end
+	end
+	local matches = #exact > 0 and exact or partial
+	if #matches ~= 1 then
+		return nil, #matches == 0 and "Seed itu tidak ada di inventory."
+			or "Nama cocok dengan beberapa seed; ketik nama lebih lengkap."
+	end
+	local selected = matches[1]
+	if Factory.running and selected.id ~= Factory.seedId then
+		Factory.stop("seed berubah; nyalakan Auto Factory lagi")
+	end
+	Factory.seedId, Factory.seedName = selected.id, selected.name
+	if seedNameStatus and seedNameStatus.SetDesc then
+		pcall(seedNameStatus.SetDesc, seedNameStatus,
+			string.format("Dipilih: %s [#%d] x%d", selected.name, selected.id, selected.count))
+	end
+	return selected.id
+end
+
 factorySec:Button({
 	Title = "Pilih seed dari nama",
 	Desc = "Gunakan ini jika daftar seed terus memuat di Android.",
 	Callback = function()
-		local typed = seedNameTyped
-		if seedNameInput and type(seedNameInput.Value) == "string" and seedNameInput.Value ~= "" then
-			typed = seedNameInput.Value
-		end
-		local query = normalizedSeedName(typed)
-		if #query < 3 then
-			seedNameStatus:SetDesc("Ketik minimal 3 huruf nama seed.")
-			return
-		end
-		if not Bind.inv then Bind.resolve() end
-		local items, inv = findItemDB(), Bind.inv
-		if not items or not inv then
-			seedNameStatus:SetDesc("Data seed atau inventory belum terbaca; coba lagi setelah masuk world.")
-			return
-		end
-		local exact, partial = {}, {}
-		for id, def in pairs(items) do
-			if type(id) == "number" and type(def) == "table" and def.kind == "seed" then
-				local ok, count = pcall(inv.count, inv, id)
-				if ok and (tonumber(count) or 0) > 0 then
-					local key = normalizedSeedName(def.name)
-					if key == query then
-						table.insert(exact, { id = id, name = def.name, count = count })
-					elseif key:find(query, 1, true) then
-						table.insert(partial, { id = id, name = def.name, count = count })
-					end
-				end
+		local selected, reason = Factory.resolveSeedName()
+		if selected then
+			setFactoryStatus("Seed dipilih: " .. (Factory.seedName or tostring(selected)))
+		else
+			if seedNameStatus and seedNameStatus.SetDesc then
+				pcall(seedNameStatus.SetDesc, seedNameStatus, reason)
 			end
+			setFactoryStatus(reason)
 		end
-		local matches = #exact > 0 and exact or partial
-		if #matches ~= 1 then
-			seedNameStatus:SetDesc(#matches == 0 and "Seed itu tidak ada di inventory."
-				or "Nama cocok dengan beberapa seed; ketik nama lebih lengkap.")
-			return
-		end
-		local selected = matches[1]
-		if Factory.running and selected.id ~= Factory.seedId then
-			Factory.stop("seed berubah; nyalakan Auto Factory lagi")
-		end
-		Factory.seedId, Factory.seedName = selected.id, selected.name
-		seedNameStatus:SetDesc(string.format("Dipilih: %s [#%d] x%d", selected.name, selected.id, selected.count))
-		setFactoryStatus("Seed dipilih: " .. selected.name)
 	end,
 })
 
