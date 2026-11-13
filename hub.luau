@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.64",
+	version = "0.4.65",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -1098,6 +1098,8 @@ local Factory = {
 	dropTakeFailures = {},
 	resumePNB = false,
 	resumeCollect = false,
+	storeFail = nil,
+	storeRetryAt = nil,
 	homeWorld = nil,
 	lastRejoinAt = 0,
 	pnb = 0,
@@ -3911,12 +3913,25 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 			setFactoryStatus(string.format("Factory: menunggu jalur tile tanam terbuka (%d seed tersisa)", seeds))
 			return 2
 		end
+		if Factory.storeRetryAt and Factory.storeRetryAt > os.clock() then
+			setFactoryStatus(string.format(
+				"Factory: seed belum tersimpan (%s); coba lagi %d dtk",
+				tostring(Factory.storeFail or "gagal"), math.ceil(Factory.storeRetryAt - os.clock())))
+			return 2
+		end
 		local stored, reason = factoryStoreSeeds(W, inv, state, seedId, gen)
 		if stored then
+			Factory.storeFail, Factory.storeRetryAt = nil, nil
 			Factory.phase = "grow"
 			setFactoryStatus("Factory: tile tanam penuh; seed tersimpan di Display Box")
 		else
-			Factory.stop("Factory: penyimpanan berhenti: " .. tostring(reason))
+			-- Jangan hentikan factory saat penyimpanan gagal: panen masih bisa
+			-- membuka tile tanam. Coba simpan lagi setelah jeda.
+			Factory.storeFail = reason
+			Factory.storeRetryAt = os.clock() + 20
+			Factory.phase = factoryTarget(W, state, seedId, blocked, "harvest") and "harvest" or "grow"
+			setFactoryStatus(string.format(
+				"Factory: seed belum tersimpan (%s); lanjut panen, coba lagi 20 dtk", tostring(reason)))
 		end
 		return 0.3
 	end
@@ -4646,48 +4661,136 @@ local function seedCountInDisplay(W, x, y, seedId)
 	return count
 end
 
-local function nearestDisplayBox(W, state)
+-- Cari id item Display Box dari ItemDB (definisi item punya display = true),
+-- bukan nomor id yang di-hardcode, supaya world dengan varian box lain tetap
+-- terbaca. Id 1422 tetap dipakai sebagai cadangan bila ItemDB gagal dibaca.
+local displayIdCache, displayIdDB
+local function displayBoxIds()
+	local db = findItemDB()
+	if displayIdDB ~= db then
+		displayIdDB, displayIdCache = db, { [1422] = true }
+		if type(db) == "table" then
+			for id, def in pairs(db) do
+				if type(def) == "table" and def.display then
+					displayIdCache[id] = true
+				end
+			end
+		end
+	end
+	return displayIdCache
+end
+
+local function isDisplayBoxTile(id)
+	return id ~= nil and id ~= 0 and displayBoxIds()[id] == true
+end
+
+-- Game menentukan box lewat displayHere(x): tile box harus di kolom titik
+-- jatuh, dan barisnya sama dengan baris kaki pemain. Jadi bot harus berdiri
+-- di tile SEBELAH box lalu menghadap box; berdiri di tile box sendiri tidak
+-- akan pernah cocok. Fungsi ini mengembalikan x titik jatuh yang valid.
+local function displayDropPoint(W, box)
+	if type(W.displayHere) ~= "function" then return nil end
+	local s = Bind.state()
+	if not s then return nil end
+	for _, delta in ipairs({ 0.75, -0.75 }) do
+		local ok, hereX, hereY = pcall(W.displayHere, s.x + delta)
+		if ok and hereX == box.x and hereY == box.y then
+			return s.x + delta
+		end
+	end
+	return nil
+end
+
+-- Daftar kandidat: satu Display Box bisa didekati dari kiri atau kanan.
+-- Hanya tile yang bisa dipijak (bukan box lain) dan terjangkau yang dipakai.
+local function factoryDisplaySpots(W, state)
+	local ids = displayBoxIds()
 	local dist = Path.explore(math.floor(state.x), math.floor(state.y - 0.0001), 6000)
-	if not dist then return nil end
-	local best, bestDistance
+	if not dist then return {} end
+	local w = tonumber(W.w) or 100
+	local list = {}
 	for y = 0, (tonumber(W.h) or 60) - 1 do
 		local row = W.fg and W.fg[y]
 		if row then
-			for x = 0, (tonumber(W.w) or 100) - 1 do
-				if row[x] == 1422 and Path.standable(x, y) then
-					local distance = dist[keyOf(x, y)]
-					if distance and (not bestDistance or distance < bestDistance) then
-						best, bestDistance = { x = x, y = y }, distance
+			for x = 0, w - 1 do
+				local id = row[x]
+				if id and id ~= 0 and ids[id] then
+					for _, side in ipairs({ -1, 1 }) do
+						local sx = x + side
+						local body = sx >= 0 and sx < w and row[sx] or nil
+						local distance = dist[keyOf(sx, y)]
+						if distance and Path.standable(sx, y) and not isDisplayBoxTile(body) then
+							list[#list + 1] = {
+								x = x,
+								y = y,
+								sx = sx,
+								sy = y,
+								face = -side,
+								dist = distance,
+							}
+						end
 					end
 				end
 			end
 		end
 	end
-	return best
+	table.sort(list, function(a, b)
+		return a.dist < b.dist
+	end)
+	return list
 end
 
 factoryStoreSeeds = function(W, inv, state, seedId, gen)
 	local alive = function()
 		return factoryAlive(gen) and W.name == Bind.name
 	end
-	local box = nearestDisplayBox(W, state)
-	if not box then return false, "tidak ada Display Box (id 1422) yang bisa dijangkau" end
-	setFactoryStatus(string.format("Factory: menuju Display Box (%d,%d)", box.x, box.y))
-	if not Path.moveTo(box.x, box.y, alive) then return false, "gagal mencapai Display Box" end
-	local arrived = Bind.state()
-	local okHere, hereX, hereY = pcall(W.displayHere, arrived and arrived.x or -1)
-	if not arrived or not arrived.grounded or not okHere
-		or hereX ~= box.x or hereY ~= box.y or tileId(box.x, box.y) ~= 1422 then
-		return false, "posisi belum tepat di dalam Display Box"
-	end
 	if type(W.displayPut) ~= "function" then return false, "fungsi Display Box tidak tersedia" end
+	local spots = factoryDisplaySpots(W, state)
+	if #spots == 0 then
+		return false, "tidak ada Display Box yang bisa didekati di world ini"
+	end
+
+	-- Kalau posisi sekarang sudah pas untuk menjatuhkan seed, jangan jalan dulu.
+	local box, dropX
+	for _, spot in ipairs(spots) do
+		local point = displayDropPoint(W, spot)
+		if point then
+			box, dropX = spot, point
+			break
+		end
+	end
+
+	-- Coba beberapa sisi box yang berbeda sebelum menyerah. Path.moveTo bisa
+	-- gagal total kalau tile box sendiri terhalang pintu/dinding.
+	if not box then
+		for attempt = 1, math.min(#spots, 6) do
+			if not alive() then return false, "Factory dihentikan saat menyimpan seed" end
+			local spot = spots[attempt]
+			setFactoryStatus(string.format("Factory: menuju Display Box (%d,%d); berdiri di (%d,%d)",
+				spot.x, spot.y, spot.sx, spot.sy))
+			Path.moveTo(spot.sx, spot.sy, alive)
+			local point = displayDropPoint(W, spot)
+			if point then
+				box, dropX = spot, point
+				break
+			end
+		end
+	end
+	if not box then
+		return false, "belum menemukan posisi drop di samping Display Box"
+	end
+
+	setFactoryStatus(string.format("Factory: menaruh seed di Display Box (%d,%d)", box.x, box.y))
 	for _ = 1, 20 do
 		if not alive() then return false, "Factory dihentikan saat menyimpan seed" end
 		local remaining = factoryCount(inv, seedId)
 		if remaining <= 0 then return true end
+		-- Karakter bisa bergeser sedikit (terdorong drop lain); pakai titik
+		-- jatuh terbaru dari aturan game bila masih valid.
+		dropX = displayDropPoint(W, box) or dropX
 		local beforeBox = seedCountInDisplay(W, box.x, box.y, seedId)
 		if beforeBox == nil then return false, "isi Display Box tidak terbaca" end
-		local called, err = pcall(W.displayPut, box.x, box.y, seedId, remaining, box.x + 0.5)
+		local called, err = pcall(W.displayPut, box.x, box.y, seedId, remaining, dropX)
 		if not called then return false, "gagal mengirim seed: " .. tostring(err) end
 		local deadline = os.clock() + 8
 		local confirmed = false
@@ -4700,7 +4803,9 @@ factoryStoreSeeds = function(W, inv, state, seedId, gen)
 			task.wait(0.15)
 		end
 		if not confirmed then
-			if factoryCount(inv, seedId) >= remaining then
+			local nowInv = factoryCount(inv, seedId)
+			local afterBox = seedCountInDisplay(W, box.x, box.y, seedId) or beforeBox
+			if nowInv >= remaining and afterBox <= beforeBox then
 				return false, "server menolak Display Box; akun perlu level 10 atau Discord terverifikasi"
 			end
 			return false, "server belum mengonfirmasi seed masuk Display Box"
@@ -5168,6 +5273,9 @@ Hub.debug = {
 	beginPNB = beginPNB,
 	finishPNBDrain = finishPNBDrain,
 	factoryBaseDrops = factoryBaseDrops,
+	factoryDisplaySpots = factoryDisplaySpots,
+	displayDropPoint = displayDropPoint,
+	storeSeeds = factoryStoreSeeds,
 }
 
 -- Load ulang harus benar-benar menghentikan loop run lama. Tanpa ini loop
