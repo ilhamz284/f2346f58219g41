@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.67",
+	version = "0.4.69",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -2084,6 +2084,22 @@ local function selectedItemDefinition(itemId)
 	return items and items[itemId] or nil
 end
 
+-- PNB blok non-solid memasang blok di tile tempat pemain berdiri. Kalau
+-- pemain berdiri di tepi tile, drop hasil pecahan (di tengah tile, x+0.5)
+-- berjarak ~0,5 tile dan sering luput dijemput karena posisinya tidak pas.
+-- Rapikan dulu ke tengah tile sebelum memasang/memecah.
+local function centerOnTile(x, timeout)
+	local s = Bind.state()
+	if not s or not s.grounded then
+		return false
+	end
+	local cx = x + 0.5
+	if math.abs(s.x - cx) <= 0.1 then
+		return true
+	end
+	return Move.walkTo(cx, { timeout = timeout or 1.5, tol = 0.1, recover = false })
+end
+
 local function findPNBTarget(W, state, layer, atSelf)
 	local floorY = standingFloor(state)
 	if not floorY or not Bind.solid(math.floor(state.x), floorY) then
@@ -2111,6 +2127,11 @@ local function findPNBTarget(W, state, layer, atSelf)
 	end
 	return nil
 end
+
+-- Game mengambil drop saat pemain berdiri di tile drop (bukan berdasarkan
+-- radius), jadi drop hasil PNB yang jatuh ke baris lain harus didatangi.
+-- Diisi setelah Path.moveTo tersedia (fungsi ini dipakai juga oleh factory).
+local dropSweepTile
 
 local function startPNB()
 	if PNB.running then
@@ -2172,6 +2193,16 @@ local function startPNB()
 		setPNBStatus("gagal: blok ini tidak cocok untuk PNB")
 		return
 	end
+	-- Blok non-solid dipasang tepat di tile pemain; posisikan dulu di tengah
+	-- tile supaya drop-nya jatuh tepat di bawah karakter dan tidak luput.
+	if atSelf then
+		setPNBStatus(string.format("menyiapkan: posisikan di tengah tile (%d,%d)", x, y))
+		centerOnTile(x, 3)
+		local centered = Bind.state()
+		if centered then
+			state = centered
+		end
+	end
 
 	PNB.running = true
 	PNB.gen += 1
@@ -2195,6 +2226,12 @@ local function startPNB()
 				if pnbTileId(W, layer, x, y) ~= 0 then
 					PNB.stop("berhenti: tile target sudah terisi")
 					break
+				end
+				if atSelf and math.abs(s.x - (x + 0.5)) > 0.2 then
+					-- Karakter bergeser dari tengah tile: rapikan lagi supaya
+					-- drop tetap jatuh di bawah badan dan tidak luput.
+					centerOnTile(x, 1.2)
+					s = Bind.state() or s
 				end
 				collectNearby(W, inv, s)
 				local hasOK, has = pcall(inv.count, inv, itemId)
@@ -2234,6 +2271,15 @@ local function startPNB()
 				task.wait(rnd(0.32, 0.48))
 				local afterBreak = Bind.state() or s
 				collectNearby(W, inv, afterBreak)
+				if atSelf and dropSweepTile then
+					-- Blok non-solid: pecahannya bisa jatuh ke baris lain.
+					if dropSweepTile(W, x, y, itemId, function()
+						return PNB.running and PNB.gen == gen
+					end) then
+						centerOnTile(x, 2)
+					end
+					collectNearby(W, inv, Bind.state() or afterBreak)
+				end
 				local dropX = not atSelf and nearestCollectibleDrop(W, inv, afterBreak) or nil
 				if dropX and PNB.running and PNB.gen == gen then
 					local reached = Move.walkTo(dropX, { timeout = 4, tol = 0.2 })
@@ -3110,6 +3156,49 @@ function Path.moveTo(tx, ty, aliveFn)
 	return false
 end
 
+-- Jemput drop hasil PNB. Game mengambil drop saat pemain berdiri di tile drop,
+-- bukan berdasarkan jarak, jadi kalau pecahan blok non-solid jatuh ke baris
+-- lain (lantai bertingkat) pemain harus didatangkan ke tile drop itu lalu
+-- kembali ke tile kerja. Hanya drop item yang sama di sekitar tile kerja yang
+-- diambil supaya tidak mengganggu drop lain.
+dropSweepTile = function(W, x, y, itemId, alive)
+	if type(W.dropList) ~= "function" then
+		return false
+	end
+	local ok, list = pcall(W.dropList)
+	if not ok or type(list) ~= "table" then
+		return false
+	end
+	local best
+	for _, drop in ipairs(list) do
+		if type(drop) == "table" and drop.id == itemId
+			and type(drop.x) == "number" and type(drop.y) == "number" then
+			local row = math.floor(drop.y)
+			local dx = math.abs(drop.x - (x + 0.5))
+			local dyRow = math.abs(row - y)
+			if dx <= 1.7 and dyRow <= 3 and (not best or dyRow < best.dyRow) then
+				best = { x = math.floor(drop.x), y = row, dyRow = dyRow }
+			end
+		end
+	end
+	if not best then
+		return false
+	end
+	local now = Bind.state()
+	if now and math.floor(now.x) == best.x and math.floor(now.y - 0.0001) == best.y then
+		return true
+	end
+	if not Path.moveTo(best.x, best.y, alive) then
+		return false
+	end
+	task.wait(0.2)
+	if best.x ~= x or best.y ~= y then
+		Path.moveTo(x, y, alive)
+		task.wait(0.1)
+	end
+	return true
+end
+
 -- Data pohon (upvalue spliceAt) dipakai untuk cek matang dan sisa waktu.
 local function factoryEnsureTreeMap(W)
 	if Factory.treeMapWorld ~= W then
@@ -3494,6 +3583,11 @@ local function factoryPNBOne(W, inv, gen, blocked, skipCollect)
 		releaseStation()
 		return false, "position"
 	end
+	if Factory.baseAtSelf then
+		-- Blok non-solid dipasang di tile tempat berdiri; tengahkan karakter
+		-- supaya drop hasil pecahan langsung berada di bawah badan.
+		centerOnTile(x, 2)
+	end
 	pcall(inv.select, inv, baseId)
 	local placed = pcall(Bind.setTile, Factory.baseLayer, x, y, baseId, false, false)
 	if not placed or pnbTileId(W, Factory.baseLayer, x, y) ~= baseId then
@@ -3517,6 +3611,10 @@ local function factoryPNBOne(W, inv, gen, blocked, skipCollect)
 	if skipCollect then
 		-- Mode hemat ruang: drop pecahan dibiarkan di lantai, tidak dijemput.
 		return true
+	end
+	if factoryAlive(gen) and Factory.baseAtSelf and dropSweepTile then
+		-- Blok non-solid: pecahan bisa jatuh ke baris lain; datangi tile drop.
+		dropSweepTile(W, x, y, baseId, alive)
 	end
 	if factoryAlive(gen) and not Factory.baseAtSelf and Bind.solid(x, y + 1) then
 		Move.walkTo(x + 0.5, { timeout = 3, tol = 0.28 })
@@ -5382,6 +5480,7 @@ Hub.debug = {
 	factoryDisplaySpots = factoryDisplaySpots,
 	displayDropPoint = displayDropPoint,
 	storeSeeds = factoryStoreSeeds,
+	centerOnTile = centerOnTile,
 }
 
 -- Load ulang harus benar-benar menghentikan loop run lama. Tanpa ini loop
