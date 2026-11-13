@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.55",
+	version = "0.4.56",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -516,12 +516,8 @@ function Move.hold(kc)
 	vkey(true, kc)
 end
 
-function Move.jump()
-	local state = Bind.state()
-	if not state or not state.grounded or os.clock() - (Move.lastJumpAt or 0) < 0.7 then
-		return false
-	end
-	Move.lastJumpAt = os.clock()
+-- Kirim satu tekanan lompat sesuai backend aktif.
+local function sendJump()
 	if Move.backend == "touch" or Move.preferTouch() then
 		local held = Move.held
 		if touchPress("Jump") then
@@ -540,6 +536,39 @@ function Move.jump()
 	task.wait(rnd(0.14, 0.20))
 	vkey(false, Enum.KeyCode.Space)
 	return true
+end
+
+-- Lompat hanya dianggap berhasil kalau karakter benar-benar naik/lepas
+-- tanah. Di Android tekanan tombol kadang hilang (frames drop / MobileGui
+-- baru hidup), dan lompatan yang tidak terjadi membuat pathfinder menandai
+-- jalur naik sebagai mustahil. Karena itu input diulang sekali sebelum
+-- menyerah.
+function Move.jump()
+	local state = Bind.state()
+	if not state or not state.grounded or os.clock() - (Move.lastJumpAt or 0) < 0.7 then
+		return false
+	end
+	local startY = state.y
+	for _ = 1, 2 do
+		Move.lastJumpAt = os.clock()
+		sendJump()
+		local deadline = os.clock() + 0.3
+		while os.clock() < deadline do
+			local s = Bind.state()
+			if s and (not s.grounded or s.y < startY - 0.12) then
+				return true
+			end
+			task.wait(0.02)
+		end
+		local now = Bind.state()
+		if not now or not now.grounded then
+			return true
+		end
+		-- Masih menempel tanah: tombol tidak sampai, ulangi setelah jeda
+		-- singkat (jangan menunggu cooldown 0,7 s penuh).
+		task.wait(0.1)
+	end
+	return false
 end
 
 function Move.idle(a, b)
@@ -1966,6 +1995,10 @@ function Path.probeJump()
 		if not leftGround then
 			return nil
 		end
+		-- Jangan cache "tidak bisa lompat": satu probe di posisi sempit bisa
+		-- mematikan semua jalur naik untuk seluruh sesi. Cukup laporkan
+		-- untuk sekarang, probe berikutnya mengukur ulang.
+		return false
 	end
 	Path.canJump = rise >= 0.6
 	return Path.canJump
@@ -2236,36 +2269,60 @@ local function pathStep(cx, cy, step, aliveFn)
 		return false
 	end
 	if step.kind == "drop" then
-		-- Turun ke platform di kolom yang sama, persis seperti video: platform
-		-- di tepi dan sebelahnya kosong. Karakter harus keluar sedikit dari
-		-- tepi sampai tidak grounded, lalu LANGSUNG balik arah supaya jatuh
-		-- menempel sisi platform dan mendarat di lantai berikutnya. Menunggu
-		-- sampai jatuh 1 tile lebih dulu membuatnya melewati platform tujuan.
+		-- Turun satu lantai lewat tepi platform. Melangkah keluar sampai
+		-- tidak grounded lalu LANGSUNG balik arah: karakter jatuh menempel
+		-- sisi platform dan mendarat di lantai berikutnya. Jatuh di sini
+		-- sangat cepat, jadi jangan menunggu sampai turun jauh dulu (bisa
+		-- melewati beberapa lantai sekaligus).
 		local outward = step.shaftX < cx and KeyLeft or KeyRight
 		local inward = step.shaftX < cx and KeyRight or KeyLeft
-		Move.hold(outward)
-		local deadline = os.clock() + 1.2
-		while aliveFn() and os.clock() < deadline do
-			local s = Bind.state()
-			if not s or not s.grounded then break end
-			task.wait(0.005)
-		end
-		Move.hold(inward)
-		deadline = os.clock() + 2.5
-		while aliveFn() and os.clock() < deadline do
-			local s = Bind.state()
-			if not s then break end
-			if s.grounded then
+		for _ = 1, 2 do
+			if not aliveFn() then
 				Move.release()
-				if landed() then return true end
-				local ax, ay = math.floor(s.x), math.floor(s.y - 0.0001)
-				-- Mendarat satu-dua lantai lebih rendah tetap kemajuan;
-				-- moveTo akan menghitung ulang dari posisi nyata.
-				return Path.standable(ax, ay)
+				return false
 			end
-			task.wait(0.01)
+			Move.hold(outward)
+			local deadline = os.clock() + 1.2
+			local airborne = false
+			while aliveFn() and os.clock() < deadline do
+				local s = Bind.state()
+				if not s then
+					break
+				end
+				if not s.grounded then
+					airborne = true
+					break
+				end
+				task.wait(0.005)
+			end
+			if airborne then
+				Move.hold(inward)
+				deadline = os.clock() + 1.1
+				while aliveFn() and os.clock() < deadline do
+					local s = Bind.state()
+					if not s then
+						break
+					end
+					if s.grounded then
+						Move.release()
+						local ay = math.floor(s.y - 0.0001)
+						if ay ~= cy then
+							-- Mendarat di lantai lain = berhasil. Kadang
+							-- mendarat tepat di tepi (x di kolom kiri), jadi
+							-- rapikan posisi ke tengah tile tujuan.
+							if ay == step.y then
+								Move.walkTo(step.x + 0.5, { timeout = 2, tol = 0.35, recover = false })
+							end
+							return true
+						end
+						break
+					end
+					task.wait(0.01)
+				end
+			end
+			Move.release()
+			task.wait(0.12)
 		end
-		Move.release()
 		return false
 	end
 	if step.kind == "dropShaft" then
@@ -2345,66 +2402,138 @@ local function pathStep(cx, cy, step, aliveFn)
 		return false
 	end
 	if step.kind == "jump" then
-		local readyAt = (Move.lastJumpAt or 0) + 0.7
-		if os.clock() < readyAt then
-			task.wait(readyAt - os.clock() + rnd(0.04, 0.10))
+		local W = Bind.getW()
+		-- Platform satu arah (id 102) tepat di atas kepala = tangga antar
+		-- lantai. Cukup berdiri di kolomnya lalu lompat lurus menembus
+		-- platform; tidak perlu geser kiri/kanan dulu seperti lompat tepi.
+		local platformAbove = false
+		if W and W.fg and step.x == cx then
+			for dy = 1, 3 do
+				local row = W.fg[cy - dy]
+				if not row then
+					break
+				end
+				if row[cx] == 102 then
+					platformAbove = true
+					break
+				end
+				if Bind.solid(cx, cy - dy) then
+					break
+				end
+			end
 		end
-		if not aliveFn() then return false end
 		-- Platform tepi harus dilompati dekat sisi poros, karena dinding
 		-- lantai atas tepat di sampingnya menahan tubuh bila terlalu tengah.
 		local center = cx + 0.5
-		local W = Bind.getW()
-		if W and W.fg and W.fg[cy + 1] and W.fg[cy + 1][cx] == 102 then
+		if not platformAbove and W and W.fg and W.fg[cy + 1] and W.fg[cy + 1][cx] == 102 then
 			if Bind.solid(cx + 1, cy - 1) then
 				center = cx + 0.12
 			elseif Bind.solid(cx - 1, cy - 1) then
 				center = cx + 0.88
 			end
 		end
-		local alignUntil = os.clock() + 0.55
-		while aliveFn() and os.clock() < alignUntil do
+		local tol = platformAbove and 0.32 or 0.12
+
+		local function align()
 			local s = Bind.state()
-			if not s or not s.grounded then Move.release(); return false end
-			if math.abs(s.x - center) <= 0.08 then break end
-			Move.hold(s.x > center and KeyLeft or KeyRight)
-			task.wait(0.01)
-		end
-		Move.release()
-		if step.x ~= cx then Move.hold(step.x > cx and KeyRight or KeyLeft) end
-		task.wait(rnd(0.03, 0.08))
-		if not Move.jump() then
+			if not s or not s.grounded then
+				return nil
+			end
+			if math.abs(s.x - center) > tol then
+				-- walkTo menangani overshoot key-up jauh lebih baik daripada
+				-- menekan kiri/kanan bergantian di sini.
+				Move.walkTo(center, {
+					timeout = platformAbove and 1.8 or 1.0,
+					tol = tol * 0.6,
+					recover = false,
+				})
+				s = Bind.state()
+			end
 			Move.release()
-			return false
+			if not s or not s.grounded or math.abs(s.x - center) > tol + 0.15 then
+				return nil
+			end
+			return s
 		end
-		local deadline = os.clock() + 1.6
-		while aliveFn() and os.clock() < deadline do
-			local s = Bind.state()
-			if not s then break end
-			if math.abs(s.x - (step.x + 0.5)) <= 0.30 then Move.release() end
-			if landed() then
-				Move.release()
-				return true
+
+		for attempt = 1, 2 do
+			if not aliveFn() then
+				return false
 			end
-			if s.grounded and math.floor(s.y - 0.0001) == step.y
-				and math.abs(s.x - (step.x + 0.5)) < 1 then
+			local ready = align()
+			if not ready then
 				Move.release()
-				return Move.walkTo(step.x + 0.5, { timeout = 2, tol = 0.28 }) and landed()
+				return false
 			end
-			if s.grounded and os.clock() - (Move.lastJumpAt or 0) > 0.35 then break end
-			task.wait(0.03)
+			-- Cooldown lompat dipatuhi sebelum menekan tombol.
+			local waitFor = (Move.lastJumpAt or 0) + 0.72 - os.clock()
+			if waitFor > 0 then
+				task.wait(waitFor)
+			end
+			if not aliveFn() then
+				return false
+			end
+			if not platformAbove and step.x ~= cx then
+				Move.hold(step.x > cx and KeyRight or KeyLeft)
+				task.wait(rnd(0.03, 0.08))
+			end
+			local tookOff = Move.jump()
+			Move.release()
+			if not tookOff then
+				local now = Bind.state()
+				if not now or not now.grounded then
+					-- Sudah di udara walau tombol terasa gagal.
+					tookOff = true
+				elseif attempt == 2 then
+					return false
+				else
+					task.wait(0.12)
+				end
+			end
+			if tookOff then
+				local deadline = os.clock() + 1.6
+				local settled = false
+				while aliveFn() and os.clock() < deadline do
+					local s = Bind.state()
+					if not s then
+						break
+					end
+					if not platformAbove and math.abs(s.x - (step.x + 0.5)) <= 0.30 then
+						Move.release()
+					end
+					if landed() then
+						Move.release()
+						return true
+					end
+					if s.grounded and os.clock() - (Move.lastJumpAt or 0) > 0.4 then
+						settled = true
+						break
+					end
+					task.wait(0.03)
+				end
+				Move.release()
+				if not settled then
+					break
+				end
+				local after = Bind.state()
+				if after and after.grounded then
+					local ax = math.floor(after.x)
+					local ay = math.floor(after.y - 0.0001)
+					if ax ~= cx or ay ~= cy then
+						-- Mendarat di tile lain tetap kemajuan (kadang berhenti
+						-- satu lantai di bawah sasaran); moveTo menghitung
+						-- ulang dari posisi nyata.
+						if Path.standable(ax, ay) then
+							return true
+						end
+					end
+				end
+				-- Mendarat kembali di titik awal: ulangi sekali dari posisi
+				-- yang sudah disejajarkan lagi.
+			end
 		end
 		Move.release()
-		-- Mendarat di tile lain tetap dianggap maju: menembus platform satu
-		-- arah sering berhenti satu lantai di bawah sasaran. moveTo akan
-		-- menghitung ulang jalur dari posisi nyata tanpa memblokir edge ini.
-		local after = Bind.state()
-		if after and after.grounded then
-			local ax = math.floor(after.x)
-			local ay = math.floor(after.y - 0.0001)
-			if (ax ~= cx or ay ~= cy) and Path.standable(ax, ay) then
-				return true
-			end
-		end
+		return false
 	end
 	return false
 end
