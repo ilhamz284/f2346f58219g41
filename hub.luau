@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.54",
+	version = "0.4.55",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -464,6 +464,39 @@ function Move.release()
 	Move.held = nil
 end
 
+-- Reload membunuh thread lama saat tombol arah masih ditekan. Kalau objek
+-- controller mobile sudah diganti game (respawn/rejoin), release milik run
+-- lama mengenai objek basi dan karakter terus berjalan ke satu arah. Cari
+-- ulang semua controller lalu lepas arahnya.
+function Move.panicRelease()
+	if Move.vimHeld then
+		vkey(false, Move.vimHeld)
+		Move.vimHeld = nil
+	end
+	vkey(false, KeyLeft)
+	vkey(false, KeyRight)
+	vkey(false, Enum.KeyCode.Space)
+	Move.held = nil
+	local ok, list = pcall(function()
+		return filtergc("table", { Keys = { "current", "mount" } })
+	end)
+	if ok and type(list) == "table" then
+		local entries = list
+		if type(list[1]) ~= "table" then
+			entries = { list }
+		end
+		for _, entry in ipairs(entries) do
+			local current = type(entry) == "table" and entry.current
+			if type(current) == "table" and type(current.edit) == "function" then
+				pcall(current.edit, nil)
+			end
+		end
+	end
+	if Touch.ready and Touch.ctrl then
+		pcall(Touch.ctrl.edit, nil)
+	end
+end
+
 function Move.hold(kc)
 	if Move.held == kc then
 		return
@@ -600,6 +633,7 @@ end
 
 Hub.onUnload(function()
 	Move.release()
+	Move.panicRelease()
 	if Touch.enabledByHub and Touch.gui then
 		pcall(function()
 			Touch.gui.Enabled = Touch.origEnabled == true
@@ -609,6 +643,10 @@ Hub.onUnload(function()
 end)
 Hub.move = Move
 Hub.touch = Touch
+
+-- Karakter yang masih jalan dari run lama harus berhenti sekarang, bukan
+-- menunggu fitur gerak berikutnya dipakai.
+Move.panicRelease()
 
 -- Jalan ke target X. Return true kalau berhenti di dekat target.
 function Move.walkTo(targetX, opts)
@@ -1396,6 +1434,118 @@ local function collectDropsNearby(W, inv, state, radius)
 		end
 	end
 	return collected, needsRoom
+end
+
+-- Drop hasil pukulan duduk di tengah tile yang pecah (x+0.5, y+0.5). Pemain
+-- yang berdiri di tile sebelah sudah berjarak ~1,12 tile, jadi radius 0,9
+-- sering melewatkannya. Drop juga baru terlihat beberapa frame setelah tile
+-- hancur, dan uid-nya masih ada di dropList walau sudah diambil server.
+-- Karena itu patokannya bukan hasil takeDrop, tetapi apakah drop masih ada
+-- di sekitar tile setelah ditunggu dan dijemput.
+-- Return: jumlah yang diambil, id drop yang tertinggal karena inventory penuh.
+local function collectDropsAtTile(W, inv, x, y, alive)
+	if type(W.dropList) ~= "function" or type(W.takeDrop) ~= "function"
+		or type(inv.room) ~= "function" or type(inv.add) ~= "function" then
+		return 0, nil
+	end
+	local cx, cy = x + 0.5, y + 0.5
+	local total = 0
+	local attempts = {}
+	local start = os.clock()
+
+	local function nearby()
+		local state = Bind.state()
+		if not state then
+			return nil
+		end
+		local ok, drops = pcall(W.dropList)
+		if not ok or type(drops) ~= "table" then
+			return nil
+		end
+		local list, nearest, nearestDist = {}, nil, nil
+		for _, drop in ipairs(drops) do
+			if type(drop) == "table" and type(drop.uid) == "number"
+				and type(drop.id) == "number" and type(drop.n) == "number"
+				and type(drop.x) == "number" and type(drop.y) == "number"
+				and not (Factory.ignoredDrops and (Factory.ignoredDrops[drop.uid] or 0) > os.clock()) then
+				local ox, oy = drop.x - cx, drop.y - cy
+				if ox * ox + oy * oy <= 2.25 then
+					local dx, dy = drop.x - state.x, drop.y - state.y
+					local dist = dx * dx + dy * dy
+					table.insert(list, { drop = drop, dist = dist })
+					if not nearestDist or dist < nearestDist then
+						nearest, nearestDist = drop, dist
+					end
+				end
+			end
+		end
+		return list, nearest, nearestDist, state
+	end
+
+	local sawAny = false
+	while os.clock() - start < 2.2 do
+		if alive and not alive() then
+			break
+		end
+		local list, nearest, nearestDist, state = nearby()
+		if not list or #list == 0 then
+			-- Drop bisa muncul beberapa frame setelah tile pecah.
+			if sawAny or os.clock() - start >= 0.6 then
+				break
+			end
+			task.wait(0.1)
+		else
+			sawAny = true
+			-- Berdiri tepat di drop; jangan jalan kalau drop ada di lantai
+			-- lain (bisa memicu jatuh).
+			if nearest and nearestDist > 0.81 and math.abs(nearest.y - state.y) <= 1.05 then
+				Move.walkTo(nearest.x, { timeout = 1.2, tol = 0.22 })
+				state = Bind.state() or state
+			end
+			local anyRoom, took, retry = false, false, false
+			for _, item in ipairs(list) do
+				local drop = item.drop
+				local roomOK, room = pcall(inv.room, inv, drop.id)
+				local available = roomOK and (tonumber(room) or 0) or 0
+				if available > 0 then
+					anyRoom = true
+					if (attempts[drop.uid] or 0) < 3 then
+						attempts[drop.uid] = (attempts[drop.uid] or 0) + 1
+						local okT, taken = pcall(W.takeDrop, drop.uid, math.min(drop.n, available))
+						taken = okT and tonumber(taken) or 0
+						if taken > 0 then
+							pcall(inv.add, inv, drop.id, taken)
+							total += taken
+							took = true
+						else
+							retry = true
+						end
+					end
+				end
+			end
+			-- Inventory penuh: tidak ada gunanya menunggu. Atau server
+			-- menolak terus: jangan tahan panen berikutnya.
+			if not anyRoom or (not took and not retry) then
+				break
+			end
+			task.wait(0.18)
+		end
+	end
+
+	-- Masih ada drop di tile ini setelah ditunggu? Kalau ruangnya nol, itu
+	-- sebabnya; pemanggil bisa menahan panen berikutnya.
+	local blockedId = nil
+	local list = nearby()
+	if list then
+		for _, item in ipairs(list) do
+			local roomOK, room = pcall(inv.room, inv, item.drop.id)
+			if not roomOK or (tonumber(room) or 0) <= 0 then
+				blockedId = item.drop.id
+				break
+			end
+		end
+	end
+	return total, blockedId
 end
 
 local function collectNearby(W, inv, state)
@@ -2625,8 +2775,13 @@ local function factoryWork(W, inv, target, seedId, gen)
 		if factoryAlive(gen) and Bind.solid(x, y + 1) then
 			Move.walkTo(x + 0.5, { timeout = 3, tol = 0.28 })
 		end
-		local _, needsRoom = collectDropsNearby(W, inv, Bind.state(), 0.9)
-		if needsRoom then Factory.collectNeedsRoom = true end
+		local _, blockedId = collectDropsAtTile(W, inv, x, y, function()
+			return factoryAlive(gen) and W.name == Bind.name
+		end)
+		if blockedId then
+			Factory.collectNeedsRoom = true
+			Factory.blockedDropId = blockedId
+		end
 		return true
 	end
 	if tileId(x, y) ~= 0 or not Bind.solid(x, y + 1) then
@@ -2760,7 +2915,11 @@ local function factoryPNBOne(W, inv, gen, blocked)
 	if factoryAlive(gen) and not Factory.baseAtSelf and Bind.solid(x, y + 1) then
 		Move.walkTo(x + 0.5, { timeout = 3, tol = 0.28 })
 	end
-	collectDropsNearby(W, inv, Bind.state(), 0.9)
+	local _, blockedId = collectDropsAtTile(W, inv, x, y, alive)
+	if blockedId then
+		Factory.collectNeedsRoom = true
+		Factory.blockedDropId = blockedId
+	end
 	return true
 end
 
@@ -2891,6 +3050,28 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 			setFactoryStatus(string.format("Factory: ruang blok tidak cukup (%d/200); PNB lalu ambil drop", blocks))
 			return 0.1
 		end
+		-- Mode panen saja tidak punya PNB/tanam untuk mengosongkan blok.
+		-- Kalau drop panen tidak muat, berhenti memukul pohon: kalau terus
+		-- jalan, hasil panen tertinggal di belakang lalu hilang.
+		if Factory.collectNeedsRoom and not Factory.baseId then
+			local dropId = Factory.blockedDropId
+			local dropRoom = dropId and factoryRoom(inv, dropId) or 0
+			if dropRoom > 0 then
+				Factory.collectNeedsRoom = false
+				Factory.blockedDropId = nil
+				local collected = collectDropsNearby(W, inv, state, 1.6)
+				if collected > 0 then
+					setFactoryStatus(string.format("Factory: ambil drop tertinggal +%d", collected))
+					return 0.2
+				end
+			else
+				local def = dropId and selectedItemDefinition(dropId) or nil
+				local name = type(def) == "table" and (def.name or tostring(dropId)) or "hasil panen"
+				Move.release()
+				setFactoryStatus(string.format("Factory: %s penuh; panen ditahan supaya drop tidak tertinggal", name))
+				return 1
+			end
+		end
 		local target = factoryTarget(W, state, seedId, blocked, "harvest")
 		if target then
 			local worked, reason = factoryWork(W, inv, target, seedId, gen)
@@ -2900,7 +3081,7 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 					Factory.harvestFailCount[seedId .. ":harvest:" .. target.y .. ":" .. target.x] = nil
 				end
 				task.wait(0.25)
-				local _, needsRoom = collectDropsNearby(W, inv, Bind.state(), 0.9)
+				local _, needsRoom = collectDropsNearby(W, inv, Bind.state(), 1.35)
 				if needsRoom then Factory.collectNeedsRoom = true end
 				if factoryAlive(gen) then
 					setFactoryStatus(string.format("Factory: harvest %d | blok %d/200",
@@ -3240,6 +3421,7 @@ local function startFactory()
 	Factory.pnbSkipUntil = nil
 	Factory.pnbLowWater = nil
 	Factory.collectNeedsRoom = false
+	Factory.blockedDropId = nil
 	Factory.resumePNB = false
 	Factory.resumeCollect = false
 	if Factory.cycle and factoryCount(inv, seedId) >= 200 then
@@ -3312,23 +3494,50 @@ local function startFactory()
 					if Factory.cycle then
 						task.wait(factoryCycleStep(W, inv, s, currentSeed, blocked, gen))
 					else
-						local target = factoryTarget(W, s, currentSeed, blocked)
-						if target then
-							local worked, reason = factoryWork(W, inv, target, currentSeed, gen)
-							if factoryAlive(gen) then
-								if worked then
-									setFactoryStatus(string.format("%s: panen %d, tanam %d (Y=%d)",
-											Factory.seedName, Factory.harvested, Factory.planted, currentFloor))
-								else
-									blocked[currentSeed .. ":" .. target.kind .. ":" .. target.y .. ":" .. target.x] = os.clock() + 4
+						local paused = false
+						if Factory.collectNeedsRoom then
+							local dropId = Factory.blockedDropId
+							local dropRoom = dropId and factoryRoom(inv, dropId) or 0
+							if dropRoom > 0 then
+								Factory.collectNeedsRoom = false
+								Factory.blockedDropId = nil
+								local picked = collectDropsNearby(W, inv, s, 1.6)
+								if picked > 0 then
+									setFactoryStatus(string.format("Factory: ambil drop tertinggal +%d", picked))
+									task.wait(0.2)
+									paused = true
 								end
+							else
+								local dropDef = dropId and selectedItemDefinition(dropId) or nil
+								local dropName = type(dropDef) == "table" and (dropDef.name or tostring(dropId)) or "hasil panen"
+								Move.release()
+								local msg = string.format("Factory: %s penuh; panen ditahan supaya drop tidak tertinggal", dropName)
+								if Factory.status ~= msg then
+									setFactoryStatus(msg)
+								end
+								task.wait(1)
+								paused = true
 							end
-							task.wait(0.18)
-						else
-							collectDropsNearby(W, inv, s, 0.9)
-							setFactoryStatus(string.format("%s: belum ada pohon matang — %s",
-								Factory.seedName or "Auto Harvest/Plant", factoryGrowDesc(W, currentSeed)))
-							task.wait(1)
+						end
+						if not paused then
+							local target = factoryTarget(W, s, currentSeed, blocked)
+							if target then
+								local worked, reason = factoryWork(W, inv, target, currentSeed, gen)
+								if factoryAlive(gen) then
+									if worked then
+										setFactoryStatus(string.format("%s: panen %d, tanam %d (Y=%d)",
+												Factory.seedName, Factory.harvested, Factory.planted, currentFloor))
+									else
+										blocked[currentSeed .. ":" .. target.kind .. ":" .. target.y .. ":" .. target.x] = os.clock() + 4
+									end
+								end
+								task.wait(0.18)
+							else
+								collectDropsNearby(W, inv, s, 1.35)
+								setFactoryStatus(string.format("%s: belum ada pohon matang — %s",
+									Factory.seedName or "Auto Harvest/Plant", factoryGrowDesc(W, currentSeed)))
+								task.wait(1)
+							end
 						end
 					end
 				end
@@ -4328,6 +4537,7 @@ Hub.debug = {
 	sweepFloor = sweepFloor,
 	descendTo = descendTo,
 	rowNeedsDig = rowNeedsDig,
+	collectDropsAtTile = collectDropsAtTile,
 }
 
 -- Load ulang harus benar-benar menghentikan loop run lama. Tanpa ini loop
