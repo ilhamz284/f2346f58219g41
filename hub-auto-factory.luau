@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.59",
+	version = "0.4.61",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -997,6 +997,11 @@ local Factory = {
 	pnbPathFailures = 0,
 	pnbSkipUntil = nil,
 	pnbLowWater = nil,
+	pnbDraining = false,
+	pnbDrainCount = 0,
+	pnbDrainTarget = nil,
+	pnbOldDrops = nil,
+	dropFilter = nil,
 	harvestFailures = 0,
 	harvestSkipUntil = nil,
 	harvestFailCount = {},
@@ -1633,7 +1638,10 @@ function PNB.stop(reason)
 	setPNBStatus(reason or "dihentikan")
 end
 
-local function collectDropsNearby(W, inv, state, radius)
+-- `only` (opsional) = tabel uid drop yang boleh diambil. Dipakai saat blok
+-- penuh: yang dijemput hanya drop lama, drop pecahan baru dibiarkan supaya
+-- blok di inventory benar-benar berkurang dulu.
+local function collectDropsNearby(W, inv, state, radius, only)
 	if not state or type(W.dropList) ~= "function" or type(W.takeDrop) ~= "function" then
 		return 0
 	end
@@ -1648,7 +1656,8 @@ local function collectDropsNearby(W, inv, state, radius)
 	for _, drop in ipairs(drops) do
 		if type(drop) == "table" and type(drop.uid) == "number" and type(drop.id) == "number"
 			and type(drop.n) == "number" and type(drop.x) == "number" and type(drop.y) == "number"
-			and not (Factory.ignoredDrops and (Factory.ignoredDrops[drop.uid] or 0) > os.clock()) then
+			and not (Factory.ignoredDrops and (Factory.ignoredDrops[drop.uid] or 0) > os.clock())
+			and (not only or only[drop.uid]) then
 			local dx, dy = drop.x - state.x, drop.y - state.y
 			if dx * dx + dy * dy <= radius * radius then
 				local roomOK, room = pcall(inv.room, inv, drop.id)
@@ -2073,6 +2082,11 @@ function Factory.stop(reason)
 	Factory.cycle = false
 	Factory.phase = "idle"
 	Factory.pnbLowWater = nil
+	Factory.pnbDraining = false
+	Factory.pnbDrainCount = 0
+	Factory.pnbDrainTarget = nil
+	Factory.pnbOldDrops = nil
+	Factory.dropFilter = nil
 	Factory.homeWorld = nil
 	Move.stop()
 	setFactoryStatus(reason or "dihentikan")
@@ -3236,7 +3250,7 @@ local function factoryWorkSpot(W, state, blocked)
 	return scan(false)
 end
 
-local function factoryPNBOne(W, inv, gen, blocked)
+local function factoryPNBOne(W, inv, gen, blocked, skipCollect)
 	local baseId = Factory.baseId
 	if factoryCount(inv, baseId) < 1 then
 		return false, "blocks"
@@ -3301,6 +3315,10 @@ local function factoryPNBOne(W, inv, gen, blocked)
 	end
 	Factory.pnb += 1
 	task.wait(0.3)
+	if skipCollect then
+		-- Mode hemat ruang: drop pecahan dibiarkan di lantai, tidak dijemput.
+		return true
+	end
 	if factoryAlive(gen) and not Factory.baseAtSelf and Bind.solid(x, y + 1) then
 		Move.walkTo(x + 0.5, { timeout = 3, tol = 0.28 })
 	end
@@ -3340,7 +3358,8 @@ local function factoryBaseDrops(W, baseId)
 		if type(drop) == "table" and drop.id == baseId and type(drop.uid) == "number"
 			and type(drop.n) == "number" and drop.n > 0
 			and type(drop.x) == "number" and type(drop.y) == "number"
-			and not (Factory.ignoredDrops and (Factory.ignoredDrops[drop.uid] or 0) > os.clock()) then
+			and not (Factory.ignoredDrops and (Factory.ignoredDrops[drop.uid] or 0) > os.clock())
+			and (not Factory.dropFilter or Factory.dropFilter[drop.uid]) then
 			table.insert(result, drop)
 		end
 	end
@@ -3349,7 +3368,11 @@ end
 
 local function factoryCollectDrop(W, inv, state, blocked, gen)
 	local drops = factoryBaseDrops(W, Factory.baseId)
-	if #drops == 0 then return "done", 0 end
+	if #drops == 0 then
+		-- Selesai (atau filter drop lama sudah habis): buka lagi semua drop.
+		Factory.dropFilter = nil
+		return "done", 0
+	end
 	local room = factoryRoom(inv, Factory.baseId)
 	if room <= 0 then return "room", #drops end
 	local dist = Path.explore(math.floor(state.x), math.floor(state.y - 0.0001), 6000)
@@ -3380,7 +3403,7 @@ local function factoryCollectDrop(W, inv, state, blocked, gen)
 		return "path", #drops
 	end
 	Move.walkTo(best.x + 0.5, { timeout = 2, tol = 0.25 })
-	local collected = collectDropsNearby(W, inv, Bind.state(), 0.9)
+	local collected = collectDropsNearby(W, inv, Bind.state(), 0.9, Factory.dropFilter)
 	if collected <= 0 then
 		Factory.dropTakeFailures = Factory.dropTakeFailures or {}
 		local uid = best.drop.uid
@@ -3417,10 +3440,66 @@ end
 local factoryStoreSeeds
 
 -- Kosongkan seluruh blok sebelum fase tanam.
-local function beginPNB(_blocks)
+local PNB_DRAIN_BATCH = 8
+
+-- `drain` = slot blok penuh. PNB dipakai untuk membuat ruang, jadi drop tiap
+-- blok jangan langsung diambil (200 -> 199 -> 200, tidak ada kemajuan).
+-- Pecah beberapa blok dulu; drop pecahannya dibiarkan, lalu hanya drop LAMA
+-- yang dijemput supaya blok di inventory benar-benar turun dulu.
+local function beginPNB(W, blocks, drain)
 	Factory.phase = "pnb"
 	Factory.pnbLowWater = 0
+	Factory.pnbDraining = drain == true
+	Factory.pnbDrainCount = 0
+	Factory.pnbOldDrops = nil
+	Factory.dropFilter = nil
 	Factory.collectNeedsRoom = false
+	if Factory.pnbDraining then
+		local old, need = {}, 0
+		if Factory.baseId then
+			for _, d in ipairs(factoryBaseDrops(W, Factory.baseId)) do
+				old[d.uid] = true
+				need += math.max(1, math.floor(tonumber(d.n) or 1))
+			end
+		end
+		-- Pecah cukup banyak supaya seluruh drop lama muat sekaligus; kalau
+		-- drop lama sedikit, tetap pakai batch minimum agar tidak kembali ke
+		-- pola 1 blok -> 1 ambil.
+		local target = math.max(PNB_DRAIN_BATCH, need)
+		target = math.min(target, math.max(1, math.floor(tonumber(blocks) or 1)))
+		Factory.pnbOldDrops = old
+		Factory.pnbDrainTarget = target
+		setFactoryStatus(need > 0
+			and string.format("Factory: blok %s/200; pecah %d blok dulu, baru ambil %d drop lama",
+				tostring(blocks or 0), target, need)
+			or string.format("Factory: blok %s/200; pecah %d blok dulu untuk ruang",
+				tostring(blocks or 0), target))
+	end
+end
+
+-- Selesai memecah batch: jemput hanya drop lama (sebelum batch). Kalau tidak
+-- ada drop lama, kembali panen dan biarkan drop pecahan di lantai.
+local function finishPNBDrain(inv)
+	local count = Factory.pnbDrainCount or 0
+	local old = Factory.pnbOldDrops
+	Factory.pnbDraining, Factory.pnbDrainCount, Factory.pnbDrainTarget, Factory.pnbOldDrops = false, 0, nil, nil
+	local anyOld = false
+	if old then
+		for _ in pairs(old) do
+			anyOld = true
+			break
+		end
+	end
+	local left = factoryCount(inv, Factory.baseId)
+	if anyOld then
+		Factory.dropFilter = old
+		Factory.phase = "collect"
+		setFactoryStatus(string.format("Factory: %d blok dipecah dulu (sisa %d); ambil drop lama", count, left))
+	else
+		Factory.dropFilter = nil
+		Factory.phase = "harvest"
+		setFactoryStatus(string.format("Factory: %d blok dipecah dulu (sisa %d); lanjut panen", count, left))
+	end
 end
 
 local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
@@ -3435,8 +3514,7 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 		-- takeDrop mengembalikan 0), jadi kosongkan dulu lewat PNB.
 		if blockFull and Factory.baseId then
 			Factory.collectNeedsRoom = false
-			beginPNB(blocks)
-			setFactoryStatus(string.format("Factory: ruang blok tidak cukup (%d/200); PNB lalu ambil drop", blocks))
+			beginPNB(W, blocks, true)
 			return 0.1
 		end
 		-- Mode panen saja tidak punya PNB/tanam untuk mengosongkan blok.
@@ -3540,10 +3618,10 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 			local desc = factoryGrowDesc(W, seedId)
 			setFactoryStatus(ripeElsewhere
 				and ("Factory: target panen tertunda; coba lagi setelah jeda (" .. desc .. ")")
-				or ("Factory: menunggu " .. tostring(Factory.seedName or "tree") .. " matang — " .. desc))
+				or ("Factory: menunggu " .. tostring(Factory.seedName or "tree") .. " matang â€” " .. desc))
 			return 1
 		end
-		beginPNB(blocks)
+		beginPNB(W, blocks)
 		if ripeElsewhere then
 			setFactoryStatus("Factory: target panen tertunda; lanjut PNB sambil coba ulang")
 		else
@@ -3555,16 +3633,25 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 	if Factory.phase == "pnb" then
 		if not Factory.baseId then
 			-- Seed ini tidak punya blok pasangan untuk PNB; lompati fase PNB.
+			Factory.pnbDraining, Factory.pnbDrainCount, Factory.pnbDrainTarget, Factory.pnbOldDrops, Factory.dropFilter = false, 0, nil, nil, nil
 			Factory.phase = "plant"
 			return 0.2
 		end
 		if seeds >= 200 then
 			Factory.resumePNB = blocks > 0
+			Factory.pnbDraining, Factory.pnbDrainCount, Factory.pnbDrainTarget, Factory.pnbOldDrops, Factory.dropFilter = false, 0, nil, nil, nil
 			Factory.phase = "plant"
 			setFactoryStatus(string.format("Factory: seed penuh %d/200; tanam dulu, sisa %d blok untuk PNB", seeds, blocks))
 			return 0.1
 		end
+		-- Batch pecah blok selesai (atau blok sudah habis): sekarang jemput
+		-- drop LAMA saja. Drop pecahan batch ini tetap di lantai.
+		if Factory.pnbDraining and (Factory.pnbDrainCount >= (Factory.pnbDrainTarget or PNB_DRAIN_BATCH) or blocks <= 0) then
+			finishPNBDrain(inv)
+			return 0.2
+		end
 		if blocks <= 0 then
+			Factory.pnbDraining, Factory.pnbDrainCount, Factory.pnbDrainTarget, Factory.pnbOldDrops = false, 0, nil, nil
 			local hasDrops = #factoryBaseDrops(W, Factory.baseId) > 0
 			Factory.phase = hasDrops and "collect" or "plant"
 			Factory.pnbLowWater = nil
@@ -3573,13 +3660,26 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 			return 0.1
 		end
 		if Factory.pnbSkipUntil and Factory.pnbSkipUntil > os.clock() then
+			if Factory.pnbDraining then
+				-- Jalur ke tile kerja sedang diblokir; jangan tahan batch pecah
+				-- blok sampai 20 detik, selesaikan saja.
+				finishPNBDrain(inv)
+				return 0.2
+			end
 			setFactoryStatus(string.format("Factory: menunggu jalur PNB; %d blok tersisa", blocks))
 			return 1
 		end
-		local worked, reason = factoryPNBOne(W, inv, gen, blocked)
+		local worked, reason = factoryPNBOne(W, inv, gen, blocked, Factory.pnbDraining)
 		if worked then
 			Factory.pnbPathFailures = 0
-			if factoryAlive(gen) then
+			if Factory.pnbDraining then
+				Factory.pnbDrainCount += 1
+				if factoryAlive(gen) then
+					setFactoryStatus(string.format("Factory: pecah blok %d/%d (blok %d sisa); drop nanti dijemput",
+						Factory.pnbDrainCount, Factory.pnbDrainTarget or PNB_DRAIN_BATCH,
+						factoryCount(inv, Factory.baseId)))
+				end
+			elseif factoryAlive(gen) then
 				setFactoryStatus(string.format("Factory: PNB %d | blok %d, seed %d",
 					Factory.pnb, factoryCount(inv, Factory.baseId), factoryCount(inv, seedId)))
 			end
@@ -3597,6 +3697,10 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 					Factory.pnbPathFailures))
 			elseif reason == "station" then
 				Factory.pnbPathFailures = 0
+				if Factory.pnbDraining then
+					finishPNBDrain(inv)
+					return 0.2
+				end
 				local ripe = factoryTarget(W, state, seedId, blocked, "harvest")
 				if ripe and factoryWork(W, inv, ripe, seedId, gen) then
 					setFactoryStatus("Factory: membuka tile kerja PNB dari tree matang")
@@ -3605,6 +3709,7 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 				end
 				return 2
 			elseif reason == "blocks" then
+				Factory.pnbDraining, Factory.pnbDrainCount, Factory.pnbDrainTarget, Factory.pnbOldDrops, Factory.dropFilter = false, 0, nil, nil, nil
 				Factory.phase = "plant"
 				setFactoryStatus("Factory: blok PNB habis; lanjut tanam")
 				return 0.2
@@ -3628,8 +3733,10 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 			setFactoryStatus("Factory: drop blok selesai diambil; mulai tanam")
 		elseif result == "room" then
 			if blocks > 0 then
-				beginPNB(blocks)
-				setFactoryStatus(string.format("Factory: drop masih ada, ruang tidak cukup; PNB %d blok", blocks))
+				beginPNB(W, blocks, true)
+				setFactoryStatus(string.format(
+					"Factory: drop masih ada, ruang tidak cukup; pecah %s blok dulu (dari %s)",
+					tostring(Factory.pnbDrainTarget or PNB_DRAIN_BATCH), tostring(blocks)))
 			else
 				Factory.stop("Factory: inventory penuh; tidak ada blok untuk PNB")
 			end
@@ -3647,7 +3754,7 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 		if seeds <= 0 then
 			if Factory.resumePNB and blocks > 0 then
 				Factory.resumePNB = false
-				beginPNB(blocks)
+				beginPNB(W, blocks)
 				setFactoryStatus(string.format("Factory: seed habis; lanjut PNB %d blok", blocks))
 			elseif Factory.resumeCollect then
 				Factory.resumeCollect = false
@@ -3705,7 +3812,7 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 	-- Jika belum ada, lanjut PNB sisa blok atau tunggu pohon tumbuh.
 	if Factory.resumePNB and blocks > 0 then
 		Factory.resumePNB = false
-		beginPNB(blocks)
+		beginPNB(W, blocks)
 		setFactoryStatus(string.format("Factory: lanjut PNB %d blok setelah tanam", blocks))
 		return 0.1
 	end
@@ -3720,7 +3827,7 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 		Factory.phase = "harvest"
 		setFactoryStatus("Factory: tree matang; mulai harvest lagi")
 	elseif blocks > 0 then
-		beginPNB(blocks)
+		beginPNB(W, blocks)
 		setFactoryStatus(string.format("Factory: lanjut PNB %d blok sambil menunggu tree", blocks))
 	elseif seeds > 0 then
 		Factory.phase = "plant"
@@ -3732,7 +3839,7 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 		if factoryHasRipeTree(W, seedId) then
 			setFactoryStatus("Factory: tree matang terdeteksi, mencari jalur yang bisa dijangkau")
 		else
-			setFactoryStatus(string.format("Factory: menunggu %s matang — %s (panen %d, PNB %d, tanam %d)",
+			setFactoryStatus(string.format("Factory: menunggu %s matang â€” %s (panen %d, PNB %d, tanam %d)",
 				Factory.seedName or "seed pilihan", factoryGrowDesc(W, seedId),
 				Factory.harvested, Factory.pnb, Factory.planted))
 		end
@@ -3809,6 +3916,11 @@ local function startFactory()
 	Factory.pnbPathFailures = 0
 	Factory.pnbSkipUntil = nil
 	Factory.pnbLowWater = nil
+	Factory.pnbDraining = false
+	Factory.pnbDrainCount = 0
+	Factory.pnbDrainTarget = nil
+	Factory.pnbOldDrops = nil
+	Factory.dropFilter = nil
 	Factory.collectNeedsRoom = false
 	Factory.blockedDropId = nil
 	Factory.resumePNB = false
@@ -3923,7 +4035,7 @@ local function startFactory()
 								task.wait(0.18)
 							else
 								collectDropsNearby(W, inv, s, 1.35)
-								setFactoryStatus(string.format("%s: belum ada pohon matang — %s",
+								setFactoryStatus(string.format("%s: belum ada pohon matang â€” %s",
 									Factory.seedName or "Auto Harvest/Plant", factoryGrowDesc(W, currentSeed)))
 								task.wait(1)
 							end
@@ -4940,6 +5052,9 @@ Hub.debug = {
 	descendTo = descendTo,
 	rowNeedsDig = rowNeedsDig,
 	collectDropsAtTile = collectDropsAtTile,
+	beginPNB = beginPNB,
+	finishPNBDrain = finishPNBDrain,
+	factoryBaseDrops = factoryBaseDrops,
 }
 
 -- Load ulang harus benar-benar menghentikan loop run lama. Tanpa ini loop
