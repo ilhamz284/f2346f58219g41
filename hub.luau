@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.50",
+	version = "0.4.54",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -2448,7 +2448,10 @@ end
 -- Contoh: "866 pohon tumbuh, terdekat ~17j 33m".
 local function factoryGrowDesc(W, seedId)
 	local count, soonest = factoryGrowInfo(W, seedId)
-	local eta = soonest and ("terdekat ~" .. factoryDuration(soonest)) or "belum ada data waktu"
+	if count <= 0 then
+		return "tidak ada pohon seed ini di world"
+	end
+	local eta = soonest and ("terdekat ~" .. factoryDuration(soonest)) or "waktu matang tidak terbaca"
 	return string.format("%d pohon tumbuh, %s", count, eta)
 end
 
@@ -3412,6 +3415,16 @@ if not okLoad or not WindUI then
 	-- WindUI kadang gagal sekali tepat setelah sisa GUI run lama dihapus
 	-- (cloneref nil). Percobaan kedua hampir selalu berhasil.
 	task.wait(0.2)
+	-- Percobaan pertama bisa meninggalkan ScreenGui setengah jadi; hapus dulu
+	-- supaya percobaan kedua tidak menumpuk dua window.
+	pcall(function()
+		local root = (gethui and gethui()) or game:GetService("CoreGui")
+		for _, c in ipairs(root:GetChildren()) do
+			if c.Name == "WindUI" then
+				c:Destroy()
+			end
+		end
+	end)
 	okLoad, WindUI = pcall(function()
 		local src = windUISource()
 		if not src then
@@ -3429,16 +3442,10 @@ if not okLoad or not WindUI then
 	return
 end
 
--- Sisa run lama bisa meninggalkan ScreenGui "WindUI" yang menutupi window
--- baru; status yang tampil lalu milik instance basi dan tidak pernah update.
--- Catat GUI yang sudah ada, buat window, lalu hapus duplikat lama.
-local uiGuiRoot = (gethui and gethui()) or game:GetService("CoreGui")
-local staleGuis = {}
-for _, c in ipairs(uiGuiRoot:GetChildren()) do
-	if c.Name == "WindUI" or c.Name:sub(1, 7) == "WindUI/" then
-		staleGuis[c] = true
-	end
-end
+-- Sisa run lama sudah dibersihkan di bagian atas file, sebelum WindUI dimuat.
+-- Jangan hapus ScreenGui "WindUI" setelah CreateWindow: WindUI memakai
+-- container itu untuk tab, dan menghapusnya membuat Tab() error
+-- ("Frame is not a valid member of ScrollingFrame").
 local Window = WindUI:CreateWindow({
 	Title = "Human Hub",
 	Author = "Dirt Farm + PNB + Auto Factory",
@@ -3448,36 +3455,6 @@ local Window = WindUI:CreateWindow({
 	ToggleKey = Enum.KeyCode.RightShift,
 })
 Hub.Window = Window
-
--- GUI milik run ini, bukan sisa run sebelumnya.
-local ownGui = nil
-for _, c in ipairs(uiGuiRoot:GetChildren()) do
-	if c.Name == "WindUI" and not staleGuis[c] then
-		ownGui = c
-	end
-end
-for c in pairs(staleGuis) do
-	if c ~= ownGui then
-		pcall(function()
-			c:Destroy()
-		end)
-	end
-end
-if ownGui then
-	-- Sapuan kedua: instance lama yang membuat GUI-nya terlambat.
-	task.delay(2, function()
-		if _G.__HumanHub ~= Hub then
-			return
-		end
-		for _, c in ipairs(uiGuiRoot:GetChildren()) do
-			if c.Name == "WindUI" and c ~= ownGui then
-				pcall(function()
-					c:Destroy()
-				end)
-			end
-		end
-	end)
-end
 
 local pnbTab = Window:Tab({ Title = "Auto Farming", Icon = "blocks" })
 local guardTab = Window:Tab({ Title = "Penjaga World", Icon = "shield" })
@@ -3754,6 +3731,52 @@ Factory.onStatus = function(message)
 			pcall(factoryStatusPara.SetTitle, factoryStatusPara, "Status Harvest/Plant: " .. message)
 		end
 	end
+end
+
+-- Status juga ditulis ke TextLabel paragraf oleh thread yang membuat UI.
+-- Paragraph.SetDesc tidak selalu terlihat berubah saat dipanggil dari thread
+-- factory, dan thread itu bisa punya capability berbeda.
+do
+	local root = (gethui and gethui()) or game:GetService("CoreGui")
+	local function findStatusLabel(inst)
+		for _, c in ipairs(inst:GetChildren()) do
+			if c:IsA("TextLabel") then
+				local parent = c.Parent
+				if parent and parent.Name == "TitleFrame" then
+					for _, s in ipairs(parent:GetChildren()) do
+						if s:IsA("TextLabel") and s ~= c and tostring(s.Text) == "Status Harvest/Plant" then
+							return c
+						end
+					end
+				end
+			end
+			local found = findStatusLabel(c)
+			if found then
+				return found
+			end
+		end
+		return nil
+	end
+	Factory.statusLabel = findStatusLabel(root)
+	task.spawn(function()
+		local label = Factory.statusLabel
+		while _G.__HumanHub == Hub do
+			task.wait(0.3)
+			if not label or not label.Parent then
+				label = findStatusLabel(root)
+				Factory.statusLabel = label
+			end
+			local message = Factory.status
+			if label and label.Parent and message and label.Text ~= message then
+				local ok = pcall(function()
+					label.Text = message
+				end)
+				if not ok then
+					return
+				end
+			end
+		end
+	end)
 end
 Factory.onMode = function()
 	Factory.syncingUI = true
