@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.63",
+	version = "0.4.64",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -1930,6 +1930,7 @@ local function pnbTileId(W, layer, x, y)
 end
 
 local itemDBCache
+local itemWorldDBCache, itemWorldDBHit
 local function itemDBCandidate(candidate)
 	return type(candidate) == "table" and type(candidate[2]) == "table"
 		and candidate[2].name == "Dirt" and type(candidate[3]) == "table"
@@ -1937,20 +1938,36 @@ local function itemDBCandidate(candidate)
 		and candidate[14].background == true
 end
 
-local function findItemDB()
-	if itemDBCandidate(itemDBCache) then
-		return itemDBCache
-	end
-	if type(Bind.hit) == "function" then
-		local ok, upvalues = pcall(debug.getupvalues, Bind.hit)
-		if ok and type(upvalues) == "table" then
-			for _, candidate in ipairs(upvalues) do
-				if itemDBCandidate(candidate) then
-					itemDBCache = candidate
-					return candidate
+-- ItemDB yang dipakai game saat ini (upvalue fungsi hit) berbeda dari tabel
+-- katalog hasil filtergc: tabel world sudah menerapkan pengali pertumbuhan
+-- milik world (mis. Pepper Tree baseGrow 105233 -> grow 63140). Memakai nilai
+-- katalog membuat pohon yang sudah siap panen dianggap belum matang.
+local function findWorldItemDB()
+	if itemWorldDBHit ~= Bind.hit then
+		itemWorldDBCache, itemWorldDBHit = nil, Bind.hit
+		if type(Bind.hit) == "function" then
+			local ok, upvalues = pcall(debug.getupvalues, Bind.hit)
+			if ok and type(upvalues) == "table" then
+				for _, candidate in ipairs(upvalues) do
+					if itemDBCandidate(candidate) then
+						itemWorldDBCache = candidate
+						break
+					end
 				end
 			end
 		end
+	end
+	return itemWorldDBCache
+end
+
+local function findItemDB()
+	local worldDB = findWorldItemDB()
+	if worldDB then
+		itemDBCache = worldDB
+		return worldDB
+	end
+	if itemDBCandidate(itemDBCache) then
+		return itemDBCache
 	end
 	-- Filter gabungan key numerik bisa melewatkan ItemDB di beberapa executor.
 	-- Cari dengan satu key lalu validasi isi tabel sebelum dipakai.
