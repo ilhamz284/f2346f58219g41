@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.48",
+	version = "0.4.49",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -65,24 +65,30 @@ end
 _G.__HumanHubShutdown = Hub.shutdown
 
 -- WindUI menaruh ScreenGui-nya di gethui() dan sisa run lama tidak terhapus.
-local uiRoot = (gethui and gethui()) or game:GetService("CoreGui")
-for _, c in ipairs(uiRoot:GetChildren()) do
-	if c.Name == "WindUI" or c.Name:sub(1, 7) == "WindUI/" then
-		pcall(function()
-			c:Destroy()
-		end)
+-- Seluruh pembersihan dibungkus pcall: kalau satu container aneh (gethui
+-- mengembalikan nil / instance terkunci), reload tidak boleh ikut gagal.
+pcall(function()
+	local uiRoot = (gethui and gethui()) or game:GetService("CoreGui")
+	for _, c in ipairs(uiRoot:GetChildren()) do
+		if c.Name == "WindUI" or c.Name:sub(1, 7) == "WindUI/" then
+			pcall(function()
+				c:Destroy()
+			end)
+		end
 	end
-end
+end)
 local localGui = game:GetService("Players").LocalPlayer and game:GetService("Players").LocalPlayer:FindFirstChild("PlayerGui")
 for _, folder in ipairs({ game:GetService("CoreGui"), localGui }) do
 	if folder and folder.GetChildren then
-		for _, c in ipairs(folder:GetChildren()) do
-			if c.Name == "WindUI" or c.Name == "Rayfield" or c.Name == "FluentUI" then
-				pcall(function()
-					c:Destroy()
-				end)
+		pcall(function()
+			for _, c in ipairs(folder:GetChildren()) do
+				if c.Name == "WindUI" or c.Name == "Rayfield" or c.Name == "FluentUI" then
+					pcall(function()
+						c:Destroy()
+					end)
+				end
 			end
-		end
+		end)
 	end
 end
 
@@ -302,7 +308,19 @@ local Touch = {
 	ctrl = nil,
 	conns = nil,
 	enabledByHub = false,
+	origEnabled = nil,
 }
+
+-- Move.stop() mematikan MobileGui. Selama GUI itu mati, semua InputBegan
+-- yang kita kirim ke tombolnya diabaikan game (terukur dx=0 selama 0,6 s),
+-- jadi karakter terlihat "tidak bisa gerak" padahal backend masih touch.
+-- Setiap kali input sentuh dipakai, pastikan GUI-nya hidup lagi.
+local function touchEnsureGui()
+	if Touch.gui and not Touch.gui.Enabled then
+		Touch.gui.Enabled = true
+		Touch.enabledByHub = true
+	end
+end
 
 local function touchFindCtrl()
 	local ok, list = pcall(function()
@@ -328,6 +346,7 @@ end
 
 local function touchSetup()
 	if Touch.ready then
+		touchEnsureGui()
 		return true
 	end
 	if os.clock() - Touch.triedAt < 3 then
@@ -372,6 +391,9 @@ local function touchSetup()
 		return false
 	end
 	Touch.gui, Touch.conns, Touch.ctrl = gui, conns, ctrl
+	if Touch.origEnabled == nil then
+		Touch.origEnabled = gui.Enabled
+	end
 	if not gui.Enabled then
 		gui.Enabled = true
 		Touch.enabledByHub = true
@@ -567,8 +589,10 @@ function Move.stop()
 	Move.gen += 1
 	Move.release()
 	if Touch.enabledByHub and Touch.gui then
+		-- Kembalikan seperti semula, jangan selalu mati: di Android tombol
+		-- sentuh itu kontrol bawaan pemain.
 		pcall(function()
-			Touch.gui.Enabled = false
+			Touch.gui.Enabled = Touch.origEnabled == true
 		end)
 		Touch.enabledByHub = false
 	end
@@ -578,7 +602,7 @@ Hub.onUnload(function()
 	Move.release()
 	if Touch.enabledByHub and Touch.gui then
 		pcall(function()
-			Touch.gui.Enabled = false
+			Touch.gui.Enabled = Touch.origEnabled == true
 		end)
 		Touch.enabledByHub = false
 	end
@@ -1756,7 +1780,7 @@ function Path.probeJump()
 	if not s or not s.grounded then
 		return nil
 	end
-	local y0, minY = s.y, s.y
+	local y0, minY, leftGround = s.y, s.y, false
 	if not Move.jump() then
 		return nil
 	end
@@ -1765,6 +1789,9 @@ function Path.probeJump()
 		local now = Bind.state()
 		if now then
 			minY = math.min(minY, now.y)
+			if not now.grounded then
+				leftGround = true
+			end
 		end
 		task.wait(0.02)
 	end
@@ -1781,6 +1808,12 @@ function Path.probeJump()
 		if headroom < 3 then
 			return nil
 		end
+		-- Kalau karakter sama sekali tidak lepas dari tanah, inputnya yang
+		-- belum sampai (mis. MobileGui baru dinyalakan), bukan berarti client
+		-- tidak bisa lompat. Jangan simpan kesimpulan palsu.
+		if not leftGround then
+			return nil
+		end
 	end
 	Path.canJump = rise >= 0.6
 	return Path.canJump
@@ -1793,7 +1826,7 @@ function Path.standable(x, y)
 	end
 	local w = tonumber(W.w) or 100
 	local h = tonumber(W.h) or 60
-	if x < 0 or x >= w - 1 or y < 0 or y >= h - 1 then
+	if x < 0 or x >= w or y < 0 or y >= h - 1 then
 		return false
 	end
 	local floor = W.fg and W.fg[y + 1] and W.fg[y + 1][x]
@@ -1825,11 +1858,34 @@ function Path.explore(sx, sy, maxNodes)
 		return v
 	end
 	local function canStand(x, y)
-		if x < 0 or x >= w - 1 or y < 0 or y >= h - 1 then
+		-- Kolom terakhir (x = w-1) tetap dipakai: di world ini tangga antar
+		-- lantai ada di tepi world, di atas Wooden Platform (id 102).
+		if x < 0 or x >= w or y < 0 or y >= h - 1 then
 			return false
 		end
 		local floor = W.fg and W.fg[y + 1] and W.fg[y + 1][x]
 		return (not isSolid(x, y)) and (isSolid(x, y + 1) or floor == 102)
+	end
+	-- Wooden Platform (id 102) adalah platform satu arah: bisa ditembus dari
+	-- bawah, tapi tetap bisa dipijak. Jangan pernah menganggapnya langit-langit.
+	local function isPlatform(x, y)
+		if x < 0 or x >= w or y < 0 or y >= h then
+			return false
+		end
+		local row = W.fg and W.fg[y]
+		return (row and row[x] or 0) == 102
+	end
+	-- Dipakai untuk memutuskan jatuh panjang aman: dari titik mendarat masih
+	-- ada pijakan lain dalam jangkauan lompat (3 tile ke atas)?
+	local function canClimbFrom(lx, ly)
+		for up = 1, 3 do
+			for dx = -2, 2 do
+				if canStand(lx + dx, ly - up) then
+					return true
+				end
+			end
+		end
+		return false
 	end
 
 	local dist, parent = {}, {}
@@ -1897,38 +1953,56 @@ function Path.explore(sx, sy, maxNodes)
 			push(cx, cy, cc, cx + 1, cy, 1, "walk")
 
 			-- Melangkah ke poros samping, lalu mendarat di lantai berikutnya.
-			-- Jatuh maksimal 3 tile: setinggi lompatan. Poros dalam yang lebih
-			-- dari itu tidak punya pijakan untuk kembali, jadi pemain bisa
-			-- terjebak di dasar poros dan factory berhenti bekerja.
+			-- Jatuh pendek (<= 3 tile) selalu aman. Jatuh panjang hanya dipakai
+			-- kalau kolom porosnya benar-benar kosong sampai dasar dan dari
+			-- titik mendarat masih ada pijakan untuk naik lagi; poros 1 tile
+			-- selebar bisa menjadi perangkap satu arah.
 			for _, dir in ipairs({ -1, 1 }) do
 				local shaftX = cx + dir
-				-- Batas kanan menahan tubuh sebelum bisa masuk poros x=w-1.
-				if shaftX >= 0 and shaftX < w - 1
+				-- Poros boleh sampai kolom terakhir (x = w-1): di world ini
+				-- tangga antar lantai justru ada di tepi world.
+				if shaftX >= 0 and shaftX < w
 					and not isSolid(shaftX, cy) and not canStand(shaftX, cy) then
 					for ny = cy + 1, h - 2 do
-						if ny - cy > 3 then break end
+						local depth = ny - cy
+						if depth > 24 then break end
 						if isSolid(shaftX, ny) then break end
-						if canStand(cx, ny) then
-							push(cx, cy, cc, cx, ny, 2 + ny - cy, "drop", shaftX)
-							break
-						end
-						if canStand(shaftX, ny) then
-							push(cx, cy, cc, shaftX, ny, 2 + ny - cy, "dropShaft", shaftX)
+						local sameCol = canStand(cx, ny)
+						local shaftCol = canStand(shaftX, ny)
+						if sameCol or shaftCol then
+							local long = depth > 3
+							if sameCol then
+								-- Turun lewat poros kosong di samping lalu balik
+								-- ke kolom semula (seperti video: platform di
+								-- tepi, sebelahnya kosong). Jauh pun boleh asal
+								-- dari titik mendarat masih bisa naik.
+								if not long or (depth <= 8 and canClimbFrom(cx, ny)) then
+									push(cx, cy, cc, cx, ny, 2 + depth, "drop", shaftX)
+								end
+							elseif shaftCol then
+								if not long then
+									push(cx, cy, cc, shaftX, ny, 2 + depth, "dropShaft", shaftX)
+								elseif canClimbFrom(shaftX, ny) then
+									push(cx, cy, cc, shaftX, ny, 2 + depth, "fall", shaftX)
+								end
+							end
 							break
 						end
 					end
 				end
 			end
 
-			-- lompat naik 1..3 tile, geser 0..2 tile
-			if Path.canJump ~= false and not isSolid(cx, cy - 1) then
+			-- lompat naik 1..3 tile, geser 0..2 tile. Platform (id 102) boleh
+			-- ditembus dari bawah, jadi jangan dihitung sebagai langit-langit.
+			if Path.canJump ~= false and (not isSolid(cx, cy - 1) or isPlatform(cx, cy - 1)) then
 				for up = 1, 3 do
 					for dx = -2, 2 do
 						local nx, ny = cx + dx, cy - up
 						-- Jangan pilih lompatan diagonal yang harus menembus lantai
 						-- solid di samping poros. Masuk dulu ke tepi lantai, lalu
 						-- gunakan edgeJump untuk naik lagi.
-						if dx == 0 or up == 1 or not isSolid(nx, cy - 1) then
+						if dx == 0 or up == 1 or not isSolid(nx, cy - 1)
+							or isPlatform(nx, cy - 1) then
 							push(cx, cy, cc, nx, ny, 2 + math.abs(dx) + up, "jump")
 						end
 					end
@@ -1942,9 +2016,9 @@ function Path.explore(sx, sy, maxNodes)
 					local shaftX = cx + dir
 					-- Poros kanan ada di data tile, tetapi batas fisik world
 					-- menahan tubuh pemain sebelum titik lompatnya.
-					if shaftX >= 0 and shaftX < w - 1
-						and not isSolid(shaftX, cy - 1)
-						and not isSolid(shaftX, cy - 2)
+					if shaftX >= 0 and shaftX < w
+						and (not isSolid(shaftX, cy - 1) or isPlatform(shaftX, cy - 1))
+						and (not isSolid(shaftX, cy - 2) or isPlatform(shaftX, cy - 2))
 						and canStand(cx, cy - 2) then
 						push(cx, cy, cc, cx, cy - 2, 7, "edgeJump", shaftX)
 					end
@@ -1980,59 +2054,83 @@ local function pathStep(cx, cy, step, aliveFn)
 	if step.kind == "walk" then
 		return Move.walkTo(step.x + 0.5, { timeout = 5, tol = 0.35 }) and landed()
 	end
-	if step.kind == "drop" or step.kind == "dropShaft" then
+	if step.kind == "fall" then
+		-- Jatuh panjang di kolom kosong: cukup melangkah keluar tepi, lalu
+		-- tunggu sampai mendarat. Tidak ada gerakan balik ke tengah karena
+		-- jaraknya jauh dan kolom tujuannya memang kosong.
 		local outward = step.shaftX < cx and KeyLeft or KeyRight
-		local inward = step.shaftX < cx and KeyRight or KeyLeft
-		local edgeStopX = step.shaftX < cx and step.shaftX + 0.55 or step.shaftX + 0.45
-		Move.hold(outward)
-		local deadline = os.clock() + 1.8
+		if math.floor(step.shaftX) == cx then
+			outward = nil
+		end
+		if outward then Move.hold(outward) end
+		local deadline = os.clock() + 1.4
 		while aliveFn() and os.clock() < deadline do
 			local s = Bind.state()
 			if not s then break end
-			if step.kind == "dropShaft" then
-				if landed() then
-					Move.release()
-					return true
-				end
-			elseif (step.shaftX < cx and s.x <= edgeStopX)
-				or (step.shaftX > cx and s.x >= edgeStopX)
-				or s.y >= cy + 1.18 then
-				break
-			end
-			task.wait(0.03)
-		end
-		if step.kind == "dropShaft" then
-			Move.release()
-			return landed()
-		end
-		Move.release()
-		deadline = os.clock() + 0.7
-		while aliveFn() and os.clock() < deadline do
-			local s = Bind.state()
-			if not s then break end
-			if s.y >= cy + 1.18 then break end
-			task.wait(0.03)
-		end
-		local falling = Bind.state()
-		if not falling or falling.y < cy + 1.18 then return false end
-		Move.hold(inward)
-		deadline = os.clock() + 1.5
-		while aliveFn() and os.clock() < deadline do
-			local s = Bind.state()
-			if not s then break end
-			if math.abs(s.x - (step.x + 0.5)) <= 0.32 then
-				Move.release()
-				break
-			end
+			if s.y >= cy + 0.9 or not s.grounded then break end
 			task.wait(0.03)
 		end
 		Move.release()
-		deadline = os.clock() + 1
+		deadline = os.clock() + 5
 		while aliveFn() and os.clock() < deadline do
-			if landed() then return true end
-			task.wait(0.03)
+			local s = Bind.state()
+			if not s then return false end
+			if s.grounded then
+				if landed() then return true end
+				return Move.walkTo(step.x + 0.5, { timeout = 2, tol = 0.35 }) and landed()
+			end
+			task.wait(0.04)
 		end
 		return false
+	end
+	if step.kind == "drop" then
+		-- Turun ke platform di kolom yang sama, persis seperti video: platform
+		-- di tepi dan sebelahnya kosong. Karakter harus keluar sedikit dari
+		-- tepi sampai tidak grounded, lalu LANGSUNG balik arah supaya jatuh
+		-- menempel sisi platform dan mendarat di lantai berikutnya. Menunggu
+		-- sampai jatuh 1 tile lebih dulu membuatnya melewati platform tujuan.
+		local outward = step.shaftX < cx and KeyLeft or KeyRight
+		local inward = step.shaftX < cx and KeyRight or KeyLeft
+		Move.hold(outward)
+		local deadline = os.clock() + 1.2
+		while aliveFn() and os.clock() < deadline do
+			local s = Bind.state()
+			if not s or not s.grounded then break end
+			task.wait(0.005)
+		end
+		Move.hold(inward)
+		deadline = os.clock() + 2.5
+		while aliveFn() and os.clock() < deadline do
+			local s = Bind.state()
+			if not s then break end
+			if s.grounded then
+				Move.release()
+				if landed() then return true end
+				local ax, ay = math.floor(s.x), math.floor(s.y - 0.0001)
+				-- Mendarat satu-dua lantai lebih rendah tetap kemajuan;
+				-- moveTo akan menghitung ulang dari posisi nyata.
+				return Path.standable(ax, ay)
+			end
+			task.wait(0.01)
+		end
+		Move.release()
+		return false
+	end
+	if step.kind == "dropShaft" then
+		local outward = step.shaftX < cx and KeyLeft or KeyRight
+		Move.hold(outward)
+		local deadline = os.clock() + 2.5
+		while aliveFn() and os.clock() < deadline do
+			local s = Bind.state()
+			if not s then break end
+			if landed() then
+				Move.release()
+				return true
+			end
+			task.wait(0.02)
+		end
+		Move.release()
+		return landed()
 	end
 	if step.kind == "edgeJump" then
 		local outward = step.shaftX < cx and KeyLeft or KeyRight
@@ -2144,6 +2242,17 @@ local function pathStep(cx, cy, step, aliveFn)
 			task.wait(0.03)
 		end
 		Move.release()
+		-- Mendarat di tile lain tetap dianggap maju: menembus platform satu
+		-- arah sering berhenti satu lantai di bawah sasaran. moveTo akan
+		-- menghitung ulang jalur dari posisi nyata tanpa memblokir edge ini.
+		local after = Bind.state()
+		if after and after.grounded then
+			local ax = math.floor(after.x)
+			local ay = math.floor(after.y - 0.0001)
+			if (ax ~= cx or ay ~= cy) and Path.standable(ax, ay) then
+				return true
+			end
+		end
 	end
 	return false
 end
@@ -2157,8 +2266,12 @@ function Path.moveTo(tx, ty, aliveFn)
 	local path, idx, expect = nil, 1, nil
 	local failedTransitions = 0
 	local recovered = false
+	local startGen = Move.gen
+	local deadline = os.clock() + 120
 	for _ = 1, 400 do
-		if not aliveFn() then
+		-- Tombol Stop atau reload hub harus langsung menghentikan pencarian,
+		-- bukan menyisakan loop pathfinding yang membuat client berat.
+		if not aliveFn() or Move.gen ~= startGen or os.clock() > deadline then
 			Move.release()
 			return false
 		end
@@ -2184,13 +2297,12 @@ function Path.moveTo(tx, ty, aliveFn)
 				if not recovered and Move.edgeStuck() and Move.recover() then
 					recovered = true
 					task.wait(0.2)
-				else
-					return false
+					continue
 				end
-			else
-				path = Path.reconstruct(parent, keyOf(cx, cy), goalKey)
-				idx = 1
+				return false
 			end
+			path = Path.reconstruct(parent, keyOf(cx, cy), goalKey)
+			idx = 1
 		end
 		local step = path[idx]
 		if not step then
@@ -2217,16 +2329,18 @@ function Path.moveTo(tx, ty, aliveFn)
 		end
 		if not pathStep(cx, cy, step, aliveFn) then
 			Move.release()
+			local landed = Bind.state()
+			local moved = landed and landed.grounded
+				and not (math.floor(landed.x) == cx and math.floor(landed.y - 0.0001) == cy)
 			-- Catat transisi pertama yang gagal. Tanpa ini pathfinder akan
 			-- menawarkan jalur yang sama lagi pada percobaan berikutnya.
-			-- Jalan lurus bisa gagal sesaat karena input/overshoot. Menandai
-			-- edge jalan sebagai tembok membuat lantai terbuka tampak putus.
-			if firstStep.kind ~= "walk" then
+			-- Kalau karakter tetap pindah tile, jangan blokir: lompat yang
+			-- menembus platform sering berhenti satu lantai lebih rendah dan
+			-- jalur baru dari posisi itu masih valid.
+			if firstStep.kind ~= "walk" and not moved then
 				Path.blockEdge(cx, cy, firstStep.x, firstStep.y, 12)
 			end
-			local landed = Bind.state()
-			if not landed or not landed.grounded
-				or (math.floor(landed.x) == cx and math.floor(landed.y - 0.0001) == cy) then
+			if not landed or not landed.grounded or not moved then
 				return false
 			end
 			failedTransitions += 1
@@ -3226,6 +3340,23 @@ local okLoad, WindUI = pcall(function()
 	end
 	return fn()
 end)
+if not okLoad or not WindUI then
+	warn("[HumanHub] WindUI gagal dimuat, coba sekali lagi: " .. tostring(WindUI))
+	-- WindUI kadang gagal sekali tepat setelah sisa GUI run lama dihapus
+	-- (cloneref nil). Percobaan kedua hampir selalu berhasil.
+	task.wait(0.2)
+	okLoad, WindUI = pcall(function()
+		local src = windUISource()
+		if not src then
+			error("sumber WindUI tidak tersedia", 0)
+		end
+		local fn, err = loadstring(src)
+		if not fn then
+			error("compile WindUI gagal: " .. tostring(err), 0)
+		end
+		return fn()
+	end)
+end
 if not okLoad or not WindUI then
 	warn("[HumanHub] gagal memuat WindUI: " .. tostring(WindUI))
 	return
