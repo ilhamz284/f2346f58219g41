@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.62",
+	version = "0.4.63",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -305,6 +305,95 @@ end
 local function log(msg)
 	print("[HumanHub] " .. tostring(msg))
 end
+
+--// ===== 1b. ANTI-AFK =====
+-- Roblox memutus koneksi setelah ±20 menit tanpa input pengguna. Gerakan bot
+-- (Humanoid, world.goTo, tombol MobileGui) tidak dihitung sebagai input, jadi
+-- timer itu tetap berjalan walau karakter terus bergerak. Karena itu input
+-- virtual dikirim berkala, dan sekali lagi saat sinyal Idled muncul. Kalau
+-- VirtualUser tidak tersedia di executor, pakai input executor sebagai cadangan.
+local AntiAFK = { enabled = true, pokes = 0, lastAt = 0, lastHow = nil, every = 240 }
+
+local function idlePoke()
+	local vuOK, vu = pcall(function()
+		return game:GetService("VirtualUser")
+	end)
+	if vuOK and vu then
+		if pcall(function()
+			vu:CaptureController()
+			vu:ClickButton2(Vector2.new(0, 0))
+		end) then
+			return "VirtualUser klik-kanan"
+		end
+		if pcall(function()
+			vu:ClickButton1(Vector2.new(0, 0))
+		end) then
+			return "VirtualUser klik-kiri"
+		end
+	end
+	local vimOK, vim = pcall(function()
+		return game:GetService("VirtualInputManager")
+	end)
+	if vimOK and vim then
+		if pcall(function()
+			vim:SendMouseButtonEvent(0, 0, 0, true, game, 1)
+			task.wait(0.05)
+			vim:SendMouseButtonEvent(0, 0, 0, false, game, 1)
+		end) then
+			return "VirtualInputManager"
+		end
+	end
+	if type(mousemoverel) == "function" then
+		if pcall(mousemoverel, 0, 0) then
+			return "mousemoverel"
+		end
+	end	if type(keypress) == "function" then
+		if pcall(keypress, Enum.KeyCode.LeftShift) then
+			return "keypress"
+		end
+	end
+	return nil
+end
+
+local function idlePokeOnce()
+	if not AntiAFK.enabled then
+		return nil
+	end
+	local how = idlePoke()
+	if how then
+		AntiAFK.pokes += 1
+		AntiAFK.lastHow = how
+		AntiAFK.lastAt = os.clock()
+	end
+	return how
+end
+
+AntiAFK.poke = idlePokeOnce
+
+local function startAntiAFK()
+	local lp = Players.LocalPlayer
+	if lp then
+		Hub.keep(lp.Idled:Connect(function()
+			local how = idlePokeOnce()
+			log("anti-AFK: input dikirim (" .. tostring(how or "gagal") .. ")")
+		end))
+	end
+	Hub.onUnload(function()
+		AntiAFK.enabled = false
+	end)
+	task.spawn(function()
+		while AntiAFK.enabled and not Hub.dead do
+			task.wait(AntiAFK.every)
+			if AntiAFK.enabled and not Hub.dead then
+				idlePokeOnce()
+			end
+		end
+	end)
+	log("anti-AFK aktif: input virtual tiap " .. tostring(AntiAFK.every) .. " detik")
+end
+
+Hub.antiAFK = AntiAFK
+startAntiAFK()
 
 --// ===== 2. BINDING KE DALAM GAME =====
 -- W = tabel world (fg/bg/name/w/h + goTo), CT = controller (state/solidAt),
