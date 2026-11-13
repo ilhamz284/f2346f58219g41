@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.49",
+	version = "0.4.50",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -1732,7 +1732,9 @@ function Factory.seedOptions()
 end
 
 local function factoryAlive(gen)
-	return Factory.running and Factory.gen == gen
+	-- Reload hub harus menghentikan loop run lama; tanpa cek ini dua instance
+	-- bisa berebut menggerakkan karakter (run lama tetap jalan tanpa UI).
+	return Factory.running and Factory.gen == gen and _G.__HumanHub == Hub
 end
 
 --// ===== 5. PATHFINDER TILE (JALAN / LOMPAT / JATUH) =====
@@ -2356,37 +2358,98 @@ function Path.moveTo(tx, ty, aliveFn)
 	return false
 end
 
-local function factoryTreeRipe(W, x, y, seedId)
-	if tileId(x, y) ~= seedId then
-		return false
-	end
+-- Data pohon (upvalue spliceAt) dipakai untuk cek matang dan sisa waktu.
+local function factoryEnsureTreeMap(W)
 	if Factory.treeMapWorld ~= W then
 		Factory.treeMap = nil
 		Factory.treeMapWorld = W
 	end
-	if not Factory.treeMap then
-		-- treeLook menyimpan sprite pohon yang dekat kamera saja. Data semua
-		-- pohon ada di upvalue spliceAt; setiap entri punya waktu tanam p.
-		local fn = findFnByWorld("spliceAt", W)
-		local ok, upvalues = false, nil
-		if fn then
-			ok, upvalues = pcall(debug.getupvalues, fn)
+	if Factory.treeMap then
+		return Factory.treeMap
+	end
+	-- findFnByWorld itu getgc scan; jangan diulang tiap tile kalau gagal.
+	if Factory.treeMapMissAt and os.clock() - Factory.treeMapMissAt < 5 then
+		return nil
+	end
+	-- treeLook menyimpan sprite pohon yang dekat kamera saja. Data semua
+	-- pohon ada di upvalue spliceAt; setiap entri punya waktu tanam p.
+	local fn = findFnByWorld("spliceAt", W)
+	local ok, upvalues = false, nil
+	if fn then
+		ok, upvalues = pcall(debug.getupvalues, fn)
+	end
+	if ok and type(upvalues) == "table" then
+		for _, candidate in ipairs(upvalues) do
+			if type(candidate) == "table" then
+				local _, sample = next(candidate)
+				if type(sample) == "table" and type(sample.p) == "number" then
+					Factory.treeMap = candidate
+					break
+				end
+			end
 		end
-		if ok and type(upvalues) == "table" then
-			for _, candidate in ipairs(upvalues) do
-				if type(candidate) == "table" then
-					local _, sample = next(candidate)
-					if type(sample) == "table" and type(sample.p) == "number" then
-						Factory.treeMap = candidate
-						break
+	end
+	if not Factory.treeMap then
+		Factory.treeMapMissAt = os.clock()
+	end
+	return Factory.treeMap
+end
+
+local function factoryTreeRipe(W, x, y, seedId)
+	if tileId(x, y) ~= seedId then
+		return false
+	end
+	local treeMap = factoryEnsureTreeMap(W)
+	local tree = treeMap and treeMap[y * W.w + x]
+	return type(tree) == "table" and type(tree.p) == "number"
+		and tree.p + (Factory.seedGrow or 0) <= workspace:GetServerTimeNow()
+end
+
+-- Jumlah pohon yang masih tumbuh dan sisa waktu pohon terdekat. Status "diam"
+-- tanpa angka membuat pemain mengira bot hang, padahal cuma menunggu matang.
+local function factoryGrowInfo(W, seedId)
+	local treeMap = factoryEnsureTreeMap(W)
+	local w = tonumber(W.w) or 100
+	local rows = W.fg
+	if not treeMap or not rows then
+		return 0, nil
+	end
+	local now = workspace:GetServerTimeNow()
+	local grow = Factory.seedGrow or 0
+	local count, soonest = 0, nil
+	for key, tree in pairs(treeMap) do
+		if type(tree) == "table" and type(tree.p) == "number" then
+			local y = math.floor(key / w)
+			local x = key - y * w
+			if rows[y] and rows[y][x] == seedId then
+				local left = tree.p + grow - now
+				if left > 0 then
+					count += 1
+					if not soonest or left < soonest then
+						soonest = left
 					end
 				end
 			end
 		end
 	end
-	local tree = Factory.treeMap and Factory.treeMap[y * W.w + x]
-	return type(tree) == "table" and type(tree.p) == "number"
-		and tree.p + (Factory.seedGrow or 0) <= workspace:GetServerTimeNow()
+	return count, soonest
+end
+
+local function factoryDuration(sec)
+	sec = math.max(0, math.floor(tonumber(sec) or 0))
+	if sec >= 3600 then
+		return string.format("%dj %02dm", math.floor(sec / 3600), math.floor((sec % 3600) / 60))
+	elseif sec >= 60 then
+		return string.format("%dm %02ds", math.floor(sec / 60), sec % 60)
+	end
+	return string.format("%ds", sec)
+end
+
+-- Contoh: "866 pohon tumbuh, terdekat ~17j 33m".
+local function factoryGrowDesc(W, seedId)
+	local count, soonest = factoryGrowInfo(W, seedId)
+	local eta = soonest and ("terdekat ~" .. factoryDuration(soonest)) or "belum ada data waktu"
+	return string.format("%d pohon tumbuh, %s", count, eta)
 end
 
 local function factoryHasRipeTree(W, seedId)
@@ -2901,9 +2964,10 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 		end
 		if blocks <= 0 then
 			Factory.phase = "grow"
+			local desc = factoryGrowDesc(W, seedId)
 			setFactoryStatus(ripeElsewhere
-				and "Factory: target panen tertunda; coba lagi setelah jeda"
-				or "Factory: menunggu tree matang")
+				and ("Factory: target panen tertunda; coba lagi setelah jeda (" .. desc .. ")")
+				or ("Factory: menunggu " .. tostring(Factory.seedName or "tree") .. " matang — " .. desc))
 			return 1
 		end
 		beginPNB(blocks)
@@ -3095,8 +3159,9 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 		if factoryHasRipeTree(W, seedId) then
 			setFactoryStatus("Factory: tree matang terdeteksi, mencari jalur yang bisa dijangkau")
 		else
-			setFactoryStatus(string.format("Factory: menunggu %s matang (panen %d, PNB %d, tanam %d)",
-				Factory.seedName or "seed pilihan", Factory.harvested, Factory.pnb, Factory.planted))
+			setFactoryStatus(string.format("Factory: menunggu %s matang — %s (panen %d, PNB %d, tanam %d)",
+				Factory.seedName or "seed pilihan", factoryGrowDesc(W, seedId),
+				Factory.harvested, Factory.pnb, Factory.planted))
 		end
 	end
 	collectDropsNearby(W, inv, state, 0.9)
@@ -3258,6 +3323,8 @@ local function startFactory()
 							task.wait(0.18)
 						else
 							collectDropsNearby(W, inv, s, 0.9)
+							setFactoryStatus(string.format("%s: belum ada pohon matang — %s",
+								Factory.seedName or "Auto Harvest/Plant", factoryGrowDesc(W, currentSeed)))
 							task.wait(1)
 						end
 					end
@@ -3362,6 +3429,16 @@ if not okLoad or not WindUI then
 	return
 end
 
+-- Sisa run lama bisa meninggalkan ScreenGui "WindUI" yang menutupi window
+-- baru; status yang tampil lalu milik instance basi dan tidak pernah update.
+-- Catat GUI yang sudah ada, buat window, lalu hapus duplikat lama.
+local uiGuiRoot = (gethui and gethui()) or game:GetService("CoreGui")
+local staleGuis = {}
+for _, c in ipairs(uiGuiRoot:GetChildren()) do
+	if c.Name == "WindUI" or c.Name:sub(1, 7) == "WindUI/" then
+		staleGuis[c] = true
+	end
+end
 local Window = WindUI:CreateWindow({
 	Title = "Human Hub",
 	Author = "Dirt Farm + PNB + Auto Factory",
@@ -3371,6 +3448,36 @@ local Window = WindUI:CreateWindow({
 	ToggleKey = Enum.KeyCode.RightShift,
 })
 Hub.Window = Window
+
+-- GUI milik run ini, bukan sisa run sebelumnya.
+local ownGui = nil
+for _, c in ipairs(uiGuiRoot:GetChildren()) do
+	if c.Name == "WindUI" and not staleGuis[c] then
+		ownGui = c
+	end
+end
+for c in pairs(staleGuis) do
+	if c ~= ownGui then
+		pcall(function()
+			c:Destroy()
+		end)
+	end
+end
+if ownGui then
+	-- Sapuan kedua: instance lama yang membuat GUI-nya terlambat.
+	task.delay(2, function()
+		if _G.__HumanHub ~= Hub then
+			return
+		end
+		for _, c in ipairs(uiGuiRoot:GetChildren()) do
+			if c.Name == "WindUI" and c ~= ownGui then
+				pcall(function()
+					c:Destroy()
+				end)
+			end
+		end
+	end)
+end
 
 local pnbTab = Window:Tab({ Title = "Auto Farming", Icon = "blocks" })
 local guardTab = Window:Tab({ Title = "Penjaga World", Icon = "shield" })
@@ -4199,6 +4306,18 @@ Hub.debug = {
 	descendTo = descendTo,
 	rowNeedsDig = rowNeedsDig,
 }
+
+-- Load ulang harus benar-benar menghentikan loop run lama. Tanpa ini loop
+-- basi tetap menggerakkan karakter dan status di window baru tidak pernah
+-- berubah (dua instance berebut).
+Hub.onUnload(function()
+	Factory.running = false
+	Factory.gen += 1
+	Farm.running = false
+	PNB.running = false
+	pcall(Move.release)
+	pcall(Move.stop)
+end)
 
 --// ===== 9. HEARTBEAT / PENJAGA =====
 -- kalau karakter hilang (respawn / keluar world), hentikan bot supaya
