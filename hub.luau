@@ -12,7 +12,11 @@
 --//            PNB sampai blok habis, tanam sampai seed habis.
 --//
 --// Prinsip gerak:
---//   - semua gerak lewat keypress A/D + Space (VirtualInputManager)
+--//   - PC: keypress A/D + Space (VirtualInputManager)
+--//   - Android: tombol MobileGui bawaan game (Left/Right/Jump) karena
+--//     SendKeyEvent tidak selalu diteruskan executor mobile
+--//   - karakter yang terjepit di tepi/pojok world dilepas otomatis lalu
+--//     path dihitung ulang, tidak langsung menyerah
 --//   - factory berjalan ke poros, jatuh, atau melompat dengan input game
 --//   - jalan lurus tetap mulus; jeda hanya saat berganti aksi
 --//   - berhenti dulu sebelum memukul tile, lalu lanjut jalan
@@ -26,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.47",
+	version = "0.4.48",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -163,17 +167,6 @@ local function findInventory()
 			end
 		end
 	end
-	-- Beberapa executor mobile tidak mengembalikan tabel inventory dari
-	-- filtergc. Scan GC dibatasi dan diberi jeda agar game tetap responsif.
-	if type(getgc) == "function" then
-		local ok, objects = pcall(function() return getgc(true) end)
-		if ok and type(objects) == "table" then
-			for i = 1, math.min(#objects, 30000) do
-				if valid(objects[i]) then return objects[i] end
-				if i % 500 == 0 then task.wait() end
-			end
-		end
-	end
 	return nil
 end
 
@@ -273,8 +266,13 @@ end
 --// ===== 3. GERAK MANUSIA =====
 local Move = {
 	held = nil,
+	vimHeld = nil,
+	backend = "vim",
+	forceTouch = type(getgenv) == "function" and getgenv().HumanHubForceTouch == true or false,
+	noTouch = false,
 	gen = 0,
 	lastJumpAt = 0,
+	recovering = false,
 	cfg = {
 		reactMin = 0.07,
 		reactMax = 0.18,
@@ -293,19 +291,173 @@ local function vkey(down, kc)
 	end)
 end
 
-function Move.release()
-	if Move.held then
-		vkey(false, Move.held)
-		Move.held = nil
+--// ===== 3a. INPUT SENTUH MOBILE =====
+-- Di sebagian executor Android SendKeyEvent tidak sampai ke game. Tombol
+-- MobileGui bawaan game tetap bekerja: tekan koneksi InputBegan-nya, lalu
+-- lepas lewat current.edit(nil) milik modul controller mobile.
+local Touch = {
+	ready = false,
+	triedAt = 0,
+	gui = nil,
+	ctrl = nil,
+	conns = nil,
+	enabledByHub = false,
+}
+
+local function touchFindCtrl()
+	local ok, list = pcall(function()
+		return filtergc("table", { Keys = { "current", "mount" } })
+	end)
+	if not ok or type(list) ~= "table" then
+		return nil
 	end
+	local entries = list
+	if type(list[1]) ~= "table" then
+		entries = { list }
+	end
+	for _, entry in ipairs(entries) do
+		local current = type(entry) == "table" and entry.current
+		if type(current) == "table"
+			and type(current.dir) == "function"
+			and type(current.edit) == "function" then
+			return current
+		end
+	end
+	return nil
+end
+
+local function touchSetup()
+	if Touch.ready then
+		return true
+	end
+	if os.clock() - Touch.triedAt < 3 then
+		return false
+	end
+	Touch.triedAt = os.clock()
+	if type(getconnections) ~= "function" then
+		return false
+	end
+	local okAll, gui, conns, ctrl = pcall(function()
+		local player = Players.LocalPlayer
+		local playerGui = player and player:FindFirstChild("PlayerGui")
+		local mobileGui = playerGui and playerGui:FindFirstChild("MobileGui")
+		if not mobileGui then
+			return nil
+		end
+		local list = {}
+		for _, name in ipairs({ "Left", "Right", "Jump" }) do
+			local button = mobileGui:FindFirstChild(name)
+			if not button then
+				return nil
+			end
+			local fn = nil
+			for _, conn in ipairs(getconnections(button.InputBegan)) do
+				if conn.Function then
+					fn = conn.Function
+					break
+				end
+			end
+			if not fn then
+				return nil
+			end
+			list[name] = fn
+		end
+		local current = touchFindCtrl()
+		if not current then
+			return nil
+		end
+		return mobileGui, list, current
+	end)
+	if not okAll or not gui or not conns or not ctrl then
+		return false
+	end
+	Touch.gui, Touch.conns, Touch.ctrl = gui, conns, ctrl
+	if not gui.Enabled then
+		gui.Enabled = true
+		Touch.enabledByHub = true
+	end
+	Touch.ready = true
+	log("input sentuh MobileGui siap")
+	return true
+end
+
+local function touchPress(name)
+	if not touchSetup() then
+		return false
+	end
+	local fake = {
+		UserInputType = Enum.UserInputType.Touch,
+		Position = Vector3.new(0, 0, 0),
+	}
+	return pcall(Touch.conns[name], fake)
+end
+
+local function touchRelease()
+	if not Touch.ready then
+		return false
+	end
+	pcall(Touch.ctrl.edit, nil)
+	return true
+end
+
+-- Pindah ke input sentuh kalau tersedia. Di PC VIM sudah terbukti, jadi
+-- hanya dipakai bila TouchEnabled aktif dan keyboard tidak terdeteksi,
+-- atau bila pengguna menyalakan "Paksa input sentuh".
+function Move.preferTouch()
+	if Move.backend == "touch" then
+		return true
+	end
+	if Move.noTouch then
+		return false
+	end
+	if not Touch.ready then
+		if not Move.forceTouch then
+			local uis = game:GetService("UserInputService")
+			if not uis.TouchEnabled or uis.KeyboardEnabled then
+				return false
+			end
+		end
+		if not touchSetup() then
+			return false
+		end
+	end
+	if Move.vimHeld then
+		vkey(false, Move.vimHeld)
+		Move.vimHeld = nil
+	end
+	Move.held = nil
+	Move.backend = "touch"
+	log("mode gerak: sentuh (MobileGui)")
+	return true
+end
+
+function Move.release()
+	if Move.vimHeld then
+		vkey(false, Move.vimHeld)
+		Move.vimHeld = nil
+	end
+	if Touch.ready then
+		pcall(Touch.ctrl.edit, nil)
+	end
+	Move.held = nil
 end
 
 function Move.hold(kc)
 	if Move.held == kc then
 		return
 	end
+	Move.preferTouch()
 	Move.release()
+	if Move.backend == "touch" then
+		if touchPress(kc == KeyRight and "Right" or "Left") then
+			Move.held = kc
+			return
+		end
+		Move.backend = "vim"
+		log("input sentuh gagal; kembali ke VIM")
+	end
 	Move.held = kc
+	Move.vimHeld = kc
 	vkey(true, kc)
 end
 
@@ -315,6 +467,20 @@ function Move.jump()
 		return false
 	end
 	Move.lastJumpAt = os.clock()
+	if Move.backend == "touch" or Move.preferTouch() then
+		local held = Move.held
+		if touchPress("Jump") then
+			task.wait(rnd(0.12, 0.16))
+			touchRelease()
+			-- edit(nil) ikut melepas arah; pasang lagi supaya lompatan
+			-- tetap punya dorongan horizontal seperti di PC.
+			if held then
+				touchPress(held == KeyRight and "Right" or "Left")
+			end
+			return true
+		end
+		Move.backend = "vim"
+	end
 	vkey(true, Enum.KeyCode.Space)
 	task.wait(rnd(0.14, 0.20))
 	vkey(false, Enum.KeyCode.Space)
@@ -325,18 +491,110 @@ function Move.idle(a, b)
 	task.wait(rnd(a, b))
 end
 
+local function moveStandable(W, x, y)
+	if not W then
+		return false
+	end
+	local w = tonumber(W.w) or 100
+	local h = tonumber(W.h) or 60
+	if x < 0 or x >= w - 1 or y < 0 or y >= h - 1 then
+		return false
+	end
+	local floor = W.fg and W.fg[y + 1] and W.fg[y + 1][x]
+	return (not Bind.solid(x, y)) and (Bind.solid(x, y + 1) or floor == 102)
+end
+
+-- true kalau karakter menempel tepi world atau berdiri di tile yang tidak
+-- dianggap bisa dipijak. Dari posisi begini pathfinder sering tidak punya
+-- jalan keluar, jadi karakter harus digeser dulu.
+function Move.edgeStuck()
+	local W = Bind.getW()
+	local s = Bind.state()
+	if not W or not s then
+		return false
+	end
+	local w = tonumber(W.w) or 100
+	local cx, cy = math.floor(s.x), math.floor(s.y - 0.0001)
+	if not moveStandable(W, cx, cy) then
+		return true
+	end
+	return cx <= 1 or cx >= w - 3
+end
+
+-- Geser karakter menjauh dari tepi sambil melompat bila perlu, lalu biarkan
+-- pemanggil menghitung ulang path dari posisi baru.
+function Move.recover()
+	if Move.recovering then
+		return false
+	end
+	local W, s = Bind.getW(), Bind.state()
+	if not W or not s then
+		return false
+	end
+	Move.recovering = true
+	local w = tonumber(W.w) or 100
+	local dir = s.x < w / 2 and 1 or -1
+	if s.x <= 2 then
+		dir = 1
+	elseif s.x >= w - 3 then
+		dir = -1
+	end
+	local deadline = os.clock() + 2.2
+	local nextJump = os.clock() + 0.3
+	Move.hold(dir > 0 and KeyRight or KeyLeft)
+	while os.clock() < deadline do
+		local now = Bind.state()
+		if not now then
+			break
+		end
+		local cx, cy = math.floor(now.x), math.floor(now.y - 0.0001)
+		if cx > 2 and cx < w - 3 and moveStandable(W, cx, cy) then
+			break
+		end
+		if now.grounded and os.clock() >= nextJump then
+			Move.jump()
+			nextJump = os.clock() + 0.9
+		end
+		task.wait(0.04)
+	end
+	Move.release()
+	task.wait(0.15)
+	Move.recovering = false
+	return true
+end
+
 function Move.stop()
 	Move.gen += 1
 	Move.release()
+	if Touch.enabledByHub and Touch.gui then
+		pcall(function()
+			Touch.gui.Enabled = false
+		end)
+		Touch.enabledByHub = false
+	end
 end
+
+Hub.onUnload(function()
+	Move.release()
+	if Touch.enabledByHub and Touch.gui then
+		pcall(function()
+			Touch.gui.Enabled = false
+		end)
+		Touch.enabledByHub = false
+	end
+end)
+Hub.move = Move
+Hub.touch = Touch
 
 -- Jalan ke target X. Return true kalau berhenti di dekat target.
 function Move.walkTo(targetX, opts)
 	opts = opts or {}
+	Move.preferTouch()
 	local tol = opts.tol or 0.14
 	local deadline = os.clock() + (opts.timeout or 25)
 	local myGen = Move.gen
 	local lastX, lastT = nil, os.clock()
+	local recovered = false
 
 	if not Move.held then
 		Move.idle(Move.cfg.reactMin, Move.cfg.reactMax)
@@ -377,9 +635,16 @@ function Move.walkTo(targetX, opts)
 			if not lastX or math.abs(s3.x - lastX) >= 0.05 then
 				lastX = s3.x
 				lastT = os.clock()
-			elseif os.clock() - lastT > 1.6 then
+			elseif os.clock() - lastT > 1.2 then
 				Move.release()
-				return false
+				if not recovered and opts.recover ~= false and Move.edgeStuck()
+					and Move.recover() then
+					recovered = true
+					lastX, lastT = nil, os.clock()
+					deadline = math.max(deadline, os.clock() + 2.0)
+				else
+					return false
+				end
 			end
 		end
 
@@ -1197,19 +1462,6 @@ local function findItemDB()
 			end
 		end
 	end
-	-- Cadangan untuk executor mobile yang tidak mendukung filtergc.
-	if type(getgc) == "function" then
-		local ok, objects = pcall(function() return getgc(true) end)
-		if ok and type(objects) == "table" then
-			for i = 1, math.min(#objects, 50000) do
-				if itemDBCandidate(objects[i]) then
-					itemDBCache = objects[i]
-					return itemDBCache
-				end
-				if i % 500 == 0 then task.wait() end
-			end
-		end
-	end
 	return nil
 end
 
@@ -1904,6 +2156,7 @@ function Path.moveTo(tx, ty, aliveFn)
 	local goalKey = keyOf(tx, ty)
 	local path, idx, expect = nil, 1, nil
 	local failedTransitions = 0
+	local recovered = false
 	for _ = 1, 400 do
 		if not aliveFn() then
 			Move.release()
@@ -1926,10 +2179,18 @@ function Path.moveTo(tx, ty, aliveFn)
 			local dist, parent = Path.explore(cx, cy, 6000)
 			if not dist or dist[goalKey] == nil then
 				Move.release()
-				return false
+				-- Dari pojok/tepi world pathfinder sering tidak menemukan
+				-- jalan sama sekali. Geser dulu, lalu hitung ulang sekali.
+				if not recovered and Move.edgeStuck() and Move.recover() then
+					recovered = true
+					task.wait(0.2)
+				else
+					return false
+				end
+			else
+				path = Path.reconstruct(parent, keyOf(cx, cy), goalKey)
+				idx = 1
 			end
-			path = Path.reconstruct(parent, keyOf(cx, cy), goalKey)
-			idx = 1
 		end
 		local step = path[idx]
 		if not step then
@@ -3464,6 +3725,56 @@ moveSec:Slider({
 	end,
 })
 
+local function moveModeName()
+	return Move.backend == "touch" and "sentuh" or "VIM"
+end
+
+local moveStatus = moveSec:Paragraph({ Title = "Status gerak", Desc = "belum dicek" })
+
+local function refreshMoveStatus()
+	local s = Bind.state()
+	local W = Bind.getW()
+	if not s then
+		return "state pemain tidak terbaca"
+	end
+	local cx, cy = math.floor(s.x), math.floor(s.y - 0.0001)
+	local text = string.format(
+		"mode=%s | touch=%s | x=%.2f y=%.2f | tile=%d,%d | bisa dipijak=%s | dunia=%s",
+		moveModeName(),
+		Touch.ready and "siap" or "belum",
+		s.x, s.y, cx, cy,
+		tostring(moveStandable(W, cx, cy)),
+		tostring(W and W.name)
+	)
+	if moveStatus.SetDesc then
+		pcall(moveStatus.SetDesc, moveStatus, text)
+	end
+	return text
+end
+
+local playerInput = game:GetService("UserInputService")
+local autoTouch = playerInput.TouchEnabled and not playerInput.KeyboardEnabled
+
+moveSec:Toggle({
+	Title = "Input sentuh MobileGui (Android)",
+	Desc = "Hub menekan tombol Left/Right/Jump bawaan game, bukan key VirtualInputManager. Kalau karakter tidak bergerak di HP, pastikan ini menyala.",
+	Value = Move.forceTouch or autoTouch,
+	Callback = function(on)
+		Move.forceTouch = on
+		Move.noTouch = not on
+		Move.release()
+		Move.backend = "vim"
+		if on then
+			if Move.preferTouch() then
+				WindUI:Notify({ Title = "Gerak", Content = "Input sentuh MobileGui aktif.", Duration = 3 })
+			else
+				WindUI:Notify({ Title = "Gerak", Content = "MobileGui tidak ditemukan; tetap VIM.", Duration = 3 })
+			end
+		end
+		refreshMoveStatus()
+	end,
+})
+
 local function testWalk(dir)
 	if Farm.running or PNB.running or Factory.running then
 		WindUI:Notify({ Title = "Gerak", Content = "Matikan fitur auto farming dulu.", Duration = 3 })
@@ -3478,10 +3789,13 @@ local function testWalk(dir)
 	task.spawn(function()
 		Move.gen += 1
 		local ok = Move.walkTo(target, { timeout = 6 })
+		local now = Bind.state()
 		WindUI:Notify({
 			Title = "Gerak",
-			Content = ok and string.format("Sampai di x=%d", target) or "Berhenti (terhalang / timeout)",
-			Duration = 3,
+			Content = ok
+				and string.format("Sampai di x=%d (mode %s)", target, moveModeName())
+				or string.format("Berhenti di x=%.1f (mode %s)", now and now.x or -1, moveModeName()),
+			Duration = 4,
 		})
 	end)
 end
@@ -3500,9 +3814,57 @@ moveSec:Button({
 	end,
 })
 
+moveSec:Button({
+	Title = "Cek status gerak",
+	Callback = function()
+		WindUI:Notify({ Title = "Status Gerak", Content = refreshMoveStatus(), Duration = 6 })
+	end,
+})
+
+moveSec:Button({
+	Title = "Tes lompat di tempat",
+	Callback = function()
+		if Farm.running or PNB.running or Factory.running then
+			WindUI:Notify({ Title = "Gerak", Content = "Matikan fitur auto farming dulu.", Duration = 3 })
+			return
+		end
+		local before = Bind.state()
+		if not before then
+			WindUI:Notify({ Title = "Gerak", Content = "State pemain tidak terbaca.", Duration = 3 })
+			return
+		end
+		local y0 = before.y
+		if not Move.jump() then
+			WindUI:Notify({ Title = "Gerak", Content = "Tidak bisa lompat sekarang (sedang di udara / baru lompat).", Duration = 3 })
+			return
+		end
+		task.spawn(function()
+			local minY = y0
+			local deadline = os.clock() + 1.0
+			while os.clock() < deadline do
+				local now = Bind.state()
+				if now then
+					minY = math.min(minY, now.y)
+				end
+				task.wait(0.02)
+			end
+			WindUI:Notify({
+				Title = "Gerak",
+				Content = string.format(
+					"Lompat %s: naik %.2f tile (mode %s)",
+					minY < y0 - 0.5 and "berhasil" or "TIDAK terbaca",
+					y0 - minY,
+					moveModeName()
+				),
+				Duration = 4,
+			})
+		end)
+	end,
+})
+
 moveSec:Paragraph({
 	Title = "Cara kerja",
-	Desc = "Factory berjalan dengan A/D, memakai Space bawaan game saat perlu naik, dan melangkah lewat poros untuk turun. Lompatan yang gagal tidak diulang terus-menerus.",
+	Desc = "Di PC hub memakai A/D + Space. Di Android hub menekan tombol MobileGui game. Karakter yang terjepit di tepi world digeser otomatis lalu path dihitung ulang.",
 })
 
 -- ---- Penjaga world ----
