@@ -30,27 +30,206 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.57",
+	version = "0.4.59",
 	conns = {},
 	unload = {},
 	ui = {},
+	remote = false,
+	bus = nil,
+	dead = false,
 }
-local prev = _G.__HumanHub
-if type(prev) == "table" and type(prev.shutdown) == "function" then
-	pcall(prev.shutdown)
+local HUB_TOKEN = tostring(math.floor(os.clock() * 1000)) .. "_" .. tostring(math.random(100000, 999999))
+
+--// ===== 0a. HENTIKAN INSTANCE LAMA =====
+-- Di Android (Delta) setiap Execute bisa punya _G sendiri, jadi run lama
+-- tidak ketemu lewat _G dan tetap hidup: window jadi dobel dan dua thread
+-- berebut menggerakkan karakter. Instance didaftarkan di semua kanal global
+-- yang biasa dipakai executor, ditambah sinyal BindableEvent yang bertahan
+-- antar-execute karena berupa Instance.
+local function uiContainer()
+	local ok, hui = pcall(function()
+		return gethui and gethui() or nil
+	end)
+	if ok and hui then
+		return hui
+	end
+	local lp = game:GetService("Players").LocalPlayer
+	return lp and lp:FindFirstChild("PlayerGui") or nil
 end
-_G.__HumanHub = Hub
+
+local function hubGlobals()
+	local list = {}
+	list[#list + 1] = _G
+	local okEnv, env = pcall(function()
+		return getgenv and getgenv() or nil
+	end)
+	if okEnv and type(env) == "table" and env ~= _G then
+		list[#list + 1] = env
+	end
+	local okShared, sh = pcall(function()
+		return shared
+	end)
+	if okShared and type(sh) == "table" and sh ~= _G and sh ~= env then
+		list[#list + 1] = sh
+	end
+	return list
+end
+
+local function findHubBus()
+	local root = uiContainer()
+	if not root then
+		return nil
+	end
+	local bus = root:FindFirstChild("HumanHubBus")
+	if bus and bus:IsA("BindableEvent") then
+		return bus
+	end
+	return nil
+end
+
+local function killPrevious()
+	local killed = false
+	for _, env in ipairs(hubGlobals()) do
+		local prevHub = env.__HumanHub
+		if type(prevHub) == "table" and type(prevHub.shutdown) == "function" and prevHub ~= Hub then
+			pcall(prevHub.shutdown)
+			killed = true
+		end
+		pcall(function()
+			env.__HumanHub = nil
+		end)
+		pcall(function()
+			env.__HumanHubShutdown = nil
+		end)
+	end
+	local bus = findHubBus()
+	if bus then
+		-- Handler BindableEvent dijalankan tertunda di thread sinyal. Panggilan
+		-- langsung di atas hanya membersihkan state Lua (Hub.dead + loop
+		-- berhenti); kerja engine dari chunk lama (Destroy GUI, input) bisa
+		-- diabaikan executor, jadi handler bus yang benar-benar menutupnya.
+		pcall(function()
+			bus:Fire("shutdown")
+		end)
+		killed = true
+		-- Beri satu frame supaya handler sempat jalan. Window run lama juga
+		-- dihapus sendiri di bawah sebelum window baru dibuat, jadi ini hanya
+		-- pengaman, bukan syarat.
+		task.wait(0.1)
+	end
+	if killed then
+		task.wait(0.05)
+	end
+	return killed
+end
+
+killPrevious()
+
+function Hub.publish()
+	if Hub.dead then
+		return
+	end
+	for _, env in ipairs(hubGlobals()) do
+		pcall(function()
+			env.__HumanHub = Hub
+		end)
+	end
+	pcall(function()
+		_G.__HumanHubShutdown = Hub.shutdown
+	end)
+end
 
 function Hub.keep(conn)
+	if Hub.dead then
+		pcall(function()
+			conn:Disconnect()
+		end)
+		return conn
+	end
 	table.insert(Hub.conns, conn)
 	return conn
 end
 
 function Hub.onUnload(fn)
+	if Hub.dead then
+		return
+	end
 	table.insert(Hub.unload, fn)
 end
 
+-- Window WindUI ditaruh di gethui()/PlayerGui dan tidak ikut mati saat
+-- script dijalankan ulang. Semua penghapusan dibungkus pcall supaya
+-- container aneh (gethui nil / instance terkunci) tidak menggagalkan reload.
+-- Tiap window diberi tanda HumanHubOwner berisi token instance-nya. Saat
+-- shutdown (often telat, lewat thread sinyal) hanya window bertanda token
+-- sendiri yang dihapus, jadi window run baru tidak ikut kena.
+local GUI_OWNER = "HumanHubOwner"
+
+local function guiOwner(c)
+	local ok, owner = pcall(function()
+		return c:GetAttribute(GUI_OWNER)
+	end)
+	return ok and owner or nil
+end
+
+local function destroyHubGui(onlyMine)
+	local function shouldKill(c)
+		if not onlyMine then
+			return true
+		end
+		local owner = guiOwner(c)
+		return owner == nil or owner == HUB_TOKEN
+	end
+	local root = uiContainer()
+	if root and root.GetChildren then
+		pcall(function()
+			for _, c in ipairs(root:GetChildren()) do
+				if (c.Name == "WindUI" or c.Name:sub(1, 7) == "WindUI/") and shouldKill(c) then
+					pcall(function()
+						c:Destroy()
+					end)
+				end
+			end
+		end)
+	end
+	local lp = game:GetService("Players").LocalPlayer
+	local playerGui = lp and lp:FindFirstChild("PlayerGui")
+	for _, folder in ipairs({ game:GetService("CoreGui"), playerGui }) do
+		if folder and folder.GetChildren then
+			pcall(function()
+				for _, c in ipairs(folder:GetChildren()) do
+					if (c.Name == "WindUI" or c.Name == "Rayfield" or c.Name == "FluentUI") and shouldKill(c) then
+						pcall(function()
+							c:Destroy()
+						end)
+					end
+				end
+			end)
+		end
+	end
+end
+
+-- Dipanggil tepat setelah window dibuat: tandai ScreenGui WindUI sebagai milik
+-- instance ini. Saat startup semua window lama sudah dihapus, jadi ScreenGui
+-- tanpa tanda pasti milik kita.
+function Hub.claimGui()
+	local root = uiContainer()
+	if not root or not root.GetChildren then
+		return
+	end
+	pcall(function()
+		for _, c in ipairs(root:GetChildren()) do
+			if (c.Name == "WindUI" or c.Name:sub(1, 7) == "WindUI/") and guiOwner(c) == nil then
+				pcall(function()
+					c:SetAttribute(GUI_OWNER, HUB_TOKEN)
+				end)
+			end
+		end
+	end)
+end
+
 function Hub.shutdown()
+	Hub.dead = true
 	for _, fn in ipairs(Hub.unload) do
 		pcall(fn)
 	end
@@ -61,36 +240,58 @@ function Hub.shutdown()
 		end)
 	end
 	table.clear(Hub.conns)
-end
-_G.__HumanHubShutdown = Hub.shutdown
-
--- WindUI menaruh ScreenGui-nya di gethui() dan sisa run lama tidak terhapus.
--- Seluruh pembersihan dibungkus pcall: kalau satu container aneh (gethui
--- mengembalikan nil / instance terkunci), reload tidak boleh ikut gagal.
-pcall(function()
-	local uiRoot = (gethui and gethui()) or game:GetService("CoreGui")
-	for _, c in ipairs(uiRoot:GetChildren()) do
-		if c.Name == "WindUI" or c.Name:sub(1, 7) == "WindUI/" then
+	for _, env in ipairs(hubGlobals()) do
+		if env.__HumanHub == Hub then
 			pcall(function()
-				c:Destroy()
+				env.__HumanHub = nil
+			end)
+		end
+		if env.__HumanHubShutdown == Hub.shutdown then
+			pcall(function()
+				env.__HumanHubShutdown = nil
 			end)
 		end
 	end
-end)
-local localGui = game:GetService("Players").LocalPlayer and game:GetService("Players").LocalPlayer:FindFirstChild("PlayerGui")
-for _, folder in ipairs({ game:GetService("CoreGui"), localGui }) do
-	if folder and folder.GetChildren then
+	destroyHubGui(true)
+end
+
+-- Bus dipakai run berikutnya untuk mematikan instance ini walau _G-nya
+-- terpisah. Bus sengaja tidak dihapus saat shutdown agar instance lain yang
+-- masih hidup tetap bisa menerima sinyal yang sama.
+do
+	local bus = findHubBus()
+	if not bus then
+		bus = Instance.new("BindableEvent")
+		bus.Name = "HumanHubBus"
+		local okParent = pcall(function()
+			bus.Parent = uiContainer()
+		end)
+		if not okParent or not bus.Parent then
+			bus = nil
+		end
+	end
+	if bus then
+		Hub.bus = bus
+		-- Atribut token lama (versi yang sempat memakainya) dibersihkan supaya
+		-- bus tidak menumpuk sampah; liveness tidak lagi bergantung padanya.
 		pcall(function()
-			for _, c in ipairs(folder:GetChildren()) do
-				if c.Name == "WindUI" or c.Name == "Rayfield" or c.Name == "FluentUI" then
-					pcall(function()
-						c:Destroy()
-					end)
-				end
+			for k in pairs(bus:GetAttributes()) do
+				bus:SetAttribute(k, nil)
 			end
 		end)
+		Hub.keep(bus.Event:Connect(function(msg)
+			if msg == "shutdown" then
+				-- Handler ini jalan di thread sinyal. filtergc di thread itu
+				-- menggantung, jadi tandai dulu supaya panicRelease dilewati.
+				Hub.remote = true
+				Hub.shutdown()
+			end
+		end))
 	end
 end
+Hub.publish()
+
+destroyHubGui()
 
 --// ===== 1. SERVICES & UTIL =====
 local Players = game:GetService("Players")
@@ -662,7 +863,12 @@ end
 
 Hub.onUnload(function()
 	Move.release()
-	Move.panicRelease()
+	if not Hub.remote then
+		-- filtergc hanya aman di thread executor. Saat shutdown lewat bus
+		-- (thread sinyal) lewati; run baru sudah memanggil panicRelease
+		-- sendiri saat startup.
+		Move.panicRelease()
+	end
 	if Touch.enabledByHub and Touch.gui then
 		pcall(function()
 			Touch.gui.Enabled = Touch.origEnabled == true
@@ -3782,6 +3988,9 @@ local function windUISource()
 	end)
 	local deadline = os.clock() + 20
 	while not done and os.clock() < deadline do
+		if Hub.dead then
+			return nil, "batal"
+		end
 		task.wait(0.1)
 	end
 	if got and type(writefile) == "function" then
@@ -3804,6 +4013,9 @@ local okLoad, WindUI = pcall(function()
 end)
 if not okLoad or not WindUI then
 	warn("[HumanHub] WindUI gagal dimuat, coba sekali lagi: " .. tostring(WindUI))
+	if Hub.dead then
+		return
+	end
 	-- WindUI kadang gagal sekali tepat setelah sisa GUI run lama dihapus
 	-- (cloneref nil). Percobaan kedua hampir selalu berhasil.
 	task.wait(0.2)
@@ -3834,6 +4046,12 @@ if not okLoad or not WindUI then
 	return
 end
 
+-- Instance ini bisa dimatikan reload lain saat masih menunggu/ memuat WindUI.
+-- Tanpa cek ini, startup zombie lanjut membuat window kedua.
+if Hub.dead then
+	return
+end
+
 -- Sisa run lama sudah dibersihkan di bagian atas file, sebelum WindUI dimuat.
 -- Jangan hapus ScreenGui "WindUI" setelah CreateWindow: WindUI memakai
 -- container itu untuk tab, dan menghapusnya membuat Tab() error
@@ -3847,6 +4065,7 @@ local Window = WindUI:CreateWindow({
 	ToggleKey = Enum.KeyCode.RightShift,
 })
 Hub.Window = Window
+Hub.claimGui()
 
 local pnbTab = Window:Tab({ Title = "Auto Farming", Icon = "blocks" })
 local guardTab = Window:Tab({ Title = "Penjaga World", Icon = "shield" })
