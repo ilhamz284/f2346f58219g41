@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.65",
+	version = "0.4.66",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -1932,7 +1932,7 @@ local function pnbTileId(W, layer, x, y)
 end
 
 local itemDBCache
-local itemWorldDBCache, itemWorldDBHit
+local itemWorldDBCache, itemWorldDBHit, itemWorldDBTriedAt
 local function itemDBCandidate(candidate)
 	return type(candidate) == "table" and type(candidate[2]) == "table"
 		and candidate[2].name == "Dirt" and type(candidate[3]) == "table"
@@ -1945,16 +1945,25 @@ end
 -- milik world (mis. Pepper Tree baseGrow 105233 -> grow 63140). Memakai nilai
 -- katalog membuat pohon yang sudah siap panen dianggap belum matang.
 local function findWorldItemDB()
-	if itemWorldDBHit ~= Bind.hit then
-		itemWorldDBCache, itemWorldDBHit = nil, Bind.hit
-		if type(Bind.hit) == "function" then
-			local ok, upvalues = pcall(debug.getupvalues, Bind.hit)
-			if ok and type(upvalues) == "table" then
-				for _, candidate in ipairs(upvalues) do
-					if itemDBCandidate(candidate) then
-						itemWorldDBCache = candidate
-						break
-					end
+	if itemWorldDBCache and itemWorldDBHit == Bind.hit then
+		return itemWorldDBCache
+	end
+	-- Tabel ItemDB world diisi game setelah script mulai berjalan. Kalau
+	-- pencarian pertama terjadi terlalu cepat, tabelnya masih kosong; dulu
+	-- hasil kosong itu di-cache selamanya sehingga hub memakai tabel katalog
+	-- (grow 105233) padahal world sudah memakai grow 63140.
+	local now = os.clock()
+	if itemWorldDBHit == Bind.hit and itemWorldDBTriedAt and now - itemWorldDBTriedAt < 1 then
+		return nil
+	end
+	itemWorldDBHit, itemWorldDBTriedAt, itemWorldDBCache = Bind.hit, now, nil
+	if type(Bind.hit) == "function" then
+		local ok, upvalues = pcall(debug.getupvalues, Bind.hit)
+		if ok and type(upvalues) == "table" then
+			for _, candidate in ipairs(upvalues) do
+				if itemDBCandidate(candidate) then
+					itemWorldDBCache = candidate
+					break
 				end
 			end
 		end
@@ -3612,6 +3621,14 @@ local function finishPNBDrain(inv)
 end
 
 local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
+	-- ItemDB world bisa baru terisi setelah factory mulai; pakai nilai grow
+	-- terbaru supaya pohon matang tidak dianggap belum siap.
+	local seedDef = selectedItemDefinition(seedId)
+	local seedGrow = type(seedDef) == "table" and tonumber(seedDef.grow) or nil
+	if seedGrow and seedGrow ~= Factory.seedGrow then
+		Factory.seedGrow = seedGrow
+		Factory.seedName = seedDef.name or Factory.seedName
+	end
 	local blocks = factoryCount(inv, Factory.baseId)
 	local seeds = factoryCount(inv, seedId)
 	local room = factoryRoom(inv, Factory.baseId)
