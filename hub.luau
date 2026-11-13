@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.61",
+	version = "0.4.62",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -3444,8 +3444,9 @@ local PNB_DRAIN_BATCH = 8
 
 -- `drain` = slot blok penuh. PNB dipakai untuk membuat ruang, jadi drop tiap
 -- blok jangan langsung diambil (200 -> 199 -> 200, tidak ada kemajuan).
--- Pecah beberapa blok dulu; drop pecahannya dibiarkan, lalu hanya drop LAMA
--- yang dijemput supaya blok di inventory benar-benar turun dulu.
+-- Kalau ada drop lama di lantai: habiskan DULU semua blok di inventory (drop
+-- pecahannya dibiarkan), baru jemput drop lama, lalu tanam/panen. Dengan
+-- begitu slot benar-benar kosong dan siklus tidak berulang tiap 8 blok.
 local function beginPNB(W, blocks, drain)
 	Factory.phase = "pnb"
 	Factory.pnbLowWater = 0
@@ -3462,15 +3463,15 @@ local function beginPNB(W, blocks, drain)
 				need += math.max(1, math.floor(tonumber(d.n) or 1))
 			end
 		end
-		-- Pecah cukup banyak supaya seluruh drop lama muat sekaligus; kalau
-		-- drop lama sedikit, tetap pakai batch minimum agar tidak kembali ke
-		-- pola 1 blok -> 1 ambil.
-		local target = math.max(PNB_DRAIN_BATCH, need)
-		target = math.min(target, math.max(1, math.floor(tonumber(blocks) or 1)))
+		local total = math.max(1, math.floor(tonumber(blocks) or 1))
+		-- Ada drop lama: pecah semua blok sampai habis. Tanpa drop lama
+		-- (mis. hanya butuh ruang panen), cukup batch kecil agar tidak
+		-- menumpuk ratusan drop di lantai.
+		local target = need > 0 and total or math.min(total, PNB_DRAIN_BATCH)
 		Factory.pnbOldDrops = old
 		Factory.pnbDrainTarget = target
 		setFactoryStatus(need > 0
-			and string.format("Factory: blok %s/200; pecah %d blok dulu, baru ambil %d drop lama",
+			and string.format("Factory: blok %s/200; pecah semua %d blok dulu, baru ambil %d drop lama",
 				tostring(blocks or 0), target, need)
 			or string.format("Factory: blok %s/200; pecah %d blok dulu untuk ruang",
 				tostring(blocks or 0), target))
@@ -3709,6 +3710,12 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 				end
 				return 2
 			elseif reason == "blocks" then
+				if Factory.pnbDraining then
+					-- Blok sudah habis di tengah drain: jangan lewatkan drop
+					-- lama, selesaikan drain (jemput drop lama) dulu.
+					finishPNBDrain(inv)
+					return 0.2
+				end
 				Factory.pnbDraining, Factory.pnbDrainCount, Factory.pnbDrainTarget, Factory.pnbOldDrops, Factory.dropFilter = false, 0, nil, nil, nil
 				Factory.phase = "plant"
 				setFactoryStatus("Factory: blok PNB habis; lanjut tanam")
