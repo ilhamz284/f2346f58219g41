@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.56",
+	version = "0.4.57",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -2432,25 +2432,79 @@ local function pathStep(cx, cy, step, aliveFn)
 				center = cx + 0.88
 			end
 		end
-		local tol = platformAbove and 0.32 or 0.12
+		-- Lompat tegak lewat platform hanya berhasil kalau SELURUH badan ada
+		-- di kolom platform. Kalau badan masih menyentuh kolom sebelah, kepala
+		-- membentur lantai/dirt di atas kolom itu dan lompatan tidak jadi.
+		local tol = platformAbove and 0.10 or 0.12
+
+		local function inColumn(s)
+			if not s then
+				return false
+			end
+			if platformAbove and math.floor(s.x) ~= step.x then
+				return false
+			end
+			return math.abs(s.x - center) <= tol
+		end
+
+		-- Koreksi halus: pulsa arah sangat pendek sampai pusat badan tepat di
+		-- tengah tile platform. Dipakai setelah walkTo maupun saat walkTo
+		-- berhenti terlalu jauh dari tengah.
+		local function fineAlign()
+			local s = Bind.state()
+			if not s or not s.grounded then
+				return nil
+			end
+			for _ = 1, 16 do
+				if inColumn(s) then
+					Move.release()
+					return s
+				end
+				local dx = center - s.x
+				local key = dx > 0 and KeyRight or KeyLeft
+				Move.hold(key)
+				local untilT = os.clock() + math.clamp(math.abs(dx) / 6, 0.02, 0.10)
+				while os.clock() < untilT do
+					local n = Bind.state()
+					if not n then
+						break
+					end
+					if inColumn(n) then
+						break
+					end
+					s = n
+					task.wait(0.008)
+				end
+				Move.release()
+				s = Bind.state()
+				if not s or not s.grounded then
+					return nil
+				end
+				task.wait(0.02)
+			end
+			return inColumn(s) and s or nil
+		end
 
 		local function align()
 			local s = Bind.state()
 			if not s or not s.grounded then
 				return nil
 			end
-			if math.abs(s.x - center) > tol then
+			if not inColumn(s) then
 				-- walkTo menangani overshoot key-up jauh lebih baik daripada
 				-- menekan kiri/kanan bergantian di sini.
 				Move.walkTo(center, {
 					timeout = platformAbove and 1.8 or 1.0,
-					tol = tol * 0.6,
+					tol = tol * 0.5,
 					recover = false,
 				})
 				s = Bind.state()
+				if not inColumn(s) then
+					s = fineAlign()
+				end
 			end
 			Move.release()
-			if not s or not s.grounded or math.abs(s.x - center) > tol + 0.15 then
+			if not inColumn(s) then
 				return nil
 			end
 			return s
