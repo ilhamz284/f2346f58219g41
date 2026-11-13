@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.66",
+	version = "0.4.67",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -569,6 +569,9 @@ local Move = {
 	gen = 0,
 	lastJumpAt = 0,
 	recovering = false,
+	vimProbed = false,
+	vimDead = false,
+	probing = false,
 	cfg = {
 		reactMin = 0.07,
 		reactMax = 0.18,
@@ -723,7 +726,7 @@ function Move.preferTouch()
 		return false
 	end
 	if not Touch.ready then
-		if not Move.forceTouch then
+		if not Move.forceTouch and not Move.vimDead then
 			local uis = game:GetService("UserInputService")
 			if not uis.TouchEnabled or uis.KeyboardEnabled then
 				return false
@@ -741,6 +744,61 @@ function Move.preferTouch()
 	Move.backend = "touch"
 	log("mode gerak: sentuh (MobileGui)")
 	return true
+end
+
+-- VIM bisa terlihat aktif (KeyboardEnabled = true) tetapi SendKeyEvent tidak
+-- sampai ke game, sehingga tombol arah ditekan tanpa karakter bergerak sama
+-- sekali (terjadi di client Windows lewat executor). Uji sekali di awal
+-- gerak: kalau 0,4 detik menekan arah tidak memindahkan karakter, pindah
+-- permanen ke input sentuh MobileGui walau keyboard terdeteksi.
+function Move.ensureBackend()
+	if Move.backend == "touch" or Move.noTouch then
+		return Move.backend == "touch"
+	end
+	if Move.vimProbed or Move.probing then
+		return false
+	end
+	local s0 = Bind.state()
+	if not s0 or not s0.grounded then
+		return false -- coba lagi setelah karakter mendarat
+	end
+	local myGen = Move.gen
+	Move.probing, Move.vimProbed = true, true
+	local moved = false
+	for _, key in ipairs({ KeyRight, KeyLeft }) do
+		local before = Bind.state()
+		if not before or Move.gen ~= myGen then
+			break
+		end
+		Move.vimHeld = key
+		vkey(true, key)
+		local deadline = os.clock() + 0.4
+		while os.clock() < deadline and Move.gen == myGen do
+			local s = Bind.state()
+			if s and math.abs(s.x - before.x) >= 0.08 then
+				moved = true
+				break
+			end
+			task.wait(0.03)
+		end
+		vkey(false, key)
+		Move.vimHeld = nil
+		if moved then
+			break
+		end
+	end
+	Move.probing = false
+	if moved then
+		return false
+	end
+	Move.vimDead = true
+	if Move.preferTouch() then
+		log("VIM tidak menggerakkan karakter; pindah ke input sentuh")
+		return true
+	end
+	Move.vimDead = false
+	log("VIM tidak menggerakkan karakter dan input sentuh tidak tersedia")
+	return false
 end
 
 function Move.release()
@@ -975,12 +1033,17 @@ Move.panicRelease()
 -- Jalan ke target X. Return true kalau berhenti di dekat target.
 function Move.walkTo(targetX, opts)
 	opts = opts or {}
-	Move.preferTouch()
+	-- Pastikan backend benar-benar menggerakkan karakter sebelum menghabiskan
+	-- timeout 25 detik menekan tombol yang tidak sampai ke game.
+	if not Move.ensureBackend() then
+		Move.preferTouch()
+	end
 	local tol = opts.tol or 0.14
 	local deadline = os.clock() + (opts.timeout or 25)
 	local myGen = Move.gen
 	local lastX, lastT = nil, os.clock()
 	local recovered = false
+	local retried = false
 
 	if not Move.held then
 		Move.idle(Move.cfg.reactMin, Move.cfg.reactMax)
@@ -1028,7 +1091,23 @@ function Move.walkTo(targetX, opts)
 					recovered = true
 					lastX, lastT = nil, os.clock()
 					deadline = math.max(deadline, os.clock() + 2.0)
+				elseif not retried then
+					-- Tekanan tombol bisa hilang tanpa perpindahan (VIM, fokus
+					-- jendela, atau MobileGui baru dinyalakan). Pastikan backend
+					-- dan tekan ulang sekali sebelum langkah dinyatakan gagal.
+					retried = true
+					if not Move.ensureBackend() then
+						Move.preferTouch()
+					end
+					lastX, lastT = s3.x, os.clock()
+					Move.hold(key)
+					deadline = math.max(deadline, os.clock() + 2.0)
 				else
+					if Move.backend == "vim" and not Move.vimDead then
+						-- VIM bisa mati di tengah sesi; izinkan percobaan
+						-- berikutnya menguji ulang lalu pindah ke sentuh.
+						Move.vimProbed = false
+					end
 					return false
 				end
 			end
@@ -2934,6 +3013,9 @@ function Path.moveTo(tx, ty, aliveFn)
 	aliveFn = aliveFn or function()
 		return true
 	end
+	-- Cek backend sekali di awal: VIM yang mati membuat semua langkah
+	-- horizontal gagal tanpa perpindahan.
+	Move.ensureBackend()
 	local goalKey = keyOf(tx, ty)
 	local path, idx, expect = nil, 1, nil
 	local failedTransitions = 0
@@ -3695,7 +3777,10 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 					-- Karakter tidak sampai ke pohon. Ini bukan gagal panen:
 					-- pohonnya tidak pernah dipukul.
 					reasonText = "tidak bisa menjangkau pohon"
-					blockFor = sameFloor and 4 or 5
+					-- Gagal berulang di pohon yang sama berarti jalurnya memang
+					-- buntu; jangan coba lagi tiap 4 detik sementara pohon lain
+					-- menunggu. Blokir makin lama setiap kegagalan.
+					blockFor = math.min(60, (sameFloor and 8 or 12) * fails)
 				elseif reason == "gone" then
 					reasonText = "pohon sudah tidak matang"
 					blockFor = 20
@@ -4945,7 +5030,10 @@ moveSec:Slider({
 })
 
 local function moveModeName()
-	return Move.backend == "touch" and "sentuh" or "VIM"
+	if Move.backend == "touch" then
+		return Move.vimDead and "sentuh (VIM mati otomatis)" or "sentuh"
+	end
+	return "VIM"
 end
 
 local moveStatus = moveSec:Paragraph({ Title = "Status gerak", Desc = "belum dicek" })
@@ -4983,6 +5071,7 @@ moveSec:Toggle({
 		Move.noTouch = not on
 		Move.release()
 		Move.backend = "vim"
+		Move.vimProbed, Move.vimDead = false, false
 		if on then
 			if Move.preferTouch() then
 				WindUI:Notify({ Title = "Gerak", Content = "Input sentuh MobileGui aktif.", Duration = 3 })
