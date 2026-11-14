@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.74",
+	version = "0.4.75",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -546,15 +546,22 @@ local function questRunCheck()
 	Quest.busy = true
 	local ok, info, err = pcall(questCheck)
 	Quest.busy = false
+	-- Kalau Auto Factory sudah dimatikan saat cek ini selesai, biarkan status
+	-- "menunggu Auto Factory" yang dipasang Factory.stop.
+	local function setStatus(text)
+		if Quest.enabled then
+			Quest.status = text
+		end
+	end
 	if not ok then
-		Quest.status = "gagal cek: " .. tostring(info)
+		setStatus("gagal cek: " .. tostring(info))
 		return nil, tostring(info)
 	end
 	if not info then
-		Quest.status = "gagal: " .. tostring(err)
+		setStatus("gagal: " .. tostring(err))
 		return nil, tostring(err)
 	end
-	Quest.status = questStatusText(info)
+	setStatus(questStatusText(info))
 	Quest.lastTick = os.clock()
 	if #info.claimed > 0 then
 		log("quest diklaim: " .. table.concat(info.claimed, ", "))
@@ -580,6 +587,12 @@ function Quest.setEnabled(on)
 		return
 	end
 	if Quest.thread then
+		-- Thread lama bisa sedang menunggu jeda 3 jam. Bangunkan supaya Auto
+		-- Factory yang dinyalakan lagi langsung melakukan cek pertama.
+		Quest.poke = true
+		if not Quest.busy then
+			Quest.status = "memeriksa daftar quest..."
+		end
 		return
 	end
 	Quest.status = "memeriksa daftar quest..."
@@ -596,6 +609,10 @@ function Quest.setEnabled(on)
 			local waited = 0
 			while Quest.enabled and waited < Quest.every and not Hub.dead do
 				task.wait(2)
+				if Quest.poke then
+					Quest.poke = false
+					break
+				end
 				waited += 2
 			end
 		end
