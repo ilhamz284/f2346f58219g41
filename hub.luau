@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.70",
+	version = "0.4.71",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -403,12 +403,15 @@ startAntiAFK()
 -- have >= need dan belum claimed yang dikirim, supaya tidak ada spam ke server.
 local Quest = {
 	enabled = false,
-	every = 12,
+	-- Quest harian tidak berubah cepat; klaim tiap 3 jam sudah cukup dan
+	-- menghindari permintaan ke server tiap beberapa detik.
+	every = 3 * 60 * 60,
 	claims = 0,
 	status = "idle",
 	lastTick = 0,
 	net = nil,
 	thread = nil,
+	busy = false,
 	lastTry = {},
 }
 
@@ -535,6 +538,40 @@ local function questStatusText(info)
 	return table.concat(parts, " | ")
 end
 
+-- Satu putaran cek + klaim. Dipakai loop berkala dan tombol "Cek sekarang".
+local function questRunCheck()
+	if Quest.busy then
+		return nil, "sedang memeriksa"
+	end
+	Quest.busy = true
+	local ok, info, err = pcall(questCheck)
+	Quest.busy = false
+	if not ok then
+		Quest.status = "gagal cek: " .. tostring(info)
+		return nil, tostring(info)
+	end
+	if not info then
+		Quest.status = "gagal: " .. tostring(err)
+		return nil, tostring(err)
+	end
+	Quest.status = questStatusText(info)
+	Quest.lastTick = os.clock()
+	if #info.claimed > 0 then
+		log("quest diklaim: " .. table.concat(info.claimed, ", "))
+	end
+	return info
+end
+
+function Quest.forceCheck()
+	if Quest.busy then
+		return false
+	end
+	task.spawn(function()
+		questRunCheck()
+	end)
+	return true
+end
+
 function Quest.setEnabled(on)
 	Quest.enabled = on and true or false
 	if not Quest.enabled then
@@ -550,24 +587,15 @@ function Quest.setEnabled(on)
 	end
 	local hub = Hub
 	Quest.thread = task.spawn(function()
+		-- Cek pertama langsung, lalu tiap Quest.every (3 jam) supaya server
+		-- tidak dibebani permintaan terus-menerus.
 		task.wait(1)
 		while Quest.enabled and not Hub.dead and _G.__HumanHub == hub do
-			local ok, info, err = pcall(questCheck)
-			if not ok then
-				Quest.status = "gagal cek: " .. tostring(info)
-			elseif info then
-				Quest.status = questStatusText(info)
-				if #info.claimed > 0 then
-					log("quest diklaim: " .. table.concat(info.claimed, ", "))
-				end
-			else
-				Quest.status = "gagal: " .. tostring(err)
-			end
-			Quest.lastTick = os.clock()
+			questRunCheck()
 			local waited = 0
 			while Quest.enabled and waited < Quest.every and not Hub.dead do
-				task.wait(0.5)
-				waited += 0.5
+				task.wait(2)
+				waited += 2
 			end
 		end
 		Quest.status = "dimatikan"
@@ -5038,15 +5066,25 @@ local questToggle, questStatusPara
 
 questSec:Paragraph({
 	Title = "Cara kerja",
-	Desc = "Memeriksa daftar quest harian tiap 12 detik dan mengklaim yang syaratnya sudah terpenuhi (have >= need). Aman berjalan bersamaan dengan Auto Factory.",
+	Desc = "Memeriksa daftar quest harian tiap 3 jam (cek pertama langsung saat toggle dinyalakan) lalu mengklaim yang syaratnya sudah terpenuhi (have >= need). Aman berjalan bersamaan dengan Auto Factory.",
 })
 
 questToggle = questSec:Toggle({
 	Title = "Auto Claim Daily Quest",
-	Desc = "Klaim otomatis quest harian yang sudah selesai, termasuk reward gems/XP.",
+	Desc = "Klaim otomatis quest harian yang sudah selesai, termasuk reward gems/XP. Hanya 8 permintaan ke server per hari.",
 	Value = false,
 	Callback = function(on)
 		Quest.setEnabled(on)
+	end,
+})
+
+questSec:Button({
+	Title = "Cek quest sekarang",
+	Desc = "Satu kali periksa + klaim, tanpa menunggu jadwal 3 jam.",
+	Callback = function()
+		if not Quest.forceCheck() then
+			WindUI:Notify({ Title = "Quest", Content = "Sedang memeriksa, tunggu sebentar.", Duration = 3 })
+		end
 	end,
 })
 
