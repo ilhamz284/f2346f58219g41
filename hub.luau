@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.85",
+	version = "0.4.86",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -4825,6 +4825,397 @@ if Hub.dead then
 	return
 end
 
+--// ===== 7b. STATUS KE DISCORD =====
+-- Modul ini hanya MEMBACA keadaan hub lalu mengirimnya ke webhook Discord.
+-- Alur factory tidak diubah. Satu akun = satu pesan yang diedit ulang tiap
+-- interval, supaya tidak kena rate limit ketika bot lebih dari satu.
+local Discord = {
+	enabled = false,
+	url = "",
+	interval = 60,
+	mention = "",
+	messageId = nil,
+	failures = 0,
+	lastPush = 0,
+	status = "belum aktif",
+	file = "HumanHubDiscord.txt",
+	lastEventKey = nil,
+	lastEventAt = 0,
+	startedAt = os.clock(),
+	pushing = false,
+}
+
+local function discordRequester()
+	local g = type(getgenv) == "function" and getgenv() or _G
+	if type(g) ~= "table" then
+		g = _G
+	end
+	local syn = g.syn
+	local fn = (type(syn) == "table" and syn.request)
+		or g.http_request
+		or (type(g.http) == "table" and g.http.request)
+		or g.request
+	if type(fn) == "function" then
+		return fn
+	end
+	return nil
+end
+
+function Discord.available()
+	return discordRequester() ~= nil
+end
+
+local function discordFileRead(name)
+	if type(readfile) ~= "function" then
+		return nil
+	end
+	local ok, data = pcall(readfile, name)
+	if ok and type(data) == "string" then
+		return data
+	end
+	return nil
+end
+
+local function discordFileWrite(name, data)
+	if type(writefile) ~= "function" then
+		return false
+	end
+	return (pcall(writefile, name, data))
+end
+
+local function discordSaveConfig()
+	discordFileWrite(Discord.file, table.concat({
+		"url=" .. tostring(Discord.url or ""),
+		"mention=" .. tostring(Discord.mention or ""),
+		"interval=" .. tostring(math.floor(tonumber(Discord.interval) or 25)),
+		"on=" .. (Discord.enabled and "1" or "0"),
+		"msgid=" .. tostring(Discord.messageId or ""),
+	}, "\n"))
+end
+
+local function discordLoadConfig()
+	local text = discordFileRead(Discord.file)
+	if not text then
+		return
+	end
+	for line in text:gmatch("[^\r\n]+") do
+		local key, value = line:match("^(%w+)=(.*)$")
+		if key == "url" then
+			Discord.url = value
+		elseif key == "mention" then
+			Discord.mention = value
+		elseif key == "interval" then
+			Discord.interval = math.clamp(tonumber(value) or 60, 30, 900)
+		elseif key == "on" then
+			Discord.enabled = value == "1"
+		elseif key == "msgid" then
+			Discord.messageId = (value ~= "") and value or nil
+		end
+	end
+end
+
+-- Encoder JSON kecil: cukup untuk payload webhook (string, angka, boolean,
+-- array, objek). Tidak butuh library luar.
+local function jsonEncode(value)
+	local out = {}
+	local function esc(s)
+		s = tostring(s)
+		return (s:gsub('[%z\1-\31\\"]', function(c)
+			if c == '"' then return '\\"' end
+			if c == "\\" then return "\\\\" end
+			if c == "\n" then return "\\n" end
+			if c == "\r" then return "\\r" end
+			if c == "\t" then return "\\t" end
+			return string.format("\\u%04x", c:byte())
+		end))
+	end
+	local function enc(v)
+		local t = type(v)
+		if t == "nil" then
+			out[#out + 1] = "null"
+		elseif t == "boolean" then
+			out[#out + 1] = v and "true" or "false"
+		elseif t == "number" then
+			if v ~= v or v == math.huge or v == -math.huge then
+				out[#out + 1] = "0"
+			else
+				out[#out + 1] = string.format("%.14g", v)
+			end
+		elseif t == "string" then
+			out[#out + 1] = '"' .. esc(v) .. '"'
+		elseif t == "table" then
+			local count, isArray = 0, true
+			for k in pairs(v) do
+				count += 1
+				if type(k) ~= "number" or k < 1 or k % 1 ~= 0 then
+					isArray = false
+					break
+				end
+			end
+			if count == 0 then
+				out[#out + 1] = "{}"
+			elseif isArray then
+				out[#out + 1] = "["
+				for i = 1, count do
+					if i > 1 then out[#out + 1] = "," end
+					enc(v[i])
+				end
+				out[#out + 1] = "]"
+			else
+				out[#out + 1] = "{"
+				local first = true
+				for k, val in pairs(v) do
+					if not first then out[#out + 1] = "," end
+					first = false
+					out[#out + 1] = '"' .. esc(tostring(k)) .. '":'
+					enc(val)
+				end
+				out[#out + 1] = "}"
+			end
+		end
+	end
+	enc(value)
+	return table.concat(out)
+end
+
+local function discordCall(method, url, body)
+	local fn = discordRequester()
+	if not fn then
+		return nil, "executor tidak punya request/http_request (POST)"
+	end
+	local opts = { Url = url, Method = method, Headers = { ["Content-Type"] = "application/json" } }
+	if body then
+		opts.Body = body
+	end
+	local ok, res = pcall(fn, opts)
+	if not ok then
+		return nil, tostring(res)
+	end
+	if type(res) ~= "table" then
+		return nil, "balasan executor tidak valid"
+	end
+	return {
+		code = tonumber(res.StatusCode or res.status or res.Status) or 0,
+		body = tostring(res.Body or res.body or ""),
+	}
+end
+
+local function discordCount(itemId)
+	local inv = Bind.inv
+	if not inv or type(inv.count) ~= "function" or not itemId then
+		return nil
+	end
+	local ok, value = pcall(inv.count, inv, itemId)
+	return ok and tonumber(value) or nil
+end
+
+local function discordSnapshot()
+	local state = Bind.state()
+	local running = Factory.running == true
+	local status = tostring(Factory.status or "-")
+	local floorY = state and math.floor(state.y - 0.0001) or nil
+	local player = Players.LocalPlayer
+	local name = "bot"
+	if player then
+		name = string.format("%s (@%s)", tostring(player.DisplayName), tostring(player.Name))
+	end
+	local seedCount = discordCount(Factory.seedId)
+	local cropCount = discordCount(Factory.baseId)
+	local lower = status:lower()
+	local color = 3066993
+	if not running then
+		color = 15158332
+	elseif lower:find("penuh", 1, true) or lower:find("menunggu", 1, true) then
+		color = 15105570
+	end
+	local okFps, fps = pcall(function()
+		return workspace:GetRealPhysicsFPS()
+	end)
+	local fields = {
+		{ name = "Status", value = status:sub(1, 1000), inline = false },
+		{ name = "Fase", value = tostring(Factory.phase or "-"), inline = true },
+		{ name = "Lantai", value = floorY and tostring(floorY) or "-", inline = true },
+		{ name = "World", value = Bind.W and tostring(Bind.W.name) or "-", inline = true },
+		{ name = "Panen", value = tostring(Factory.harvested or 0), inline = true },
+		{ name = "Tanam", value = tostring(Factory.planted or 0), inline = true },
+		{ name = "PNB", value = tostring(Factory.pnb or 0), inline = true },
+		{
+			name = "Seed " .. tostring(Factory.seedName or Factory.seedId or "-"),
+			value = seedCount and (seedCount .. "/200") or "-",
+			inline = true,
+		},
+		{
+			name = "Hasil panen",
+			value = cropCount and (cropCount .. "/200") or "-",
+			inline = true,
+		},
+		{
+			name = "Quest",
+			value = tostring((Quest and Quest.status) or "-"):sub(1, 300),
+			inline = true,
+		},
+		{
+			name = "Uptime",
+			value = string.format("%d menit", math.floor((os.clock() - Discord.startedAt) / 60)),
+			inline = true,
+		},
+		{
+			name = "FPS",
+			value = okFps and tostring(math.floor((tonumber(fps) or 0) + 0.5)) or "-",
+			inline = true,
+		},
+	}
+	return { name = name, status = status, running = running, color = color, fields = fields, floorY = floorY }
+end
+
+local function discordPayload()
+	local snap = discordSnapshot()
+	local payload = {
+		username = "HumanHub • " .. tostring(Players.LocalPlayer and Players.LocalPlayer.Name or "bot"),
+		embeds = {
+			{
+				title = string.format("%s • %s Y=%s", snap.name,
+					tostring(Bind.W and Bind.W.name or "-"), tostring(snap.floorY or "-")),
+				description = "Diperbarui " .. os.date("!%H:%M:%SZ") .. " UTC",
+				color = snap.color,
+				fields = snap.fields,
+				footer = { text = "HumanHub v" .. tostring(Hub.version) },
+			},
+		},
+	}
+	return jsonEncode(payload), snap
+end
+
+local function discordSendEvent(text)
+	local url = (Discord.url or ""):gsub("%s+", "")
+	if url == "" then
+		return
+	end
+	local content = text
+	if Discord.mention ~= "" then
+		content = Discord.mention .. " " .. content
+	end
+	task.spawn(function()
+		discordCall("POST", url .. "?wait=false", jsonEncode({ content = content:sub(1, 1900) }))
+	end)
+end
+
+local function discordEventLabel(status, running)
+	local lower = status:lower()
+	if not running then
+		return "stop", "Bot berhenti"
+	end
+	if lower:find("penuh", 1, true) then
+		return "full", "Inventory penuh"
+	end
+	if lower:find("tidak bisa menjangkau", 1, true) then
+		return "path", "Pohon tidak terjangkau"
+	end
+	if lower:find("error", 1, true) then
+		return "error", "Ada error"
+	end
+	return nil
+end
+
+local function discordNotify(snap)
+	local key, label = discordEventLabel(snap.status, snap.running)
+	if not key then
+		return
+	end
+	local now = os.clock()
+	-- Satu jenis notifikasi maksimal sekali per 10 menit supaya tidak spam.
+	if Discord.lastEventKey == key and now - Discord.lastEventAt < 600 then
+		return
+	end
+	Discord.lastEventKey, Discord.lastEventAt = key, now
+	discordSendEvent(string.format("**%s** — %s: %s", snap.name, label, snap.status:sub(1, 300)))
+end
+
+function Discord.push()
+	if Discord.pushing then
+		return false, "masih mengirim"
+	end
+	if not Discord.enabled then
+		return false, "nonaktif"
+	end
+	local url = (Discord.url or ""):gsub("%s+", "")
+	if not (url:match("^https://discord%.com/api/webhooks/") or url:match("^https://discordapp%.com/api/webhooks/")) then
+		Discord.status = "URL webhook belum benar"
+		return false, Discord.status
+	end
+	Discord.pushing = true
+	local body, snap = discordPayload()
+	local res, err
+	if Discord.messageId then
+		res, err = discordCall("PATCH", url .. "/messages/" .. Discord.messageId, body)
+		if res and res.code == 404 then
+			-- Pesan lama sudah dihapus: buat pesan baru.
+			Discord.messageId = nil
+			res, err = discordCall("POST", url .. "?wait=true", body)
+		end
+	else
+		res, err = discordCall("POST", url .. "?wait=true", body)
+	end
+	Discord.pushing = false
+	if not res then
+		Discord.failures += 1
+		Discord.status = "gagal kirim: " .. tostring(err)
+		if Discord.failures >= 5 then
+			Discord.enabled = false
+			Discord.status = "dimatikan otomatis setelah 5x gagal: " .. tostring(err)
+			discordSaveConfig()
+		end
+		return false, Discord.status
+	end
+	if res.code == 429 then
+		local retry = tonumber(res.body:match('"retry_after"%s*:%s*([%d%.]+)')) or 5
+		Discord.interval = math.clamp(math.ceil(retry) + 5, 30, 900)
+		Discord.status = string.format("kena rate limit; interval jadi %d dtk", Discord.interval)
+		discordSaveConfig()
+		return false, Discord.status
+	end
+	if res.code >= 400 then
+		Discord.failures += 1
+		Discord.status = string.format("Discord menolak (%d)", res.code)
+		if res.code == 400 or res.code == 401 or res.code == 403 then
+			Discord.enabled = false
+			Discord.status = string.format("webhook ditolak (%d); periksa URL", res.code)
+			discordSaveConfig()
+		end
+		return false, Discord.status
+	end
+	if not Discord.messageId then
+		local id = res.body:match('"id"%s*:%s*"(%d+)"')
+		if id then
+			Discord.messageId = id
+			discordSaveConfig()
+		end
+	end
+	Discord.failures = 0
+	Discord.lastPush = os.clock()
+	Discord.status = "terkirim " .. os.date("!%H:%M:%SZ")
+	discordNotify(snap)
+	return true, Discord.status
+end
+
+function Discord.start()
+	discordLoadConfig()
+	Discord.status = Discord.available()
+		and (Discord.enabled and "aktif" or "nonaktif")
+		or "executor tidak mendukung POST (request)"
+	task.spawn(function()
+		while not Hub.dead do
+			if Discord.enabled then
+				local ok, err = pcall(Discord.push)
+				if not ok then
+					Discord.status = "error: " .. tostring(err)
+				end
+			end
+			task.wait(math.clamp(tonumber(Discord.interval) or 60, 30, 900))
+		end
+	end)
+end
+
 -- Sisa run lama sudah dibersihkan di bagian atas file, sebelum WindUI dimuat.
 -- Jangan hapus ScreenGui "WindUI" setelah CreateWindow: WindUI memakai
 -- container itu untuk tab, dan menghapusnya membuat Tab() error
@@ -5833,7 +6224,189 @@ infoTab:Section({ Title = "Catatan", Opened = true }):Paragraph({
 	Desc = "Tile lava (id 4), Bedrock, pintu, dan lock dilewati - tidak digali.",
 })
 
+-- ---- Status ke Discord ----
+local discordSec = infoTab:Section({ Title = "Status ke Discord", Opened = false })
+local discordShown = nil
+local discordStatusPara = discordSec:Paragraph({ Title = "Status Discord", Desc = Discord.status })
+local function discordSay(text)
+	text = tostring(text or "-")
+	if text == discordShown then
+		return
+	end
+	discordShown = text
+	if discordStatusPara then
+		if discordStatusPara.SetDesc then
+			pcall(discordStatusPara.SetDesc, discordStatusPara, text)
+		elseif discordStatusPara.SetTitle then
+			pcall(discordStatusPara.SetTitle, discordStatusPara, "Status Discord: " .. text)
+		end
+	end
+end
+
+local function readBoxByPlaceholder(placeholder, fallback)
+	-- WindUI menaruh window di gethui()/CoreGui, bukan PlayerGui.
+	local roots = {}
+	local okHui, hui = pcall(function()
+		return gethui and gethui() or nil
+	end)
+	if okHui and hui then
+		roots[#roots + 1] = hui
+	end
+	local okCore, core = pcall(function()
+		return game:GetService("CoreGui")
+	end)
+	if okCore and core then
+		roots[#roots + 1] = core
+	end
+	local pg = Players.LocalPlayer and Players.LocalPlayer:FindFirstChild("PlayerGui")
+	if pg then
+		roots[#roots + 1] = pg
+	end
+	for _, root in ipairs(roots) do
+		local ok, found = pcall(function()
+			for _, child in ipairs(root:GetDescendants()) do
+				if child:IsA("TextBox") and child.PlaceholderText == placeholder then
+					return child.Text
+				end
+			end
+			return nil
+		end)
+		if ok and found then
+			return found
+		end
+	end
+	return fallback
+end
+
+local discordUrlTyped = Discord.url or ""
+local discordMentionTyped = Discord.mention or ""
+
+discordSec:Paragraph({
+	Title = "Cara pakai",
+	Desc = "Satu akun menulis satu pesan lalu pesan itu diedit ulang tiap interval (bawaan 60 detik). URL disimpan di file lokal executor, tidak ikut repo.",
+})
+
+local discordUrlInput = discordSec:Input({
+	Title = "URL webhook",
+	Desc = "Tempel URL webhook Discord kanal Anda.",
+	Placeholder = "URL webhook Discord...",
+	Value = Discord.url or "",
+	Type = "Input",
+	Callback = function(value)
+		discordUrlTyped = tostring(value or "")
+	end,
+})
+
+local discordIntervalInput = discordSec:Input({
+	Title = "Interval (detik)",
+	Desc = "Bawaan 60 detik. Minimal 30, maksimal 900.",
+	Placeholder = "60",
+	Value = tostring(Discord.interval or 60),
+	Type = "Input",
+	Callback = function(value)
+		local n = tonumber(tostring(value or ""):match("%d+"))
+		if n then
+			Discord.interval = math.clamp(n, 30, 900)
+		end
+	end,
+})
+
+local discordMentionInput = discordSec:Input({
+	Title = "Mention notifikasi",
+	Desc = "Opsional untuk notifikasi penting. Contoh: <@123456789>. Kosongkan bila tidak perlu.",
+	Placeholder = "Mention (opsional)...",
+	Value = Discord.mention or "",
+	Type = "Input",
+	Callback = function(value)
+		discordMentionTyped = tostring(value or "")
+	end,
+})
+
+local function discordField(placeholder, element, typed)
+	local box = readBoxByPlaceholder(placeholder, nil)
+	if type(box) == "string" and box ~= "" then
+		return box
+	end
+	if element and type(element.Value) == "string" and element.Value ~= "" then
+		return element.Value
+	end
+	return typed or ""
+end
+
+local function discordApplyInputs()
+	Discord.url = tostring(discordField("URL webhook Discord...", discordUrlInput, discordUrlTyped) or "")
+		:gsub("^%s+", ""):gsub("%s+$", "")
+	local mention = discordField("Mention (opsional)...", discordMentionInput, discordMentionTyped)
+	Discord.mention = tostring(mention or ""):gsub("^%s+", ""):gsub("%s+$", "")
+	local raw = discordField("60", discordIntervalInput, tostring(Discord.interval or 60))
+	local n = tonumber(tostring(raw or ""):match("%d+"))
+	Discord.interval = math.clamp(n or 60, 30, 900)
+	discordSaveConfig()
+end
+Discord.applyInputs = discordApplyInputs
+
+discordSec:Toggle({
+	Title = "Kirim status otomatis",
+	Desc = "Saat aktif, pesan Discord diperbarui tiap interval.",
+	Value = Discord.enabled == true,
+	Callback = function(value)
+		discordApplyInputs()
+		Discord.enabled = value == true
+		if Discord.enabled then
+			Discord.failures = 0
+			if not Discord.available() then
+				Discord.enabled = false
+				discordSay("executor ini tidak punya request/http_request (POST)")
+			elseif Discord.url == "" then
+				Discord.enabled = false
+				discordSay("isi URL webhook dulu")
+			else
+				discordSay("aktif; kirim pertama...")
+				task.spawn(function()
+					local _, msg = pcall(Discord.push)
+					discordSay(tostring(msg))
+				end)
+			end
+		else
+			discordSay("nonaktif")
+		end
+		discordSaveConfig()
+	end,
+})
+
+discordSec:Button({
+	Title = "Tes kirim sekarang",
+	Desc = "Kirim/perbarui pesan sekali tanpa mengubah pengaturan.",
+	Callback = function()
+		discordApplyInputs()
+		if not Discord.available() then
+			discordSay("executor ini tidak punya request/http_request (POST)")
+			return
+		end
+		if Discord.url == "" then
+			discordSay("isi URL webhook dulu")
+			return
+		end
+		discordSay("mengirim...")
+		task.spawn(function()
+			local wasEnabled = Discord.enabled
+			Discord.enabled = true
+			local _, msg = pcall(Discord.push)
+			Discord.enabled = wasEnabled
+			discordSay(tostring(msg))
+		end)
+	end,
+})
+
+task.spawn(function()
+	while _G.__HumanHub == Hub do
+		task.wait(2)
+		discordSay(Discord.status)
+	end
+end)
+
 log("loaded v" .. Hub.version)
+Discord.start()
 -- WindUI tidak auto-pilih tab: tanpa ini panel isi kelihatan kosong.
 if pnbTab.Select then
 	pcall(pnbTab.Select, pnbTab)
@@ -5865,6 +6438,7 @@ Hub.debug = {
 	centerOnTile = centerOnTile,
 	Quest = Quest,
 	questCheck = questCheck,
+	Discord = Discord,
 }
 
 -- Load ulang harus benar-benar menghentikan loop run lama. Tanpa ini loop
