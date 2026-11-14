@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.82",
+	version = "0.4.84",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -4123,14 +4123,15 @@ local function beginPNB(W, blocks, drain)
 			end
 		end
 		local total = math.max(1, math.floor(tonumber(blocks) or 1))
-		-- Ada drop lama: pecah semua blok sampai habis. Tanpa drop lama
-		-- (mis. hanya butuh ruang panen), cukup batch kecil agar tidak
-		-- menumpuk ratusan drop di lantai.
-		local target = need > 0 and total or math.min(total, PNB_DRAIN_BATCH)
+		-- Ada drop lama: pecah cukup blok untuk menampung drop itu, jangan
+		-- habiskan seluruh isi inventory. Memecah semua 200 blok butuh ~6
+		-- menit tanpa panen/tanam (terasa seperti bot diam); cukup `need`
+		-- slot plus sedikit sisa, lalu jemput drop dan kembali bekerja.
+		local target = need > 0 and math.min(total, need + 8) or math.min(total, PNB_DRAIN_BATCH)
 		Factory.pnbOldDrops = old
 		Factory.pnbDrainTarget = target
 		setFactoryStatus(need > 0
-			and string.format("Factory: blok %s/200; pecah semua %d blok dulu, baru ambil %d drop lama",
+			and string.format("Factory: blok %s/200; pecah %d blok untuk ruang, lalu ambil %d drop lama",
 				tostring(blocks or 0), target, need)
 			or string.format("Factory: blok %s/200; pecah %d blok dulu untuk ruang",
 				tostring(blocks or 0), target))
@@ -4179,7 +4180,7 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 	-- akibatnya panen berhenti total dan factory pindah ke PNB berjam-jam.
 	local stickyFull = Factory.collectNeedsRoom and Factory.blockedDropId ~= nil
 		and factoryRoom(inv, Factory.blockedDropId) <= 0
-	local blockFull = blocks >= 200 or room == 0 or stickyFull
+	local blockFull = stickyFull or (Factory.baseId ~= nil and (blocks >= 200 or room == 0))
 
 	if Factory.phase == "harvest" then
 		local cy = math.floor(state.y - 0.0001)
@@ -4306,7 +4307,8 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 		end
 		-- Jika belum ada target panen yang dipilih, kerjakan blok/seed yang
 		-- tersedia; fase grow akan mencoba tree lagi pada putaran berikutnya.
-		if blocks <= 0 and seeds > 0 and factoryTarget(W, state, seedId, blocked, "plant") then
+		if blocks <= 0 and seeds > 0 and (Factory.plant or Factory.cycle)
+			and factoryTarget(W, state, seedId, blocked, "plant") then
 			Factory.phase = "plant"
 			setFactoryStatus(string.format("Factory: target panen tertunda; lanjut tanam (%d seed)", seeds))
 			return 0.1
@@ -4593,7 +4595,7 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 	elseif blocks > 0 then
 		beginPNB(W, blocks)
 		setFactoryStatus(string.format("Factory: lanjut PNB %d blok sambil menunggu tree", blocks))
-	elseif seeds > 0 then
+	elseif seeds > 0 and (Factory.plant or Factory.cycle) then
 		Factory.phase = "plant"
 		setFactoryStatus(string.format("Factory: tanam %d seed yang tersedia", seeds))
 	elseif not factoryHasTrees(W, seedId) and blocks <= 0 then
