@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.78",
+	version = "0.4.80",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -3717,6 +3717,11 @@ local function factoryWork(W, inv, target, seedId, gen)
 			if tileId(px, y) == 0 then
 				Factory.harvested += 1
 				chopped[#chopped + 1] = px
+				-- JANGAN mengubah Factory.treeMap: tabel itu milik script game
+				-- (diambil lewat upvalue spliceAt). Menghapus entrinya merusak
+				-- data internal game (visual/drop bisa rusak, VM bisa macet).
+				-- Penghapusan tile sudah membuat factoryTarget tidak memilihnya
+				-- lagi karena baris world sudah 0.
 			end
 		end
 		if #chopped == 0 then
@@ -3737,18 +3742,42 @@ local function factoryWork(W, inv, target, seedId, gen)
 		local harvestedAlive = function()
 			return factoryAlive(gen) and W.name == Bind.name
 		end
-		local _, needsRoom = collectDropsNearby(W, inv, Bind.state(), 2.8)
-		if needsRoom then
-			Factory.collectNeedsRoom = true
-		end
-		for _, px in ipairs(chopped) do
-			if not harvestedAlive() then
-				break
+		-- Drop dijemput per tile seperti sebelumnya. collectDropsAtTile berjalan
+		-- sendiri ke posisi drop, jadi tidak ada takeDrop dari jarak jauh yang
+		-- ditolak server (itu yang membuat drop tertinggal/menumpuk visual).
+		-- Satu cek dropList dulu supaya tile tanpa drop tidak menunggu 0,6 dtk.
+		local function anyDropNear(cx, cy, radius)
+			if type(W.dropList) ~= "function" then
+				return true
 			end
-			local _, blockedId = collectDropsAtTile(W, inv, px, y, harvestedAlive)
-			if blockedId then
-				Factory.collectNeedsRoom = true
-				Factory.blockedDropId = blockedId
+			local okList, drops = pcall(W.dropList)
+			if not okList or type(drops) ~= "table" then
+				return true
+			end
+			local r2 = radius * radius
+			for _, drop in ipairs(drops) do
+				if type(drop) == "table" and type(drop.x) == "number" and type(drop.y) == "number" then
+					local dx, dy = drop.x - cx, drop.y - cy
+					if dx * dx + dy * dy <= r2 then
+						return true
+					end
+				end
+			end
+			return false
+		end
+		if anyDropNear(chopped[1] + 0.5, y + 0.5, 8) then
+			for _, px in ipairs(chopped) do
+				if not harvestedAlive() then
+					break
+				end
+				if anyDropNear(px + 0.5, y + 0.5, 2.6) then
+					local _, blockedId = collectDropsAtTile(W, inv, px, y, harvestedAlive)
+					if blockedId then
+						Factory.collectNeedsRoom = true
+						Factory.blockedDropId = blockedId
+						break
+					end
+				end
 			end
 		end
 		return true
