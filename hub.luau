@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.76",
+	version = "0.4.78",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -3683,17 +3683,46 @@ local function factoryWork(W, inv, target, seedId, gen)
 			Factory.treeMap = nil
 			return false, "gone"
 		end
-		for hit = 1, 12 do
-			if not factoryAlive(gen) or tileId(x, y) ~= seedId then
+		-- Satu pemberhentian memanen beberapa pohon sekaligus: target plus
+		-- pohon matang di kiri/kanan pada baris yang sama, selama masih dalam
+		-- jangkauan pukul dari posisi berdiri. Ini menghapus jalan bolak-balik
+		-- per pohon seperti pada fase plant.
+		local playerTile = math.floor(arrived.x)
+		local plan = { x }
+		for _, dx in ipairs({ 1, -1, 2, -2 }) do
+			local px = x + dx
+			if px >= 0 and px < (tonumber(W.w) or 100) - 1
+				and math.abs(playerTile - px) <= 2 then
+				local dup = false
+				for _, v in ipairs(plan) do
+					if v == px then dup = true end
+				end
+				if not dup and tileId(px, y) == seedId and factoryTreeRipe(W, px, y, seedId) then
+					plan[#plan + 1] = px
+				end
+			end
+		end
+		local chopped = {}
+		for _, px in ipairs(plan) do
+			if not factoryAlive(gen) then
 				break
 			end
-			Dig.punch(x, y, true, hit > 1, false)
-			task.wait(0.06)
+			for hit = 1, 12 do
+				if not factoryAlive(gen) or tileId(px, y) ~= seedId then
+					break
+				end
+				Dig.punch(px, y, true, hit > 1, false)
+				task.wait(0.02)
+			end
+			if tileId(px, y) == 0 then
+				Factory.harvested += 1
+				chopped[#chopped + 1] = px
+			end
 		end
-		if tileId(x, y) ~= 0 then
+		if #chopped == 0 then
 			return false, "break"
 		end
-		Factory.harvested += 1
+		x = chopped[1]
 		if Factory.cycle and not Factory.workX and tileId(x, y) == 0
 			and Bind.solid(x, y + 1) and (Factory.baseLayer ~= "bg" or bgId(x, y) == 0) then
 			local standX = Factory.baseAtSelf and x
@@ -3703,15 +3732,24 @@ local function factoryWork(W, inv, target, seedId, gen)
 				Factory.workX, Factory.workStandX, Factory.workY = x, standX, y
 			end
 		end
-		if factoryAlive(gen) and Bind.solid(x, y + 1) then
-			Move.walkTo(x + 0.5, { timeout = 3, tol = 0.28 })
-		end
-		local _, blockedId = collectDropsAtTile(W, inv, x, y, function()
+		-- Drop dari semua pohon yang roboh dijemput dulu; drop di sekitar
+		-- (radius 2,8 tile) diambil sekaligus, sisanya di tile masing-masing.
+		local harvestedAlive = function()
 			return factoryAlive(gen) and W.name == Bind.name
-		end)
-		if blockedId then
+		end
+		local _, needsRoom = collectDropsNearby(W, inv, Bind.state(), 2.8)
+		if needsRoom then
 			Factory.collectNeedsRoom = true
-			Factory.blockedDropId = blockedId
+		end
+		for _, px in ipairs(chopped) do
+			if not harvestedAlive() then
+				break
+			end
+			local _, blockedId = collectDropsAtTile(W, inv, px, y, harvestedAlive)
+			if blockedId then
+				Factory.collectNeedsRoom = true
+				Factory.blockedDropId = blockedId
+			end
 		end
 		return true
 	end
@@ -4148,7 +4186,8 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 				if Factory.harvestFailCount then
 					Factory.harvestFailCount[seedId .. ":harvest:" .. target.y .. ":" .. target.x] = nil
 				end
-				task.wait(0.25)
+				-- Drop sudah dijemput di dalam factoryWork; sisa drop di sekitar
+				-- diambil langsung tanpa jeda tambahan.
 				local _, needsRoom = collectDropsNearby(W, inv, Bind.state(), 1.35)
 				if needsRoom then Factory.collectNeedsRoom = true end
 				if factoryAlive(gen) then
@@ -4191,7 +4230,7 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 						reasonText, target.x, target.y))
 				end
 			end
-			return 0.18
+			return 0.06
 		end
 		local ripeElsewhere = factoryHasRipeTree(W, seedId)
 		-- Beberapa target hanya ditunda beberapa detik setelah input gerak
