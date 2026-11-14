@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.69",
+	version = "0.4.70",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -394,6 +394,192 @@ end
 
 Hub.antiAFK = AntiAFK
 startAntiAFK()
+
+--// ===== 1c. AUTO CLAIM DAILY QUEST =====
+-- Quest harian diklaim lewat jalur yang sama dengan tombol klaim di UI game:
+-- modul ByteNet "World" menyediakan call("Quests", "list") dan
+-- call("Quests", "claim", id). Modul itu tidak diparentkan ke DataModel, jadi
+-- dicari lewat bentuk tabelnya (CALLS/EVENTS/call/on). Hanya quest dengan
+-- have >= need dan belum claimed yang dikirim, supaya tidak ada spam ke server.
+local Quest = {
+	enabled = false,
+	every = 12,
+	claims = 0,
+	status = "idle",
+	lastTick = 0,
+	net = nil,
+	thread = nil,
+	lastTry = {},
+}
+
+local function questNet()
+	if Quest.net and type(Quest.net.call) == "function" then
+		return Quest.net
+	end
+	if type(filtergc) ~= "function" then
+		return nil
+	end
+	local ok, found = pcall(filtergc, "table", { Keys = { "CALLS", "EVENTS", "call", "on" } })
+	if not ok or type(found) ~= "table" then
+		return nil
+	end
+	local list = found
+	if type(found[1]) ~= "table" then
+		list = { found }
+	end
+	for _, t in ipairs(list) do
+		if type(t) == "table" and type(t.call) == "function"
+			and type(t.CALLS) == "table" and type(t.CALLS.Quests) == "table" then
+			Quest.net = t
+			return t
+		end
+	end
+	return nil
+end
+
+-- call() menunggu jawaban server dengan coroutine.yield, jadi harus dijalankan
+-- di thread sendiri lalu ditunggu dengan batas waktu. Kalau dipanggil langsung,
+-- loop factory bisa ikut macet saat server diam.
+local function questCall(action, ...)
+	local net = questNet()
+	if not net then
+		return false, "modul jaringan quest tidak ditemukan"
+	end
+	local args = table.pack(...)
+	local box = { done = false }
+	task.spawn(function()
+		local r = table.pack(pcall(net.call, "Quests", action, table.unpack(args, 1, args.n)))
+		box.result = r
+		box.done = true
+	end)
+	local started = os.clock()
+	while not box.done and os.clock() - started < 9 do
+		task.wait(0.1)
+	end
+	local r = box.result
+	if not r then
+		return false, "server tidak menjawab"
+	end
+	if not r[1] then
+		return false, tostring(r[2])
+	end
+	-- r[2] = flag sukses dari server, r[3] = pesan/tabel quests, r[4] = gems
+	return r[2] ~= false, r[3], r[4], r[5]
+end
+
+local function questDuration(seconds)
+	seconds = math.max(0, math.floor(tonumber(seconds) or 0))
+	local h = math.floor(seconds / 3600)
+	local m = math.floor((seconds % 3600) / 60)
+	if h > 0 then
+		return string.format("%dj %dm", h, m)
+	end
+	return string.format("%dm", m)
+end
+
+local function questCheck()
+	local okList, data = questCall("list")
+	if not okList or type(data) ~= "table" or type(data.quests) ~= "table" then
+		return nil, type(data) == "string" and data or "daftar quest tidak terbaca"
+	end
+	local total, already = 0, 0
+	local ready = {}
+	for _, q in ipairs(data.quests) do
+		if type(q) == "table" and q.id ~= nil then
+			total += 1
+			local need = tonumber(q.need) or 0
+			local have = tonumber(q.have) or 0
+			if q.claimed then
+				already += 1
+			elseif need > 0 and have >= need then
+				ready[#ready + 1] = q
+			end
+		end
+	end
+	local names, gems = {}, nil
+	for _, q in ipairs(ready) do
+		local id = tostring(q.id)
+		-- Jangan ulangi klaim yang baru gagal; server bisa menolak sesaat.
+		if os.clock() - (Quest.lastTry[id] or 0) >= 45 then
+			Quest.lastTry[id] = os.clock()
+			local okClaim, msg, _, g = questCall("claim", q.id)
+			if okClaim then
+				names[#names + 1] = tostring(q.text or id)
+				gems = g or gems
+				Quest.claims += 1
+			elseif type(msg) == "string" and #msg > 0 then
+				Quest.lastError = msg
+			end
+		end
+	end
+	return {
+		total = total,
+		done = already + #names,
+		claimed = names,
+		gems = gems,
+		resetIn = data.resetIn,
+	}
+end
+
+local function questStatusText(info)
+	local parts = { string.format("%d/%d quest selesai", info.done, info.total) }
+	if #info.claimed > 0 then
+		parts[#parts + 1] = "diklaim: " .. table.concat(info.claimed, ", ")
+	end
+	if info.gems then
+		parts[#parts + 1] = "gems " .. tostring(info.gems)
+	end
+	if tonumber(info.resetIn) then
+		parts[#parts + 1] = "reset " .. questDuration(info.resetIn)
+	end
+	return table.concat(parts, " | ")
+end
+
+function Quest.setEnabled(on)
+	Quest.enabled = on and true or false
+	if not Quest.enabled then
+		-- Jangan timpa "idle" saat toggle dibuat dalam keadaan mati.
+		Quest.status = (Quest.thread or Quest.claims > 0 or Quest.lastTick > 0) and "dimatikan" or "idle"
+		return
+	end
+	if Quest.thread then
+		return
+	end
+	if not questNet() then
+		Quest.status = "menunggu modul jaringan quest..."
+	end
+	local hub = Hub
+	Quest.thread = task.spawn(function()
+		task.wait(1)
+		while Quest.enabled and not Hub.dead and _G.__HumanHub == hub do
+			local ok, info, err = pcall(questCheck)
+			if not ok then
+				Quest.status = "gagal cek: " .. tostring(info)
+			elseif info then
+				Quest.status = questStatusText(info)
+				if #info.claimed > 0 then
+					log("quest diklaim: " .. table.concat(info.claimed, ", "))
+				end
+			else
+				Quest.status = "gagal: " .. tostring(err)
+			end
+			Quest.lastTick = os.clock()
+			local waited = 0
+			while Quest.enabled and waited < Quest.every and not Hub.dead do
+				task.wait(0.5)
+				waited += 0.5
+			end
+		end
+		Quest.status = "dimatikan"
+		Quest.thread = nil
+	end)
+end
+
+Hub.onUnload(function()
+	Quest.enabled = false
+end)
+
+Hub.quest = Quest
 
 --// ===== 2. BINDING KE DALAM GAME =====
 -- W = tabel world (fg/bg/name/w/h + goTo), CT = controller (state/solidAt),
@@ -4846,6 +5032,70 @@ Factory.onMode = function()
 	end
 end
 
+-- ---- Auto Claim Daily Quest ----
+local questSec = pnbTab:Section({ Title = "Daily Quest", Opened = false })
+local questToggle, questStatusPara
+
+questSec:Paragraph({
+	Title = "Cara kerja",
+	Desc = "Memeriksa daftar quest harian tiap 12 detik dan mengklaim yang syaratnya sudah terpenuhi (have >= need). Aman berjalan bersamaan dengan Auto Factory.",
+})
+
+questToggle = questSec:Toggle({
+	Title = "Auto Claim Daily Quest",
+	Desc = "Klaim otomatis quest harian yang sudah selesai, termasuk reward gems/XP.",
+	Value = false,
+	Callback = function(on)
+		Quest.setEnabled(on)
+	end,
+})
+
+questStatusPara = questSec:Paragraph({ Title = "Status Quest", Desc = "idle" })
+
+-- Sama seperti status factory: tulis langsung ke TextLabel paragraf, karena
+-- SetDesc dari thread lain tidak selalu memperbarui tampilan.
+do
+	local root = (gethui and gethui()) or game:GetService("CoreGui")
+	local function findQuestLabel(inst)
+		for _, c in ipairs(inst:GetChildren()) do
+			if c:IsA("TextLabel") then
+				local parent = c.Parent
+				if parent and parent.Name == "TitleFrame" then
+					for _, s in ipairs(parent:GetChildren()) do
+						if s:IsA("TextLabel") and s ~= c and tostring(s.Text) == "Status Quest" then
+							return c
+						end
+					end
+				end
+			end
+			local found = findQuestLabel(c)
+			if found then
+				return found
+			end
+		end
+		return nil
+	end
+	Quest.statusLabel = findQuestLabel(root)
+	task.spawn(function()
+		local label = Quest.statusLabel
+		while _G.__HumanHub == Hub do
+			task.wait(0.5)
+			if not label or not label.Parent then
+				label = findQuestLabel(root)
+				Quest.statusLabel = label
+			end
+			local message = Quest.status
+			if label and label.Parent and message and label.Text ~= message then
+				if not pcall(function()
+					label.Text = message
+				end) then
+					return
+				end
+			end
+		end
+	end)
+end
+
 local function seedCountInDisplay(W, x, y, seedId)
 	if not W.displays or type(W.displays.get) ~= "function" then return nil end
 	local ok, contents = pcall(W.displays.get, x, y)
@@ -5481,6 +5731,8 @@ Hub.debug = {
 	displayDropPoint = displayDropPoint,
 	storeSeeds = factoryStoreSeeds,
 	centerOnTile = centerOnTile,
+	Quest = Quest,
+	questCheck = questCheck,
 }
 
 -- Load ulang harus benar-benar menghentikan loop run lama. Tanpa ini loop
