@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.75",
+	version = "0.4.76",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -3857,7 +3857,17 @@ local function factoryPNBOne(W, inv, gen, blocked, skipCollect)
 	if Factory.baseAtSelf then
 		-- Blok non-solid dipasang di tile tempat berdiri; tengahkan karakter
 		-- supaya drop hasil pecahan langsung berada di bawah badan.
-		centerOnTile(x, 2)
+		if not centerOnTile(x, 2) then
+			-- Karakter tidak bisa tepat di tile ini (tidak grounded / terhalang).
+			-- Jangan pukul 30 kali ke tile yang salah; lepas station dan cari
+			-- tile lain. Blok yang sudah terpasang dibiarkan supaya tidak
+			-- memakan blok lagi di posisi yang sama.
+			if blocked then
+				blocked["pnb:" .. y .. ":" .. x] = os.clock() + 30
+			end
+			releaseStation()
+			return false, "position"
+		end
 	end
 	pcall(inv.select, inv, baseId)
 	local placed = pcall(Bind.setTile, Factory.baseLayer, x, y, baseId, false, false)
@@ -3867,6 +3877,19 @@ local function factoryPNBOne(W, inv, gen, blocked, skipCollect)
 	pcall(inv.remove, inv, baseId, 1)
 	W.punchReady = os.clock() + 0.15
 	task.wait(0.18)
+	-- Kalau karakter tergeser dari tile blok setelah blok terpasang, pukulan
+	-- akan mengenai tile lain dan blok tidak pernah hancur. Berhenti lebih awal
+	-- daripada memukul 30 kali tanpa hasil.
+	if Factory.baseAtSelf then
+		local now = Bind.state()
+		if not now or math.abs(now.x - (x + 0.5)) > 0.35 then
+			if blocked then
+				blocked["pnb:" .. y .. ":" .. x] = os.clock() + 30
+			end
+			releaseStation()
+			return false, "position"
+		end
+	end
 	for hit = 1, 30 do
 		if not factoryAlive(gen) or pnbTileId(W, Factory.baseLayer, x, y) ~= baseId then
 			break
@@ -3875,6 +3898,7 @@ local function factoryPNBOne(W, inv, gen, blocked, skipCollect)
 		task.wait(0.07)
 	end
 	if pnbTileId(W, Factory.baseLayer, x, y) ~= 0 then
+		log(string.format("PNB: blok %s tidak hancur di X=%d Y=%d", tostring(baseId), x, y))
 		return false, "break"
 	end
 	Factory.pnb += 1
@@ -4246,12 +4270,27 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 				finishPNBDrain(inv)
 				return 0.2
 			end
+			-- Jangan diam selama jeda: pakai waktunya untuk panen atau tanam
+			-- yang sudah tersedia, lalu kembali ke PNB.
+			local ripeNow = factoryTarget(W, state, seedId, blocked, "harvest")
+			if ripeNow and factoryWork(W, inv, ripeNow, seedId, gen) then
+				setFactoryStatus("Factory: jeda PNB; panen pohon matang dulu")
+				return 0.2
+			end
+			if seeds > 0 then
+				local spot = factoryTarget(W, state, seedId, blocked, "plant")
+				if spot and factoryWork(W, inv, spot, seedId, gen) then
+					setFactoryStatus("Factory: jeda PNB; tanam seed dulu")
+					return 0.2
+				end
+			end
 			setFactoryStatus(string.format("Factory: menunggu jalur PNB; %d blok tersisa", blocks))
 			return 1
 		end
 		local worked, reason = factoryPNBOne(W, inv, gen, blocked, Factory.pnbDraining)
 		if worked then
 			Factory.pnbPathFailures = 0
+			Factory.pnbBreakFailures = 0
 			if Factory.pnbDraining then
 				Factory.pnbDrainCount += 1
 				if factoryAlive(gen) then
@@ -4300,7 +4339,25 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 				setFactoryStatus("Factory: blok PNB habis; lanjut tanam")
 				return 0.2
 			else
-				Factory.stop("Factory: PNB gagal (" .. tostring(reason) .. ")")
+				-- Blok yang dipasang tidak hancur walau sudah dipukul berkali-kali.
+				-- Jangan matikan seluruh Auto Factory: tandai tile itu supaya
+				-- tidak dipilih lagi, lepas station, lalu lanjut ke tile lain.
+				Factory.pnbBreakFailures = (Factory.pnbBreakFailures or 0) + 1
+				local failX, failY = Factory.workX, Factory.workY
+				if blocked and failX and failY then
+					blocked["pnb:" .. failY .. ":" .. failX] = os.clock() + 60
+				end
+				log(string.format("PNB: gagal (%s) di X=%s Y=%s; lanjut tile lain", tostring(reason), tostring(failX), tostring(failY)))
+				Factory.workX, Factory.workStandX, Factory.workY = nil, nil, nil
+				Factory.pnbPathFailures = 0
+				if Factory.pnbBreakFailures >= 3 then
+					Factory.pnbBreakFailures = 0
+					Factory.pnbSkipUntil = os.clock() + 20
+					setFactoryStatus("Factory: 3 blok tidak hancur; jeda PNB 20 dtk, lanjut panen/tanam")
+				else
+					setFactoryStatus(string.format("Factory: blok tidak hancur (%s); pindah tile", tostring(reason)))
+				end
+				return 0.3
 			end
 		end
 		return worked and 0.3 or 1
