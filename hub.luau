@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.71",
+	version = "0.4.73",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -582,6 +582,7 @@ function Quest.setEnabled(on)
 	if Quest.thread then
 		return
 	end
+	Quest.status = "memeriksa daftar quest..."
 	if not questNet() then
 		Quest.status = "menunggu modul jaringan quest..."
 	end
@@ -598,7 +599,10 @@ function Quest.setEnabled(on)
 				waited += 2
 			end
 		end
-		Quest.status = "dimatikan"
+		-- Jangan timpa pesan "menunggu Auto Factory" yang dipasang Factory.stop.
+		if Quest.status ~= "menunggu Auto Factory" then
+			Quest.status = "dimatikan"
+		end
 		Quest.thread = nil
 	end)
 end
@@ -2545,6 +2549,11 @@ function Factory.stop(reason)
 	Factory.dropFilter = nil
 	Factory.homeWorld = nil
 	Move.stop()
+	-- Quest harian hanya berjalan selama factory aktif.
+	if Quest and Quest.setEnabled then
+		Quest.setEnabled(false)
+		Quest.status = "menunggu Auto Factory"
+	end
 	setFactoryStatus(reason or "dihentikan")
 	if Factory.onMode then
 		pcall(Factory.onMode)
@@ -4483,6 +4492,11 @@ local function startFactory()
 	local blocked = {}
 	local missingSince = nil
 	setFactoryStatus(string.format("berjalan: %s, lantai Y=%d", Factory.seedName, floorY))
+	-- Klaim quest harian ikut hidup bersama Auto Factory, tanpa toggle sendiri.
+	-- Mengecek tiap 3 jam (cek pertama langsung) supaya server tidak dibebani.
+	if Quest and Quest.setEnabled then
+		Quest.setEnabled(true)
+	end
 	task.spawn(function()
 		local ok, err = pcall(function()
 			while factoryAlive(gen) do
@@ -5060,35 +5074,10 @@ Factory.onMode = function()
 	end
 end
 
--- ---- Auto Claim Daily Quest ----
-local questSec = pnbTab:Section({ Title = "Daily Quest", Opened = false })
-local questToggle, questStatusPara
-
-questSec:Paragraph({
-	Title = "Cara kerja",
-	Desc = "Memeriksa daftar quest harian tiap 3 jam (cek pertama langsung saat toggle dinyalakan) lalu mengklaim yang syaratnya sudah terpenuhi (have >= need). Aman berjalan bersamaan dengan Auto Factory.",
-})
-
-questToggle = questSec:Toggle({
-	Title = "Auto Claim Daily Quest",
-	Desc = "Klaim otomatis quest harian yang sudah selesai, termasuk reward gems/XP. Hanya 8 permintaan ke server per hari.",
-	Value = false,
-	Callback = function(on)
-		Quest.setEnabled(on)
-	end,
-})
-
-questSec:Button({
-	Title = "Cek quest sekarang",
-	Desc = "Satu kali periksa + klaim, tanpa menunggu jadwal 3 jam.",
-	Callback = function()
-		if not Quest.forceCheck() then
-			WindUI:Notify({ Title = "Quest", Content = "Sedang memeriksa, tunggu sebentar.", Duration = 3 })
-		end
-	end,
-})
-
-questStatusPara = questSec:Paragraph({ Title = "Status Quest", Desc = "idle" })
+-- ---- Quest harian: ikut Auto Factory, tanpa toggle ----
+-- Klaim berjalan otomatis selama Auto Factory menyala (dinyalakan/dihentikan
+-- bersama factory di startFactory/Factory.stop). Di sini hanya statusnya.
+local questStatusPara = factorySec:Paragraph({ Title = "Quest harian", Desc = "menunggu Auto Factory" })
 
 -- Sama seperti status factory: tulis langsung ke TextLabel paragraf, karena
 -- SetDesc dari thread lain tidak selalu memperbarui tampilan.
@@ -5100,7 +5089,7 @@ do
 				local parent = c.Parent
 				if parent and parent.Name == "TitleFrame" then
 					for _, s in ipairs(parent:GetChildren()) do
-						if s:IsA("TextLabel") and s ~= c and tostring(s.Text) == "Status Quest" then
+						if s:IsA("TextLabel") and s ~= c and tostring(s.Text) == "Quest harian" then
 							return c
 						end
 					end
