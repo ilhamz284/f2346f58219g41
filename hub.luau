@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.84",
+	version = "0.4.85",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -2132,14 +2132,14 @@ local function collectDropsAtTile(W, inv, x, y, alive)
 	end
 
 	local sawAny = false
-	while os.clock() - start < 2.2 do
+	while os.clock() - start < 1.6 do
 		if alive and not alive() then
 			break
 		end
 		local list, nearest, nearestDist, state = nearby()
 		if not list or #list == 0 then
 			-- Drop bisa muncul beberapa frame setelah tile pecah.
-			if sawAny or os.clock() - start >= 0.6 then
+			if sawAny or os.clock() - start >= 0.35 then
 				break
 			end
 			task.wait(0.1)
@@ -2177,7 +2177,7 @@ local function collectDropsAtTile(W, inv, x, y, alive)
 			if not anyRoom or (not took and not retry) then
 				break
 			end
-			task.wait(0.18)
+			task.wait(0.1)
 		end
 	end
 
@@ -3563,7 +3563,7 @@ local function factoryTarget(W, state, seedId, blocked, onlyKind)
 				or (floorMode == "same" and y == cy)
 				or (floorMode == "below" and y > cy)
 				or (floorMode == "above" and y < cy)
-			local rowBlocked = blocked[kind .. ":row:" .. y]
+			local rowBlocked = kind == "plant" and blocked[kind .. ":row:" .. y]
 			if inFloor and not (rowBlocked and rowBlocked > os.clock()) then
 				local row = W.fg and W.fg[y]
 				if row then
@@ -3683,51 +3683,17 @@ local function factoryWork(W, inv, target, seedId, gen)
 			Factory.treeMap = nil
 			return false, "gone"
 		end
-		-- Satu pemberhentian memanen beberapa pohon sekaligus: target plus
-		-- pohon matang di kiri/kanan pada baris yang sama, selama masih dalam
-		-- jangkauan pukul dari posisi berdiri. Ini menghapus jalan bolak-balik
-		-- per pohon seperti pada fase plant.
-		local playerTile = math.floor(arrived.x)
-		local plan = { x }
-		for _, dx in ipairs({ 1, -1, 2, -2 }) do
-			local px = x + dx
-			if px >= 0 and px < (tonumber(W.w) or 100) - 1
-				and math.abs(playerTile - px) <= 2 then
-				local dup = false
-				for _, v in ipairs(plan) do
-					if v == px then dup = true end
-				end
-				if not dup and tileId(px, y) == seedId and factoryTreeRipe(W, px, y, seedId) then
-					plan[#plan + 1] = px
-				end
-			end
-		end
-		local chopped = {}
-		for _, px in ipairs(plan) do
-			if not factoryAlive(gen) then
+		for hit = 1, 12 do
+			if not factoryAlive(gen) or tileId(x, y) ~= seedId then
 				break
 			end
-			for hit = 1, 12 do
-				if not factoryAlive(gen) or tileId(px, y) ~= seedId then
-					break
-				end
-				Dig.punch(px, y, true, hit > 1, false)
-				task.wait(0.02)
-			end
-			if tileId(px, y) == 0 then
-				Factory.harvested += 1
-				chopped[#chopped + 1] = px
-				-- JANGAN mengubah Factory.treeMap: tabel itu milik script game
-				-- (diambil lewat upvalue spliceAt). Menghapus entrinya merusak
-				-- data internal game (visual/drop bisa rusak, VM bisa macet).
-				-- Penghapusan tile sudah membuat factoryTarget tidak memilihnya
-				-- lagi karena baris world sudah 0.
-			end
+			Dig.punch(x, y, true, hit > 1, false)
+			task.wait(0.02)
 		end
-		if #chopped == 0 then
+		if tileId(x, y) ~= 0 then
 			return false, "break"
 		end
-		x = chopped[1]
+		Factory.harvested += 1
 		if Factory.cycle and not Factory.workX and tileId(x, y) == 0
 			and Bind.solid(x, y + 1) and (Factory.baseLayer ~= "bg" or bgId(x, y) == 0) then
 			local standX = Factory.baseAtSelf and x
@@ -3737,48 +3703,15 @@ local function factoryWork(W, inv, target, seedId, gen)
 				Factory.workX, Factory.workStandX, Factory.workY = x, standX, y
 			end
 		end
-		-- Drop dari semua pohon yang roboh dijemput dulu; drop di sekitar
-		-- (radius 2,8 tile) diambil sekaligus, sisanya di tile masing-masing.
-		local harvestedAlive = function()
+		if factoryAlive(gen) and Bind.solid(x, y + 1) then
+			Move.walkTo(x + 0.5, { timeout = 1.2, tol = 0.28 })
+		end
+		local _, blockedId = collectDropsAtTile(W, inv, x, y, function()
 			return factoryAlive(gen) and W.name == Bind.name
-		end
-		-- Drop dijemput per tile seperti sebelumnya. collectDropsAtTile berjalan
-		-- sendiri ke posisi drop, jadi tidak ada takeDrop dari jarak jauh yang
-		-- ditolak server (itu yang membuat drop tertinggal/menumpuk visual).
-		-- Satu cek dropList dulu supaya tile tanpa drop tidak menunggu 0,6 dtk.
-		local function anyDropNear(cx, cy, radius)
-			if type(W.dropList) ~= "function" then
-				return true
-			end
-			local okList, drops = pcall(W.dropList)
-			if not okList or type(drops) ~= "table" then
-				return true
-			end
-			local r2 = radius * radius
-			for _, drop in ipairs(drops) do
-				if type(drop) == "table" and type(drop.x) == "number" and type(drop.y) == "number" then
-					local dx, dy = drop.x - cx, drop.y - cy
-					if dx * dx + dy * dy <= r2 then
-						return true
-					end
-				end
-			end
-			return false
-		end
-		if anyDropNear(chopped[1] + 0.5, y + 0.5, 8) then
-			for _, px in ipairs(chopped) do
-				if not harvestedAlive() then
-					break
-				end
-				if anyDropNear(px + 0.5, y + 0.5, 2.6) then
-					local _, blockedId = collectDropsAtTile(W, inv, px, y, harvestedAlive)
-					if blockedId then
-						Factory.collectNeedsRoom = true
-						Factory.blockedDropId = blockedId
-						break
-					end
-				end
-			end
+		end)
+		if blockedId then
+			Factory.collectNeedsRoom = true
+			Factory.blockedDropId = blockedId
 		end
 		return true
 	end
@@ -4123,15 +4056,14 @@ local function beginPNB(W, blocks, drain)
 			end
 		end
 		local total = math.max(1, math.floor(tonumber(blocks) or 1))
-		-- Ada drop lama: pecah cukup blok untuk menampung drop itu, jangan
-		-- habiskan seluruh isi inventory. Memecah semua 200 blok butuh ~6
-		-- menit tanpa panen/tanam (terasa seperti bot diam); cukup `need`
-		-- slot plus sedikit sisa, lalu jemput drop dan kembali bekerja.
-		local target = need > 0 and math.min(total, need + 8) or math.min(total, PNB_DRAIN_BATCH)
+		-- Ada drop lama: pecah semua blok sampai habis. Tanpa drop lama
+		-- (mis. hanya butuh ruang panen), cukup batch kecil agar tidak
+		-- menumpuk ratusan drop di lantai.
+		local target = need > 0 and total or math.min(total, PNB_DRAIN_BATCH)
 		Factory.pnbOldDrops = old
 		Factory.pnbDrainTarget = target
 		setFactoryStatus(need > 0
-			and string.format("Factory: blok %s/200; pecah %d blok untuk ruang, lalu ambil %d drop lama",
+			and string.format("Factory: blok %s/200; pecah semua %d blok dulu, baru ambil %d drop lama",
 				tostring(blocks or 0), target, need)
 			or string.format("Factory: blok %s/200; pecah %d blok dulu untuk ruang",
 				tostring(blocks or 0), target))
@@ -4175,18 +4107,21 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 	local blocks = factoryCount(inv, Factory.baseId)
 	local seeds = factoryCount(inv, seedId)
 	local room = factoryRoom(inv, Factory.baseId)
-	-- "Penuh" harus dibaca dari ruang inventory yang sebenarnya. Dulu flag
-	-- collectNeedsRoom ikut dihitung walau ruangnya masih ada (mis. room=2),
-	-- akibatnya panen berhenti total dan factory pindah ke PNB berjam-jam.
-	local stickyFull = Factory.collectNeedsRoom and Factory.blockedDropId ~= nil
-		and factoryRoom(inv, Factory.blockedDropId) <= 0
-	local blockFull = stickyFull or (Factory.baseId ~= nil and (blocks >= 200 or room == 0))
+	local blockFull = blocks >= 200 or room == 0 or Factory.collectNeedsRoom == true
 
 	if Factory.phase == "harvest" then
 		local cy = math.floor(state.y - 0.0001)
-		-- Drop panen tertinggal. Jangan pukul pohon berikutnya sebelum drop
-		-- itu dijemput, tetapi juga jangan berhenti selama masih ada ruang.
-		if Factory.collectNeedsRoom then
+		-- Blok penuh: panen cuma membuang drop (inv.room(id) == 0 membuat
+		-- takeDrop mengembalikan 0), jadi kosongkan dulu lewat PNB.
+		if blockFull and Factory.baseId then
+			Factory.collectNeedsRoom = false
+			beginPNB(W, blocks, true)
+			return 0.1
+		end
+		-- Mode panen saja tidak punya PNB/tanam untuk mengosongkan blok.
+		-- Kalau drop panen tidak muat, berhenti memukul pohon: kalau terus
+		-- jalan, hasil panen tertinggal di belakang lalu hilang.
+		if Factory.collectNeedsRoom and not Factory.baseId then
 			local dropId = Factory.blockedDropId
 			local dropRoom = dropId and factoryRoom(inv, dropId) or 0
 			if dropRoom > 0 then
@@ -4198,28 +4133,12 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 					return 0.2
 				end
 			else
-				-- Benar-benar tidak ada ruang untuk drop panen. Di Auto Factory
-				-- ruang bisa dibuka dengan PNB; di mode panen saja tidak ada
-				-- yang bisa dikerjakan, jadi tunggu ruang dengan status jelas.
-				Factory.collectNeedsRoom = false
-				if Factory.baseId then
-					beginPNB(W, blocks, true)
-					return 0.1
-				end
 				local def = dropId and selectedItemDefinition(dropId) or nil
 				local name = type(def) == "table" and (def.name or tostring(dropId)) or "hasil panen"
 				Move.release()
-				setFactoryStatus(string.format("Factory: %s penuh (%d/200); panen ditahan supaya drop tidak tertinggal",
-					name, dropId and factoryCount(inv, dropId) or 200))
+				setFactoryStatus(string.format("Factory: %s penuh; panen ditahan supaya drop tidak tertinggal", name))
 				return 1
 			end
-		end
-		-- Blok penuh: panen cuma membuang drop (inv.room(id) == 0 membuat
-		-- takeDrop mengembalikan 0), jadi kosongkan dulu lewat PNB.
-		if blockFull and Factory.baseId then
-			Factory.collectNeedsRoom = false
-			beginPNB(W, blocks, true)
-			return 0.1
 		end
 		local target = factoryTarget(W, state, seedId, blocked, "harvest")
 		if target then
@@ -4229,8 +4148,7 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 				if Factory.harvestFailCount then
 					Factory.harvestFailCount[seedId .. ":harvest:" .. target.y .. ":" .. target.x] = nil
 				end
-				-- Drop sudah dijemput di dalam factoryWork; sisa drop di sekitar
-				-- diambil langsung tanpa jeda tambahan.
+				task.wait(0.05)
 				local _, needsRoom = collectDropsNearby(W, inv, Bind.state(), 1.35)
 				if needsRoom then Factory.collectNeedsRoom = true end
 				if factoryAlive(gen) then
@@ -4268,25 +4186,12 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 				end
 				blocked[key] = os.clock() + blockFor
 				Factory.harvestFailures = (Factory.harvestFailures or 0) + 1
-				-- Pohon di lantai lain yang jalurnya gagal berulang: jangan
-				-- coba satu per satu (tiap percobaan 8-12 dtk). Tutup lantai
-				-- itu sementara supaya pohon lain di lantai ini dikerjakan.
-				if not sameFloor and (reason == "path" or reason == "floor" or reason == "far") then
-					Factory.harvestFloorFail = Factory.harvestFloorFail or {}
-					local fk = tostring(target.y)
-					local n = (Factory.harvestFloorFail[fk] or 0) + 1
-					Factory.harvestFloorFail[fk] = n
-					if n >= 2 then
-						Factory.harvestFloorFail[fk] = 0
-						blocked["harvest:row:" .. target.y] = os.clock() + 45
-					end
-				end
 				if factoryAlive(gen) then
 					setFactoryStatus(string.format("Factory: %s X=%d Y=%d; coba tree lain",
 						reasonText, target.x, target.y))
 				end
 			end
-			return 0.06
+			return 0.08
 		end
 		local ripeElsewhere = factoryHasRipeTree(W, seedId)
 		-- Beberapa target hanya ditunda beberapa detik setelah input gerak
@@ -4307,8 +4212,7 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 		end
 		-- Jika belum ada target panen yang dipilih, kerjakan blok/seed yang
 		-- tersedia; fase grow akan mencoba tree lagi pada putaran berikutnya.
-		if blocks <= 0 and seeds > 0 and (Factory.plant or Factory.cycle)
-			and factoryTarget(W, state, seedId, blocked, "plant") then
+		if blocks <= 0 and seeds > 0 and factoryTarget(W, state, seedId, blocked, "plant") then
 			Factory.phase = "plant"
 			setFactoryStatus(string.format("Factory: target panen tertunda; lanjut tanam (%d seed)", seeds))
 			return 0.1
@@ -4486,20 +4390,6 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 		else
 			setFactoryStatus(string.format("Factory: mencoba ulang drop blok (%d tersisa, %s)", amount, result))
 		end
-		-- Drop yang tidak terjangkau/ditolak terus jangan menahan seluruh
-		-- factory berulang kali. Setelah 3 percobaan, lanjut kerja lain;
-		-- drop itu tetap dicoba lagi di fase collect berikutnya.
-		if result == "path" or result == "take" then
-			Factory.collectMissStreak = (Factory.collectMissStreak or 0) + 1
-		else
-			Factory.collectMissStreak = 0
-		end
-		if Factory.collectMissStreak >= 3 then
-			Factory.collectMissStreak = 0
-			Factory.phase = "harvest"
-			setFactoryStatus("Factory: drop blok tidak terjangkau; lanjut panen/tanam")
-			return 0.2
-		end
 		return result == "collected" and 0.15 or 1
 	end
 
@@ -4595,7 +4485,7 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 	elseif blocks > 0 then
 		beginPNB(W, blocks)
 		setFactoryStatus(string.format("Factory: lanjut PNB %d blok sambil menunggu tree", blocks))
-	elseif seeds > 0 and (Factory.plant or Factory.cycle) then
+	elseif seeds > 0 then
 		Factory.phase = "plant"
 		setFactoryStatus(string.format("Factory: tanam %d seed yang tersedia", seeds))
 	elseif not factoryHasTrees(W, seedId) and blocks <= 0 then
