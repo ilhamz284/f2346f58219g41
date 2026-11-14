@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.86",
+	version = "0.4.88",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -4838,7 +4838,7 @@ local Discord = {
 	failures = 0,
 	lastPush = 0,
 	status = "belum aktif",
-	file = "HumanHubDiscord.txt",
+	file = nil,
 	lastEventKey = nil,
 	lastEventAt = 0,
 	startedAt = os.clock(),
@@ -4883,18 +4883,38 @@ local function discordFileWrite(name, data)
 	return (pcall(writefile, name, data))
 end
 
+local function discordAccountFile()
+	-- Satu PC bisa menjalankan beberapa akun dengan executor yang sama, jadi
+	-- berkas konfigurasi dipisah per UserId. Tanpa ini dua bot berbagi satu
+	-- messageId dan saling menimpa pesan Discord satu sama lain.
+	local player = Players.LocalPlayer
+	local uid = player and tonumber(player.UserId)
+	if uid and uid > 0 then
+		return string.format("HumanHubDiscord_%d.txt", uid)
+	end
+	return "HumanHubDiscord.txt"
+end
+
 local function discordSaveConfig()
+	Discord.file = Discord.file or discordAccountFile()
 	discordFileWrite(Discord.file, table.concat({
 		"url=" .. tostring(Discord.url or ""),
 		"mention=" .. tostring(Discord.mention or ""),
-		"interval=" .. tostring(math.floor(tonumber(Discord.interval) or 25)),
+		"interval=" .. tostring(math.floor(tonumber(Discord.interval) or 60)),
 		"on=" .. (Discord.enabled and "1" or "0"),
 		"msgid=" .. tostring(Discord.messageId or ""),
 	}, "\n"))
 end
 
 local function discordLoadConfig()
+	Discord.file = Discord.file or discordAccountFile()
 	local text = discordFileRead(Discord.file)
+	local migrated = false
+	if not text and Discord.file ~= "HumanHubDiscord.txt" then
+		-- Pindahkan pengaturan dari berkas lama (satu berkas untuk semua akun).
+		text = discordFileRead("HumanHubDiscord.txt")
+		migrated = text ~= nil
+	end
 	if not text then
 		return
 	end
@@ -4911,6 +4931,9 @@ local function discordLoadConfig()
 		elseif key == "msgid" then
 			Discord.messageId = (value ~= "") and value or nil
 		end
+	end
+	if migrated then
+		discordSaveConfig()
 	end
 end
 
@@ -5199,7 +5222,9 @@ function Discord.push()
 end
 
 function Discord.start()
-	discordLoadConfig()
+	if not Discord.file then
+		discordLoadConfig()
+	end
 	Discord.status = Discord.available()
 		and (Discord.enabled and "aktif" or "nonaktif")
 		or "executor tidak mendukung POST (request)"
@@ -6225,6 +6250,11 @@ infoTab:Section({ Title = "Catatan", Opened = true }):Paragraph({
 })
 
 -- ---- Status ke Discord ----
+-- Muat pengaturan sebelum UI dibuat supaya kolom URL/interval langsung
+-- terisi nilai yang tersimpan (Discord.start() dipanggil setelah ini).
+if not Discord.file then
+	discordLoadConfig()
+end
 local discordSec = infoTab:Section({ Title = "Status ke Discord", Opened = false })
 local discordShown = nil
 local discordStatusPara = discordSec:Paragraph({ Title = "Status Discord", Desc = Discord.status })
