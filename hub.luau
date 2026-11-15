@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.91",
+	version = "0.4.92",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -4070,16 +4070,16 @@ local function beginPNB(W, blocks, drain)
 			end
 		end
 		local total = math.max(1, math.floor(tonumber(blocks) or 1))
-		-- Ada drop lama: pecah semua blok sampai habis. Tanpa drop lama
-		-- (mis. hanya butuh ruang panen), cukup batch kecil agar tidak
-		-- menumpuk ratusan drop di lantai.
-		local target = need > 0 and total or math.min(total, PNB_DRAIN_BATCH)
+		-- Selalu habiskan semua blok dulu, baru jemput drop / lanjut panen.
+		-- Batch kecil membuat siklus 200 -> 192 -> 200 berulang dan bot
+		-- terlihat cuma "pecah 8 blok".
+		local target = total
 		Factory.pnbOldDrops = old
 		Factory.pnbDrainTarget = target
 		setFactoryStatus(need > 0
 			and string.format("Factory: blok %s/200; pecah semua %d blok dulu, baru ambil %d drop lama",
 				tostring(blocks or 0), target, need)
-			or string.format("Factory: blok %s/200; pecah %d blok dulu untuk ruang",
+			or string.format("Factory: blok %s/200; pecah semua %d blok dulu untuk ruang",
 				tostring(blocks or 0), target))
 	end
 end
