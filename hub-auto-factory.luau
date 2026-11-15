@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.97",
+	version = "0.4.98",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -3485,8 +3485,21 @@ function Path.moveTo(tx, ty, aliveFn)
 			-- Kalau karakter tetap pindah tile, jangan blokir: lompat yang
 			-- menembus platform sering berhenti satu lantai lebih rendah dan
 			-- jalur baru dari posisi itu masih valid.
-			if firstStep.kind ~= "walk" and not moved then
-				Path.blockEdge(cx, cy, firstStep.x, firstStep.y, 10)
+			if not moved then
+				if firstStep.kind == "walk" then
+					-- Langkah walk juga bisa mentok: drop/blok di tengah lorong
+					-- atau tekanan tombol yang tidak sampai. Dulu edge walk tidak
+					-- pernah diblokir, jadi explore menawarkan rute jalan yang
+					-- sama berulang-ulang dan bot terlihat diam belasan detik
+					-- (trace: 20 percobaan "x,26 -> 98,26 walk" beruntun).
+					-- Blokir hanya satu tile ke arah gerak, bukan seluruh jalur
+					-- gabungan, dan sebentar saja supaya hambatan sementara
+					-- (drop yang nanti dijemput) tidak menutup jalur permanen.
+					local dir = step.x >= cx and 1 or -1
+					Path.blockEdge(cx, cy, cx + dir, cy, 8)
+				else
+					Path.blockEdge(cx, cy, firstStep.x, firstStep.y, 10)
+				end
 			end
 			-- Masih di udara / kehilangan pijakan: path dari posisi ini tidak
 			-- berarti apa-apa, biar pemanggil yang ulang.
@@ -3783,6 +3796,15 @@ local function factoryWork(W, inv, target, seedId, gen)
 	-- coba lagi: karakter harus benar-benar sampai tile yang bisa menjangkau
 	-- pohon, bukan memukul/menyerah dari lantai atau tile yang salah.
 	local function approach(t)
+		-- Status yang jujur saat berjalan. Tanpa ini layar tetap menampilkan
+		-- "harvest N" dari pohon sebelumnya selama bot menyusuri lantai, jadi
+		-- bot terlihat diam tanpa alasan.
+		local pre = Bind.state()
+		if pre and (math.abs(pre.x - (t.standX + 0.5)) > 2.5
+			or math.floor(pre.y - 0.0001) ~= t.y) then
+			setFactoryStatus(string.format("Factory: jalan ke %s X=%d Y=%d",
+				t.kind == "harvest" and "pohon" or "tile tanam", t.x, t.y))
+		end
 		local ok, why = Path.moveTo(t.standX, t.standY, alive)
 		if ok then
 			local arr = Bind.state()
@@ -4803,7 +4825,10 @@ local function startFactory()
 		Quest.setEnabled(true)
 	end
 	task.spawn(function()
-		local ok, err = pcall(function()
+		-- xpcall supaya pesan error menyertakan lokasi (file:baris). Tanpa itu
+		-- console cuma menampilkan ":2991: attempt to index nil with number"
+		-- tanpa petunjuk fungsi mana yang gagal.
+		local ok, err = xpcall(function()
 			while factoryAlive(gen) do
 				local s = Bind.state()
 				local currentW = Bind.getW()
@@ -4909,6 +4934,12 @@ local function startFactory()
 					end
 				end
 			end
+		end, function(e)
+			local trace = debug.traceback(nil, 2)
+			if type(trace) == "string" then
+				trace = trace:gsub("%s*\n%s*", " <- ")
+			end
+			return tostring(e) .. " | " .. tostring(trace)
 		end)
 		if not ok and factoryAlive(gen) then
 			log("Auto Harvest/Plant error: " .. tostring(err))
