@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.98",
+	version = "0.4.99",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -3372,6 +3372,13 @@ function Path.moveTo(tx, ty, aliveFn)
 	local staleState = 0
 	local startGen = Move.gen
 	local deadline = os.clock() + 120
+	-- Tile terakhir tempat karakter benar-benar berdiri. Kalau tile ini tidak
+	-- berubah selama beberapa detik, langkah-langkah berikutnya hanya
+	-- mengulang hal yang sama: dulu bot diam belasan detik (status tetap
+	-- "jalan ke pohon") sampai deadline 120 dtk habis. Pemanggil lebih cepat
+	-- tahu dan bisa memilih target lain.
+	local stillX, stillY, stillSince = nil, nil, os.clock()
+	local STILL_LIMIT = 6
 	for _ = 1, 400 do
 		-- Tombol Stop atau reload hub harus langsung menghentikan pencarian,
 		-- bukan menyisakan loop pathfinding yang membuat client berat.
@@ -3392,6 +3399,21 @@ function Path.moveTo(tx, ty, aliveFn)
 			continue
 		end
 		local cx, cy = math.floor(s.x), math.floor(s.y - 0.0001)
+		if cx ~= stillX or cy ~= stillY then
+			stillX, stillY, stillSince = cx, cy, os.clock()
+		elseif os.clock() - stillSince > STILL_LIMIT then
+			Move.release()
+			Path.record({
+				from = string.format("%d,%d", cx, cy),
+				to = string.format("%d,%d", tx, ty),
+				kind = "stuck",
+				ok = false,
+				why = "stuck",
+			})
+			log(string.format("path: macet %.0f dtk di %d,%d (tujuan %d,%d); pindah target",
+				os.clock() - stillSince, cx, cy, tx, ty))
+			return false, "stuck"
+		end
 		local remain = math.abs(tx - cx) + math.abs(ty - cy)
 		if remain < bestRemain then
 			bestRemain = remain
@@ -4177,9 +4199,25 @@ local function factoryCollectDrop(W, inv, state, blocked, gen)
 	end
 	local alive = function() return factoryAlive(gen) and W.name == Bind.name end
 	if not Path.moveTo(best.x, best.y, alive) then
-		blocked["drop:" .. best.drop.uid] = os.clock() + 15
+		-- Dulu drop dikunci 15 dtk setiap gagal. Selama terkunci tidak ada
+		-- kandidat lain, jadi fase collect cuma berdiri diam (terukur 9-15
+		-- dtk dengan status "mencoba ulang drop blok"). Jeda sekarang naik
+		-- bertahap dan drop yang tetap mustahil dilepas setelah 5 percobaan
+		-- supaya bot lanjut ke drop/pekerjaan lain.
+		Factory.dropPathFails = Factory.dropPathFails or {}
+		local uid = best.drop.uid
+		local fails = (Factory.dropPathFails[uid] or 0) + 1
+		Factory.dropPathFails[uid] = fails
+		if fails >= 5 then
+			Factory.dropPathFails[uid] = nil
+			Factory.ignoredDrops = Factory.ignoredDrops or {}
+			Factory.ignoredDrops[uid] = os.clock() + 90
+			return "ignored", #drops
+		end
+		blocked["drop:" .. uid] = os.clock() + math.min(8, 2 + fails * 2)
 		return "path", #drops
 	end
+	Factory.dropPathFails = nil
 	Move.walkTo(best.x + 0.5, { timeout = 2, tol = 0.25 })
 	local collected = collectDropsNearby(W, inv, Bind.state(), 0.9, Factory.dropFilter)
 	if collected <= 0 then
@@ -4193,7 +4231,7 @@ local function factoryCollectDrop(W, inv, state, blocked, gen)
 			return "ignored", #drops
 		end
 		if best.drop.n > room then return "room", #drops end
-		blocked["drop:" .. best.drop.uid] = os.clock() + 10
+		blocked["drop:" .. best.drop.uid] = os.clock() + 5
 		return "take", #drops
 	end
 	Factory.dropTakeFailures[best.drop.uid] = nil
@@ -4597,8 +4635,11 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 		elseif result == "collected" then
 			setFactoryStatus(string.format("Factory: mengambil drop blok +%d", amount))
 		elseif result == "ignored" then
-			setFactoryStatus("Factory: drop lokal ditolak berulang kali; lanjut target lain")
+			setFactoryStatus("Factory: drop tidak terjangkau berulang kali; lewati 90 dtk, lanjut target lain")
 		else
+			-- Saat menunggu jeda drop, jemput dulu apa pun yang sudah dalam
+			-- jangkauan. Tanpa ini jeda blok benar-benar diam.
+			collectDropsNearby(W, inv, Bind.state() or state, 0.9)
 			setFactoryStatus(string.format("Factory: mencoba ulang drop blok (%d tersisa, %s)", amount, result))
 		end
 		return result == "collected" and 0.15 or 1
