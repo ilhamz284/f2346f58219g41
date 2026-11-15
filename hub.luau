@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.101",
+	version = "0.4.102",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -633,7 +633,7 @@ Hub.quest = Quest
 --// ===== 2. BINDING KE DALAM GAME =====
 -- W = tabel world (fg/bg/name/w/h + goTo), CT = controller (state/solidAt),
 -- hit = fungsi pukul tile milik game, setTile = fungsi pasang tile.
-local Bind = { W = nil, CT = nil, hit = nil, setTile = nil, inv = nil, name = nil }
+local Bind = { W = nil, CT = nil, hit = nil, setTile = nil, inv = nil, name = nil, retryAt = 0 }
 
 local function pickTable(matches, need)
 	if type(matches) ~= "table" then
@@ -702,10 +702,18 @@ local function findInventory()
 end
 
 function Bind.resolve(force)
+	local now = os.clock()
 	if not force and Bind.W and Bind.CT and Bind.hit and Bind.setTile then
-		if not Bind.inv then Bind.inv = findInventory() end
+		if not Bind.inv and now >= Bind.retryAt then
+			Bind.retryAt = now + 3
+			Bind.inv = findInventory()
+		end
 		return Bind.inv ~= nil
 	end
+	-- State hilang dapat dibaca Heartbeat dan loop factory bersamaan.
+	-- Batasi percobaan gagal supaya tidak scan GC setiap frame saat respawn.
+	if not force and now < (Bind.retryAt or 0) then return false end
+	Bind.retryAt = now + 3
 
 	local okW, worldList = pcall(function() return filtergc("table", { Keys = { "fg", "bg", "name", "w", "h" } }) end)
 	if not okW then
@@ -2597,6 +2605,7 @@ end
 
 --// ===== 7. AUTO HARVEST / AUTO PLANT =====
 local function setFactoryStatus(message)
+	if Factory.status == message then return end
 	Factory.status = message
 	if Factory.onStatus then
 		pcall(Factory.onStatus, message)
@@ -2911,6 +2920,7 @@ function Path.explore(sx, sy, maxNodes)
 		return first
 	end
 	enqueue({ x = sx, y = sy, c = 0, key = startKey })
+	local sliceStarted = os.clock()
 
 	local function push(cx, cy, cc, nx, ny, cost, kind, shaftX)
 		if nx < 0 or nx >= w or ny < 0 or ny >= h - 1 then
@@ -2936,6 +2946,13 @@ function Path.explore(sx, sy, maxNodes)
 		if not visited[cur.key] then
 			visited[cur.key] = true
 			count += 1
+			-- World besar dikerjakan bertahap; beri renderer giliran setelah
+			-- sekitar 2 ms, tanpa memotong jangkauan pencarian lintas lantai.
+			if count % 16 == 0 and os.clock() - sliceStarted >= 0.002 then
+				task.wait()
+				if Hub.dead or Bind.W ~= W then return nil, nil end
+				sliceStarted = os.clock()
+			end
 			local cx, cy, cc = cur.x, cur.y, cur.c
 
 			-- jalan kiri/kanan
@@ -3770,10 +3787,22 @@ end
 
 local function factoryTarget(W, state, seedId, blocked, onlyKind)
 	local cy = math.floor(state.y - 0.0001)
-	local dist = Path.explore(math.floor(state.x), cy, 6000)
-	if not dist then
-		return nil
+	local sx = math.floor(state.x)
+	-- Mayoritas target berikutnya hanya satu langkah di baris yang sama.
+	-- Hitung koridor jalan kaki dulu; Dijkstra seluruh world hanya diperlukan
+	-- saat koridor ini habis atau tujuan berada di lantai lain.
+	local dist = {}
+	if Path.standable(sx, cy) then
+		dist[keyOf(sx, cy)] = 0
+		for _, dir in ipairs({ -1, 1 }) do
+			for step = 1, (tonumber(W.w) or 100) do
+				local x = sx + dir * step
+				if not Path.standable(x, cy) or edgeBlocked(x - dir, cy, x, cy) then break end
+				dist[keyOf(x, cy)] = step
+			end
+		end
 	end
+	local explored = false
 	local function closest(kind, floorMode, allowSelf)
 		local best, bestDistance
 		for y = 0, (tonumber(W.h) or 60) - 2 do
@@ -3833,6 +3862,12 @@ local function factoryTarget(W, state, seedId, blocked, onlyKind)
 				return closest(kind, mode, false) or closest(kind, mode, true)
 			end
 			return closest(kind, mode, true)
+		end
+		local nearby = pass("same")
+		if nearby then return nearby end
+		if not explored then
+			explored = true
+			dist = Path.explore(sx, cy, 6000) or {}
 		end
 		return pass("same") or pass("below") or pass("above")
 	end
@@ -6382,7 +6417,25 @@ local function guardMessage(message)
 	end
 end
 
+local worldPlayerCache = { controller = nil, world = nil, name = nil, retryAt = 0 }
 local function worldPlayers()
+	local W = Bind.W
+	if worldPlayerCache.world ~= W or worldPlayerCache.name ~= (W and W.name) then
+		worldPlayerCache.controller = nil
+		worldPlayerCache.world, worldPlayerCache.name = W, W and W.name
+		worldPlayerCache.retryAt = 0
+	end
+	local function readPlayers(ctrl)
+		if type(ctrl) ~= "table" or type(ctrl.reset) ~= "function" then return nil end
+		local ok, ups = pcall(debug.getupvalues, ctrl.reset)
+		return ok and type(ups) == "table" and type(ups[1]) == "table" and ups[1] or nil
+	end
+	-- Simpan controller, baca tabel pemain terbarunya tiap tick. reset world
+	-- bisa mengganti tabel itu; jangan cache snapshot daftar pemain.
+	local current = readPlayers(worldPlayerCache.controller)
+	if current then return current end
+	if os.clock() < worldPlayerCache.retryAt then return nil end
+	worldPlayerCache.retryAt = os.clock() + 5
 	local ok, matches = pcall(function() return filtergc("table", { Keys = { "reset", "showNames", "list" } }) end)
 	if not ok or type(matches) ~= "table" then
 		return nil
@@ -6392,9 +6445,10 @@ local function worldPlayers()
 	end
 	for _, ctrl in ipairs(matches) do
 		if type(ctrl) == "table" and type(ctrl.reset) == "function" and type(ctrl.update) == "function" then
-			local okUps, ups = pcall(debug.getupvalues, ctrl.reset)
-			if okUps and type(ups) == "table" and type(ups[1]) == "table" then
-				return ups[1]
+			local players = readPlayers(ctrl)
+			if players then
+				worldPlayerCache.controller = ctrl
+				return players
 			end
 		end
 	end
@@ -6772,10 +6826,14 @@ end)
 --// ===== 9. HEARTBEAT / PENJAGA =====
 -- kalau karakter hilang (respawn / keluar world), hentikan bot supaya
 -- tidak menekan tombol terus tanpa tujuan.
+local nextStateCheck = 0
 Hub.keep(RunService.Heartbeat:Connect(function()
 	if not Farm.running and not PNB.running and not Factory.running then
 		return
 	end
+	local now = os.clock()
+	if now < nextStateCheck then return end
+	nextStateCheck = now + 0.25
 	local s = Bind.state()
 	if not s then
 		if Farm.running then
