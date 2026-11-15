@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.99",
+	version = "0.4.100",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -2673,6 +2673,35 @@ function Path.record(entry)
 	while #Path.trace > 80 do
 		table.remove(Path.trace, 1)
 	end
+end
+
+-- Diagnostik tanpa menggerakkan karakter: langkah apa yang direncanakan
+-- pathfinder dari posisi sekarang ke tile (tx, ty). Dipakai untuk memastikan
+-- bot memang harus menepi dulu untuk turun lantai, atau ternyata berbelok di
+-- baris yang bukan tempat tujuan (bug rute).
+function Path.plan(tx, ty, limit)
+	local s = Bind.state()
+	if not s then
+		return {}, { reason = "nostate" }
+	end
+	local sx, sy = math.floor(s.x), math.floor(s.y - 0.0001)
+	local dist, parent = Path.explore(sx, sy, 6000)
+	local goal = keyOf(tx, ty)
+	if not dist or dist[goal] == nil then
+		return {}, { from = string.format("%d,%d", sx, sy), reason = "noroute" }
+	end
+	local steps = Path.reconstruct(parent, keyOf(sx, sy), goal)
+	local out = {}
+	for i = 1, math.min(#steps, limit or 40) do
+		local st = steps[i]
+		out[#out + 1] = string.format("%d,%d:%s", st.x, st.y, tostring(st.kind))
+	end
+	return out, {
+		from = string.format("%d,%d", sx, sy),
+		cost = dist[goal],
+		total = #steps,
+		reason = "ok",
+	}
 end
 
 local function edgeBlocked(fx, fy, tx, ty)
