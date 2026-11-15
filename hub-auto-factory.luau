@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.88",
+	version = "0.4.89",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -4833,14 +4833,11 @@ local Discord = {
 	enabled = false,
 	url = "",
 	interval = 60,
-	mention = "",
 	messageId = nil,
 	failures = 0,
 	lastPush = 0,
 	status = "belum aktif",
 	file = nil,
-	lastEventKey = nil,
-	lastEventAt = 0,
 	startedAt = os.clock(),
 	pushing = false,
 }
@@ -4899,7 +4896,6 @@ local function discordSaveConfig()
 	Discord.file = Discord.file or discordAccountFile()
 	discordFileWrite(Discord.file, table.concat({
 		"url=" .. tostring(Discord.url or ""),
-		"mention=" .. tostring(Discord.mention or ""),
 		"interval=" .. tostring(math.floor(tonumber(Discord.interval) or 60)),
 		"on=" .. (Discord.enabled and "1" or "0"),
 		"msgid=" .. tostring(Discord.messageId or ""),
@@ -4922,8 +4918,6 @@ local function discordLoadConfig()
 		local key, value = line:match("^(%w+)=(.*)$")
 		if key == "url" then
 			Discord.url = value
-		elseif key == "mention" then
-			Discord.mention = value
 		elseif key == "interval" then
 			Discord.interval = math.clamp(tonumber(value) or 60, 30, 900)
 		elseif key == "on" then
@@ -5044,6 +5038,7 @@ local function discordSnapshot()
 	end
 	local seedCount = discordCount(Factory.seedId)
 	local cropCount = discordCount(Factory.baseId)
+	local gems = discordCount(112)
 	local lower = status:lower()
 	local color = 3066993
 	if not running then
@@ -5070,6 +5065,11 @@ local function discordSnapshot()
 		{
 			name = "Hasil panen",
 			value = cropCount and (cropCount .. "/200") or "-",
+			inline = true,
+		},
+		{
+			name = "Gems",
+			value = gems and tostring(gems) or "-",
 			inline = true,
 		},
 		{
@@ -5108,51 +5108,8 @@ local function discordPayload()
 	}
 	return jsonEncode(payload), snap
 end
-
-local function discordSendEvent(text)
-	local url = (Discord.url or ""):gsub("%s+", "")
-	if url == "" then
-		return
-	end
-	local content = text
-	if Discord.mention ~= "" then
-		content = Discord.mention .. " " .. content
-	end
-	task.spawn(function()
-		discordCall("POST", url .. "?wait=false", jsonEncode({ content = content:sub(1, 1900) }))
-	end)
-end
-
-local function discordEventLabel(status, running)
-	local lower = status:lower()
-	if not running then
-		return "stop", "Bot berhenti"
-	end
-	if lower:find("penuh", 1, true) then
-		return "full", "Inventory penuh"
-	end
-	if lower:find("tidak bisa menjangkau", 1, true) then
-		return "path", "Pohon tidak terjangkau"
-	end
-	if lower:find("error", 1, true) then
-		return "error", "Ada error"
-	end
-	return nil
-end
-
-local function discordNotify(snap)
-	local key, label = discordEventLabel(snap.status, snap.running)
-	if not key then
-		return
-	end
-	local now = os.clock()
-	-- Satu jenis notifikasi maksimal sekali per 10 menit supaya tidak spam.
-	if Discord.lastEventKey == key and now - Discord.lastEventAt < 600 then
-		return
-	end
-	Discord.lastEventKey, Discord.lastEventAt = key, now
-	discordSendEvent(string.format("**%s** — %s: %s", snap.name, label, snap.status:sub(1, 300)))
-end
+-- Untuk uji/debug: hasilkan JSON yang akan dikirim tanpa mengirim.
+Discord.payloadJson = discordPayload
 
 function Discord.push()
 	if Discord.pushing then
@@ -5167,7 +5124,7 @@ function Discord.push()
 		return false, Discord.status
 	end
 	Discord.pushing = true
-	local body, snap = discordPayload()
+	local body = discordPayload()
 	local res, err
 	if Discord.messageId then
 		res, err = discordCall("PATCH", url .. "/messages/" .. Discord.messageId, body)
@@ -5217,7 +5174,6 @@ function Discord.push()
 	Discord.failures = 0
 	Discord.lastPush = os.clock()
 	Discord.status = "terkirim " .. os.date("!%H:%M:%SZ")
-	discordNotify(snap)
 	return true, Discord.status
 end
 
@@ -6309,11 +6265,10 @@ local function readBoxByPlaceholder(placeholder, fallback)
 end
 
 local discordUrlTyped = Discord.url or ""
-local discordMentionTyped = Discord.mention or ""
 
 discordSec:Paragraph({
 	Title = "Cara pakai",
-	Desc = "Satu akun menulis satu pesan lalu pesan itu diedit ulang tiap interval (bawaan 60 detik). URL disimpan di file lokal executor, tidak ikut repo.",
+	Desc = "Satu akun menulis satu pesan lalu pesan itu diedit ulang tiap interval (bawaan 60 detik). Tidak ada pesan tambahan, jadi panel tidak terdorong ke bawah. URL disimpan di file lokal executor, tidak ikut repo.",
 })
 
 local discordUrlInput = discordSec:Input({
@@ -6341,17 +6296,6 @@ local discordIntervalInput = discordSec:Input({
 	end,
 })
 
-local discordMentionInput = discordSec:Input({
-	Title = "Mention notifikasi",
-	Desc = "Opsional untuk notifikasi penting. Contoh: <@123456789>. Kosongkan bila tidak perlu.",
-	Placeholder = "Mention (opsional)...",
-	Value = Discord.mention or "",
-	Type = "Input",
-	Callback = function(value)
-		discordMentionTyped = tostring(value or "")
-	end,
-})
-
 local function discordField(placeholder, element, typed)
 	local box = readBoxByPlaceholder(placeholder, nil)
 	if type(box) == "string" and box ~= "" then
@@ -6366,8 +6310,6 @@ end
 local function discordApplyInputs()
 	Discord.url = tostring(discordField("URL webhook Discord...", discordUrlInput, discordUrlTyped) or "")
 		:gsub("^%s+", ""):gsub("%s+$", "")
-	local mention = discordField("Mention (opsional)...", discordMentionInput, discordMentionTyped)
-	Discord.mention = tostring(mention or ""):gsub("^%s+", ""):gsub("%s+$", "")
 	local raw = discordField("60", discordIntervalInput, tostring(Discord.interval or 60))
 	local n = tonumber(tostring(raw or ""):match("%d+"))
 	Discord.interval = math.clamp(n or 60, 30, 900)
