@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.94",
+	version = "0.4.97",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -1156,6 +1156,21 @@ end
 
 function Move.idle(a, b)
 	task.wait(rnd(a, b))
+end
+
+-- Client yang frame-nya berat (pernah turun ke 3-13 fps) baru memperlihatkan
+-- perpindahan beberapa frame kemudian. Batas waktu transisi gerak ikut
+-- melar supaya lompatan/jatuhan yang sebenarnya normal tidak dinyatakan
+-- gagal hanya karena lambat, lalu dilaporkan "tidak bisa menjangkau".
+function Move.frameScale()
+	local ok, fps = pcall(function()
+		return workspace:GetRealPhysicsFPS()
+	end)
+	local f = ok and tonumber(fps) or 60
+	if not f or f <= 0 then
+		f = 60
+	end
+	return math.clamp(60 / math.max(8, f), 1, 5)
 end
 
 local function moveStandable(W, x, y)
@@ -2648,6 +2663,18 @@ function Path.clearEdges()
 	Path.blockedEdges = {}
 end
 
+-- Riwayat singkat langkah gerak untuk diagnosa: langkah apa yang gagal dan
+-- dari tile mana. Dipakai lewat Hub.debug.Path.trace saat bot terlihat
+-- "gerak-berhenti" tanpa sampai ke tujuan.
+Path.trace = {}
+function Path.record(entry)
+	entry.at = os.clock()
+	table.insert(Path.trace, entry)
+	while #Path.trace > 80 do
+		table.remove(Path.trace, 1)
+	end
+end
+
 local function edgeBlocked(fx, fy, tx, ty)
 	local k = edgeKeyOf(fx, fy, tx, ty)
 	local untilAt = Path.blockedEdges[k]
@@ -2894,11 +2921,24 @@ function Path.explore(sx, sy, maxNodes)
 				for up = 1, 3 do
 					for dx = -2, 2 do
 						local nx, ny = cx + dx, cy - up
-						-- Jangan pilih lompatan diagonal yang harus menembus lantai
-						-- solid di samping poros. Masuk dulu ke tepi lantai, lalu
-						-- gunakan edgeJump untuk naik lagi.
-						if dx == 0 or up == 1 or not isSolid(nx, cy - 1)
-							or isPlatform(nx, cy - 1) then
+						-- Badan pemain butuh ruang kosong di SETIAP baris yang
+						-- dilewati lompatan, dari kolom awal sampai kolom tujuan.
+						-- Tanpa cek ini pathfinder menawarkan lompat menembus
+						-- lantai solid; bot mencoba, gagal berulang, lalu
+						-- dilaporkan "tidak bisa menjangkau" padahal mustahil.
+						local clear = true
+						local x0, x1 = math.min(cx, nx), math.max(cx, nx)
+						for k = 1, up do
+							local ry = cy - k
+							for mx = x0, x1 do
+								if isSolid(mx, ry) and not isPlatform(mx, ry) then
+									clear = false
+									break
+								end
+							end
+							if not clear then break end
+						end
+						if clear then
 							push(cx, cy, cc, nx, ny, 2 + math.abs(dx) + up, "jump")
 						end
 					end
@@ -2964,7 +3004,8 @@ local function pathStep(cx, cy, step, aliveFn)
 			outward = nil
 		end
 		if outward then Move.hold(outward) end
-		local deadline = os.clock() + 1.4
+		local scale = Move.frameScale()
+		local deadline = os.clock() + math.min(4, 1.4 * scale)
 		while aliveFn() and os.clock() < deadline do
 			local s = Bind.state()
 			if not s then break end
@@ -2972,7 +3013,7 @@ local function pathStep(cx, cy, step, aliveFn)
 			task.wait(0.03)
 		end
 		Move.release()
-		deadline = os.clock() + 5
+		deadline = os.clock() + math.min(12, 5 * scale)
 		while aliveFn() and os.clock() < deadline do
 			local s = Bind.state()
 			if not s then return false end
@@ -2992,13 +3033,14 @@ local function pathStep(cx, cy, step, aliveFn)
 		-- melewati beberapa lantai sekaligus).
 		local outward = step.shaftX < cx and KeyLeft or KeyRight
 		local inward = step.shaftX < cx and KeyRight or KeyLeft
+		local scale = Move.frameScale()
 		for _ = 1, 2 do
 			if not aliveFn() then
 				Move.release()
 				return false
 			end
 			Move.hold(outward)
-			local deadline = os.clock() + 1.2
+			local deadline = os.clock() + math.min(6, 1.2 * scale)
 			local airborne = false
 			while aliveFn() and os.clock() < deadline do
 				local s = Bind.state()
@@ -3013,7 +3055,7 @@ local function pathStep(cx, cy, step, aliveFn)
 			end
 			if airborne then
 				Move.hold(inward)
-				deadline = os.clock() + 1.1
+				deadline = os.clock() + math.min(6, 1.1 * scale)
 				while aliveFn() and os.clock() < deadline do
 					local s = Bind.state()
 					if not s then
@@ -3044,7 +3086,7 @@ local function pathStep(cx, cy, step, aliveFn)
 	if step.kind == "dropShaft" then
 		local outward = step.shaftX < cx and KeyLeft or KeyRight
 		Move.hold(outward)
-		local deadline = os.clock() + 2.5
+		local deadline = os.clock() + math.min(8, 2.5 * Move.frameScale())
 		while aliveFn() and os.clock() < deadline do
 			local s = Bind.state()
 			if not s then break end
@@ -3071,7 +3113,8 @@ local function pathStep(cx, cy, step, aliveFn)
 		end
 		if not aliveFn() then return false end
 		Move.hold(outward)
-		local deadline = os.clock() + 1.5
+		local scale = Move.frameScale()
+		local deadline = os.clock() + math.min(5, 1.5 * scale)
 		local ready = false
 		while aliveFn() and os.clock() < deadline do
 			local s = Bind.state()
@@ -3095,7 +3138,7 @@ local function pathStep(cx, cy, step, aliveFn)
 			return false
 		end
 		Move.hold(inward)
-		deadline = os.clock() + 1.2
+		deadline = os.clock() + math.min(5, 1.2 * scale)
 		local braking = false
 		while aliveFn() and os.clock() < deadline do
 			local s = Bind.state()
@@ -3261,7 +3304,7 @@ local function pathStep(cx, cy, step, aliveFn)
 				end
 			end
 			if tookOff then
-				local deadline = os.clock() + 1.6
+				local deadline = os.clock() + math.min(5.5, 1.6 * Move.frameScale())
 				local settled = false
 				while aliveFn() and os.clock() < deadline do
 					local s = Bind.state()
@@ -3325,6 +3368,8 @@ function Path.moveTo(tx, ty, aliveFn)
 	-- "tidak bisa menjangkau" hanya karena satu lompatan meleset.
 	local bestRemain = math.huge
 	local recovered = false
+	local clearedEdges = false
+	local staleState = 0
 	local startGen = Move.gen
 	local deadline = os.clock() + 120
 	for _ = 1, 400 do
@@ -3332,12 +3377,19 @@ function Path.moveTo(tx, ty, aliveFn)
 		-- bukan menyisakan loop pathfinding yang membuat client berat.
 		if not aliveFn() or Move.gen ~= startGen or os.clock() > deadline then
 			Move.release()
-			return false
+			return false, "alive"
 		end
 		local s = Bind.state()
 		if not s then
+			-- State sesaat hilang (respawn/streaming) bukan berarti tile tujuan
+			-- mustahil. Tunggu sebentar, jangan langsung menyerah.
+			staleState += 1
 			Move.release()
-			return false
+			if staleState > 15 then
+				return false, "nostate"
+			end
+			task.wait(0.2)
+			continue
 		end
 		local cx, cy = math.floor(s.x), math.floor(s.y - 0.0001)
 		local remain = math.abs(tx - cx) + math.abs(ty - cy)
@@ -3350,12 +3402,37 @@ function Path.moveTo(tx, ty, aliveFn)
 			return true
 		end
 		if path and expect and (cx ~= expect.x or cy ~= expect.y) then
-			path = nil
+			-- Jangan langsung buang jalur hanya karena posisi belum sama dengan
+			-- tile yang diharapkan (state game sering terlambat 1-2 frame).
+			-- Kalau tile sekarang masih ada di jalur yang sama, lanjutkan dari
+			-- situ; hitung ulang penuh hanya kalau benar-benar melenceng.
+			local resync
+			for j = idx, math.min(#path, idx + 8) do
+				if path[j].x == cx and path[j].y == cy then
+					resync = j
+					break
+				end
+			end
+			if resync then
+				idx = resync + 1
+			else
+				path = nil
+			end
+			expect = nil
 		end
 		if not path then
 			local dist, parent = Path.explore(cx, cy, 6000)
 			if not dist or dist[goalKey] == nil then
 				Move.release()
+				-- Edge yang sempat diblokir (mis. lompatan meleset sekali) bisa
+				-- menyembunyikan satu-satunya jalur ke tujuan. Bersihkan sekali
+				-- lalu hitung ulang sebelum menyatakan tujuan mustahil.
+				if not clearedEdges and next(Path.blockedEdges) ~= nil then
+					clearedEdges = true
+					Path.clearEdges()
+					task.wait(0.1)
+					continue
+				end
 				-- Dari pojok/tepi world pathfinder sering tidak menemukan
 				-- jalan sama sekali. Geser dulu, lalu hitung ulang sekali.
 				if not recovered and Move.edgeStuck() and Move.recover() then
@@ -3363,7 +3440,7 @@ function Path.moveTo(tx, ty, aliveFn)
 					task.wait(0.2)
 					continue
 				end
-				return false
+				return false, "noroute"
 			end
 			path = Path.reconstruct(parent, keyOf(cx, cy), goalKey)
 			idx = 1
@@ -3396,23 +3473,34 @@ function Path.moveTo(tx, ty, aliveFn)
 			local landed = Bind.state()
 			local moved = landed and landed.grounded
 				and not (math.floor(landed.x) == cx and math.floor(landed.y - 0.0001) == cy)
+			local traceEntry = {
+				from = string.format("%d,%d", cx, cy),
+				to = string.format("%d,%d", step.x, step.y),
+				kind = tostring(firstStep.kind),
+				ok = false,
+			}
+			Path.record(traceEntry)
 			-- Catat transisi pertama yang gagal. Tanpa ini pathfinder akan
 			-- menawarkan jalur yang sama lagi pada percobaan berikutnya.
 			-- Kalau karakter tetap pindah tile, jangan blokir: lompat yang
 			-- menembus platform sering berhenti satu lantai lebih rendah dan
 			-- jalur baru dari posisi itu masih valid.
 			if firstStep.kind ~= "walk" and not moved then
-				Path.blockEdge(cx, cy, firstStep.x, firstStep.y, 6)
+				Path.blockEdge(cx, cy, firstStep.x, firstStep.y, 10)
 			end
 			-- Masih di udara / kehilangan pijakan: path dari posisi ini tidak
 			-- berarti apa-apa, biar pemanggil yang ulang.
 			if not landed or not landed.grounded then
-				return false
+				traceEntry.why = "airborne"
+				return false, "airborne"
 			end
-			failedTransitions += 1
+			failedTransitions = moved and 0 or (failedTransitions + 1)
 			-- Satu transisi gagal (mis. lompatan tidak jadi, kepentok drop)
 			-- belum berarti jalurnya buntu. Beri kesempatan lebih banyak.
-			if failedTransitions >= 5 then return false end
+			if failedTransitions >= 5 then
+				traceEntry.why = "transition"
+				return false, "transition"
+			end
 			path, expect = nil, nil
 			task.wait(moved and 0.3 or 0.2)
 		else
@@ -3421,7 +3509,7 @@ function Path.moveTo(tx, ty, aliveFn)
 		end
 	end
 	Move.release()
-	return false
+	return false, "timeout"
 end
 
 -- Jemput drop hasil PNB. Game mengambil drop saat pemain berdiri di tile drop,
@@ -3690,9 +3778,57 @@ local function factoryWork(W, inv, target, seedId, gen)
 		end
 		return true
 	end
-	if not Path.moveTo(target.standX, target.standY, alive) then
+	-- Jalan ke tile berdiri target. Kalau gagal di tengah jalan (bukan karena
+	-- memang tidak ada jalur), pilih ulang target dari posisi sekarang lalu
+	-- coba lagi: karakter harus benar-benar sampai tile yang bisa menjangkau
+	-- pohon, bukan memukul/menyerah dari lantai atau tile yang salah.
+	local function approach(t)
+		local ok, why = Path.moveTo(t.standX, t.standY, alive)
+		if ok then
+			local arr = Bind.state()
+			if arr and standingFloor(arr) == t.y + 1 then
+				return true
+			end
+			why = "floor"
+		end
+		if why == "noroute" or why == "alive" or why == "timeout" then
+			return false, why
+		end
+		for _ = 1, 2 do
+			if not factoryAlive(gen) then
+				return false, "alive"
+			end
+			local now = Bind.state()
+			if not now then
+				return false, "nostate"
+			end
+			local again = factoryTarget(W, now, seedId, {}, "harvest")
+			if not again or (again.x == t.x and again.y == t.y) then
+				return false, why
+			end
+			target = again
+			task.wait(0.25)
+			local ok2, why2 = Path.moveTo(again.standX, again.standY, alive)
+			if ok2 then
+				local arr = Bind.state()
+				if arr and standingFloor(arr) == again.y + 1 then
+					return true
+				end
+				why2 = "floor"
+			end
+			why = why2 or why
+			if why == "noroute" or why == "alive" then
+				return false, why
+			end
+		end
+		return false, why
+	end
+	local reached, why = approach(target)
+	if not reached then
+		Factory.lastMoveFail = why
 		return false, retargeted and "retarget" or "path"
 	end
+	Factory.lastMoveFail = nil
 	local arrived = Bind.state()
 	if not factoryAlive(gen) or Factory.seedId ~= seedId or not (Factory[target.kind] or Factory.cycle)
 		or not arrived or standingFloor(arrived) ~= target.y + 1 then
@@ -4225,18 +4361,12 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 				end
 				blocked[key] = os.clock() + blockFor
 				Factory.harvestFailures = (Factory.harvestFailures or 0) + 1
-				-- Gagal lagi di pohon lain dengan alasan jalan: blokir edge yang
-				-- menumpuk hanya membuat bot menjauh. Bersihkan agar jalur
-				-- dihitung ulang dari nol.
-				if (reason == "path" or reason == "floor" or reason == "far")
-					and Factory.harvestFailures >= 2 and Path.clearEdges then
-					Path.clearEdges()
-				end
 				-- Diagnostik: alasan sebenarnya (path/floor/far) tidak tampil di
 				-- status. Simpan supaya bisa dibaca lewat Hub.debug.Factory.
 				local failState = Bind.state()
 				Factory.lastFail = {
 					reason = reason,
+					moveFail = Factory.lastMoveFail,
 					x = target.x,
 					y = target.y,
 					cy = cy,
