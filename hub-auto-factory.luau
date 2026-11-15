@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.103",
+	version = "0.4.104",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -1511,7 +1511,7 @@ function Dig.isProtected(id, x, y)
 end
 
 -- Pukul satu tile satu kali. Return true kalau panggilan game berhasil.
-function Dig.punch(x, y, isTree, skipAim, allowLava, forceBg)
+function Dig.punch(x, y, isTree, skipAim, allowLava, forceBg, canAct)
 	local W = Bind.getW()
 	if not W or not Bind.hit then
 		return false
@@ -1565,6 +1565,7 @@ function Dig.punch(x, y, isTree, skipAim, allowLava, forceBg)
 	if not skipAim then
 		Move.idle(0.03, 0.08)
 	end
+	if canAct and not canAct() then return false end
 
 	local ok = pcall(Bind.hit, x, y, isTree == true)
 	W.punchReady = os.clock() + rnd(0.21, 0.24)
@@ -2396,7 +2397,7 @@ end
 -- pemain berdiri di tepi tile, drop hasil pecahan (di tengah tile, x+0.5)
 -- berjarak ~0,5 tile dan sering luput dijemput karena posisinya tidak pas.
 -- Rapikan dulu ke tengah tile sebelum memasang/memecah.
-local function centerOnTile(x, timeout)
+local function centerOnTile(x, timeout, alive)
 	local s = Bind.state()
 	if not s or not s.grounded then
 		return false
@@ -2405,7 +2406,8 @@ local function centerOnTile(x, timeout)
 	if math.abs(s.x - cx) <= 0.1 then
 		return true
 	end
-	return Move.walkTo(cx, { timeout = timeout or 1.5, tol = 0.1, recover = false })
+	return Move.walkTo(cx, { timeout = timeout or 1.5, tol = 0.1, recover = false,
+		quick = alive ~= nil, alive = alive, floorY = alive and standingFloor(s) or nil })
 end
 
 local function findPNBTarget(W, state, layer, atSelf)
@@ -4186,7 +4188,28 @@ local function factoryPNBOne(W, inv, gen, blocked, skipCollect)
 	local alive = function()
 		return factoryAlive(gen) and W.name == Bind.name
 	end
-	if not Path.moveTo(standX, y, alive) then
+	local stationed = s.grounded and standingFloor(s) == y + 1 and math.floor(s.x) == standX
+	if not stationed and s.grounded and standingFloor(s) == y + 1
+		and math.abs(math.floor(s.x) - standX) <= 2 then
+		-- Setelah collect blok solid, posisi hanya bergeser ke tile sebelah.
+		-- Cek koridor pendek lalu kembali tanpa menghitung jalur seluruh world.
+		local fromX = math.floor(s.x)
+		local clear = true
+		for px = math.min(fromX, standX), math.max(fromX, standX) do
+			if not Path.standable(px, y) then clear = false; break end
+			if px < math.max(fromX, standX) then
+				local fx = standX > fromX and px or px + 1
+				local tx = standX > fromX and px + 1 or px
+				if edgeBlocked(fx, y, tx, y) then clear = false; break end
+			end
+		end
+		if clear then
+			stationed = Move.walkTo(standX + 0.5, { timeout = 2, tol = 0.2,
+				quick = true, recover = false, floorY = y + 1, alive = alive })
+		end
+	end
+	if stationed then Move.release() end
+	if not stationed and not Path.moveTo(standX, y, alive) then
 		if blocked then
 			blocked["pnb:" .. y .. ":" .. x] = os.clock() + 25
 		end
@@ -4194,7 +4217,7 @@ local function factoryPNBOne(W, inv, gen, blocked, skipCollect)
 		return false, "path"
 	end
 	local arrived = Bind.state()
-	if not factoryAlive(gen) or not arrived or standingFloor(arrived) ~= y + 1
+	if not alive() or not arrived or standingFloor(arrived) ~= y + 1
 		or pnbTileId(W, Factory.baseLayer, x, y) ~= 0 or tileId(x, y) ~= 0 then
 		if blocked then
 			blocked["pnb:" .. y .. ":" .. x] = os.clock() + 25
@@ -4205,7 +4228,7 @@ local function factoryPNBOne(W, inv, gen, blocked, skipCollect)
 	if Factory.baseAtSelf then
 		-- Blok non-solid dipasang di tile tempat berdiri; tengahkan karakter
 		-- supaya drop hasil pecahan langsung berada di bawah badan.
-		if not centerOnTile(x, 2) then
+		if not centerOnTile(x, 2, alive) then
 			-- Karakter tidak bisa tepat di tile ini (tidak grounded / terhalang).
 			-- Jangan pukul 30 kali ke tile yang salah; lepas station dan cari
 			-- tile lain. Blok yang sudah terpasang dibiarkan supaya tidak
@@ -4223,8 +4246,9 @@ local function factoryPNBOne(W, inv, gen, blocked, skipCollect)
 		return false, "place"
 	end
 	pcall(inv.remove, inv, baseId, 1)
-	W.punchReady = os.clock() + 0.15
-	task.wait(0.18)
+	-- Jangan memperpendek cooldown pukulan terakhir saat memasang blok baru.
+	-- Dig.punch menunggu sisa cooldown ini; tidak perlu jeda pasang terpisah.
+	W.punchReady = math.max(tonumber(W.punchReady) or 0, os.clock() + 0.15)
 	-- Kalau karakter tergeser dari tile blok setelah blok terpasang, pukulan
 	-- akan mengenai tile lain dan blok tidak pernah hancur. Berhenti lebih awal
 	-- daripada memukul 30 kali tanpa hasil.
@@ -4239,33 +4263,36 @@ local function factoryPNBOne(W, inv, gen, blocked, skipCollect)
 		end
 	end
 	for hit = 1, 30 do
-		if not factoryAlive(gen) or pnbTileId(W, Factory.baseLayer, x, y) ~= baseId then
+		if not alive() or pnbTileId(W, Factory.baseLayer, x, y) ~= baseId then
 			break
 		end
-		Dig.punch(x, y, false, hit > 1, Factory.baseId == 4, Factory.baseLayer == "bg")
-		task.wait(0.07)
+		if not Dig.punch(x, y, false, true, Factory.baseId == 4, Factory.baseLayer == "bg", alive) then break end
+		task.wait(0.02)
 	end
 	if pnbTileId(W, Factory.baseLayer, x, y) ~= 0 then
 		log(string.format("PNB: blok %s tidak hancur di X=%d Y=%d", tostring(baseId), x, y))
 		return false, "break"
 	end
 	Factory.pnb += 1
-	task.wait(0.3)
 	if skipCollect then
 		-- Mode hemat ruang: drop pecahan dibiarkan di lantai, tidak dijemput.
 		return true
 	end
-	if factoryAlive(gen) and Factory.baseAtSelf and dropSweepTile then
-		-- Blok non-solid: pecahan bisa jatuh ke baris lain; datangi tile drop.
-		dropSweepTile(W, x, y, baseId, alive)
-	end
 	if factoryAlive(gen) and not Factory.baseAtSelf and Bind.solid(x, y + 1) then
-		Move.walkTo(x + 0.5, { timeout = 3, tol = 0.28 })
+		Move.walkTo(x + 0.5, { timeout = 3, tol = 0.28,
+			quick = true, recover = false, floorY = y + 1, alive = alive })
 	end
-	local _, blockedId = collectDropsAtTile(W, inv, x, y, alive)
+	local _, blockedId = collectDropsAtTile(W, inv, x, y, alive, true)
 	if blockedId then
 		Factory.collectNeedsRoom = true
 		Factory.blockedDropId = blockedId
+	end
+	if alive() and not blockedId and Factory.baseAtSelf and dropSweepTile then
+		-- Cek lantai lain setelah kolektor memberi waktu drop untuk muncul.
+		-- Tanpa urutan ini, drop terlambat bisa terlewat saat blok terakhir habis.
+		if dropSweepTile(W, x, y, baseId, alive) and alive() then
+			collectDropsNearby(W, inv, Bind.state(), 1.35)
+		end
 	end
 	return true
 end
@@ -4748,7 +4775,7 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 				return 0.3
 			end
 		end
-		return worked and 0.3 or 1
+		return worked and 0.04 or 1
 	end
 
 	if Factory.phase == "collect" then
