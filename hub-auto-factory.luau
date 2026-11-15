@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.104",
+	version = "0.4.105",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -3936,10 +3936,11 @@ local function factoryWork(W, inv, target, seedId, gen)
 		-- "harvest N" dari pohon sebelumnya selama bot menyusuri lantai, jadi
 		-- bot terlihat diam tanpa alasan.
 		local pre = Bind.state()
-		if t.kind == "harvest" and pre and pre.grounded and standingFloor(pre) == t.y + 1 then
-			-- Pohon sebelah sudah dalam jangkauan pukul: tidak perlu berjalan
+		if pre and pre.grounded and standingFloor(pre) == t.y + 1 then
+			-- Target sebelah sudah dalam jangkauan aksi: tidak perlu berjalan
 			-- ke pusat tile berdiri lain atau menghitung Dijkstra lagi.
-			if math.abs(math.floor(pre.x) - t.x) <= 1 then
+			local reach = t.kind == "plant" and 2 or 1
+			if math.abs(math.floor(pre.x) - t.x) <= reach then
 				Move.release()
 				return true
 			end
@@ -3960,7 +3961,7 @@ local function factoryWork(W, inv, target, seedId, gen)
 				})
 				local pos = Bind.state()
 				if moved and pos and pos.grounded and standingFloor(pos) == t.y + 1
-					and math.abs(math.floor(pos.x) - t.x) <= 1 then return true end
+					and math.abs(math.floor(pos.x) - t.x) <= reach then return true end
 			end
 		end
 		if pre and (math.abs(pre.x - (t.standX + 0.5)) > 2.5
@@ -3987,7 +3988,7 @@ local function factoryWork(W, inv, target, seedId, gen)
 			if not now then
 				return false, "nostate"
 			end
-			local again = factoryTarget(W, now, seedId, {}, "harvest")
+			local again = factoryTarget(W, now, seedId, {}, t.kind)
 			if not again or (again.x == t.x and again.y == t.y) then
 				return false, why
 			end
@@ -4072,15 +4073,26 @@ local function factoryWork(W, inv, target, seedId, gen)
 	if not hasOK or (tonumber(count) or 0) < 1 then
 		return false, "seed"
 	end
+	local batchStart = Factory.planted
+	local batchLimit = 24
+	local function plantable(px)
+		return px >= 0 and px < (tonumber(W.w) or 100) - 1
+			and not (Factory.workX == px and Factory.workY == y)
+			and tileId(px, y) == 0 and Bind.solid(px, y + 1)
+	end
 	local function plantTile(px)
+		if not alive() or Factory.seedId ~= seedId or Factory.planted - batchStart >= batchLimit then return false end
+		local pos = Bind.state()
+		if not pos or not pos.grounded or standingFloor(pos) ~= y + 1
+			or math.abs(math.floor(pos.x) - px) > 2 then return false end
 		local left = select(2, pcall(inv.count, inv, seedId))
 		if (tonumber(left) or 0) < 1 then
 			return false
 		end
-		if tileId(px, y) ~= 0 or not Bind.solid(px, y + 1) then
+		if not plantable(px) then
 			return false
 		end
-		pcall(inv.select, inv, seedId)
+		if inv.selected ~= seedId and not pcall(inv.select, inv, seedId) then return false end
 		local ok = pcall(Bind.setTile, "fg", px, y, seedId, false, false)
 		if not ok or tileId(px, y) ~= seedId then
 			return false
@@ -4096,21 +4108,31 @@ local function factoryWork(W, inv, target, seedId, gen)
 	if not plantTile(x) then
 		return false, "place"
 	end
-	-- Game menerima tanam sampai 2 tile dari posisi berdiri (diuji: dx=1 dan
-	-- dx=2 berhasil, dx=18 ditolak), jadi sekalian tanam tile kosong di kiri
-	-- dan kanan selama masih di baris yang sama. Ini menghilangkan jalan
-	-- bolak-balik untuk tiap seed dan membuat fase plant jauh lebih cepat.
-	for _, dx in ipairs({ 1, -1, 2, -2 }) do
-		if not factoryAlive(gen) then
-			break
+	-- Isi jangkauan +/-2 dari posisi nyata, lalu geser maju di koridor
+	-- yang aman. Batch dibatasi supaya loop utama tetap mengecek inventory,
+	-- status factory, dan target lantai lain secara berkala.
+	local delta = x - math.floor(startState and startState.x or arrived.x)
+	local dir = delta < 0 and -1 or (delta > 0 and 1 or (arrived.facing == -1 and -1 or 1))
+	for _ = 1, 6 do
+		if not alive() or Factory.seedId ~= seedId or Factory.planted - batchStart >= batchLimit then break end
+		local pos = Bind.state()
+		if not pos or not pos.grounded or standingFloor(pos) ~= y + 1 then break end
+		local cx = math.floor(pos.x)
+		for offset = -2, 2 do plantTile(cx + dir * offset) end
+		local counted, remaining = pcall(inv.count, inv, seedId)
+		if not alive() or Factory.planted - batchStart >= batchLimit or not counted
+			or (tonumber(remaining) or 0) <= 0 then break end
+		local nextX
+		for step = 1, 4 do
+			local px = cx + dir * step
+			if px < 0 or px >= (tonumber(W.w) or 100) - 1
+				or not Path.standable(px, y) or edgeBlocked(px - dir, y, px, y) then break end
+			if plantable(px) then nextX = px end
 		end
-		local px = x + dx
-		if px >= 0 and px < (tonumber(W.w) or 100) - 1
-			and not (Factory.workX == px and Factory.workY == y) then
-			plantTile(px)
-		end
+		if not nextX then break end
+		if not Move.walkTo(nextX + 0.5, { timeout = 3, tol = 0.2, quick = true,
+			recover = false, floorY = y + 1, alive = alive }) then break end
 	end
-	task.wait(0.03)
 	return true
 end
 
