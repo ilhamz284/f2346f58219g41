@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.89",
+	version = "0.4.91",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -2639,6 +2639,13 @@ function Path.blockEdge(fx, fy, tx, ty, seconds)
 	Path.blockedEdges[edgeKeyOf(fx, fy, tx, ty)] = os.clock() + (seconds or 60)
 end
 
+-- Kalau kegagalan terus beruntun padahal tile-nya bisa dipijak, blokir edge
+-- lama hanya memperpanjang kebuntuan. Buang supaya pathfinder bisa mencoba
+-- jalur yang tadi sempat gagal sesaat.
+function Path.clearEdges()
+	Path.blockedEdges = {}
+end
+
 local function edgeBlocked(fx, fy, tx, ty)
 	local k = edgeKeyOf(fx, fy, tx, ty)
 	local untilAt = Path.blockedEdges[k]
@@ -2939,7 +2946,12 @@ local function pathStep(cx, cy, step, aliveFn)
 			and math.floor(s.y - 0.0001) == step.y
 	end
 	if step.kind == "walk" then
-		return Move.walkTo(step.x + 0.5, { timeout = 5, tol = 0.35 }) and landed()
+		-- Langkah walk digabung sepanjang satu baris, jadi jaraknya bisa
+		-- puluhan tile. Timeout tetap 5 dtk membuat langkah panjang gagal
+		-- di tengah jalan dan dilaporkan sebagai "tidak bisa menjangkau".
+		local tiles = math.abs((tonumber(step.x) or cx) - cx) + 1
+		local timeout = math.min(30, 4 + tiles * 0.35)
+		return Move.walkTo(step.x + 0.5, { timeout = timeout, tol = 0.35 }) and landed()
 	end
 	if step.kind == "fall" then
 		-- Jatuh panjang di kolom kosong: cukup melangkah keluar tepi, lalu
@@ -3378,13 +3390,15 @@ function Path.moveTo(tx, ty, aliveFn)
 			-- menembus platform sering berhenti satu lantai lebih rendah dan
 			-- jalur baru dari posisi itu masih valid.
 			if firstStep.kind ~= "walk" and not moved then
-				Path.blockEdge(cx, cy, firstStep.x, firstStep.y, 12)
+				Path.blockEdge(cx, cy, firstStep.x, firstStep.y, 6)
 			end
 			if not landed or not landed.grounded or not moved then
 				return false
 			end
 			failedTransitions += 1
-			if failedTransitions >= 3 then return false end
+			-- Satu transisi gagal (mis. kepentok drop/pemain lain) belum
+			-- berarti jalurnya buntu. Beri kesempatan lebih banyak.
+			if failedTransitions >= 5 then return false end
 			path, expect = nil, nil
 			task.wait(0.3)
 		else
@@ -4186,6 +4200,26 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 				end
 				blocked[key] = os.clock() + blockFor
 				Factory.harvestFailures = (Factory.harvestFailures or 0) + 1
+				-- Gagal lagi di pohon lain dengan alasan jalan: blokir edge yang
+				-- menumpuk hanya membuat bot menjauh. Bersihkan agar jalur
+				-- dihitung ulang dari nol.
+				if (reason == "path" or reason == "floor" or reason == "far")
+					and Factory.harvestFailures >= 2 and Path.clearEdges then
+					Path.clearEdges()
+				end
+				-- Diagnostik: alasan sebenarnya (path/floor/far) tidak tampil di
+				-- status. Simpan supaya bisa dibaca lewat Hub.debug.Factory.
+				local failState = Bind.state()
+				Factory.lastFail = {
+					reason = reason,
+					x = target.x,
+					y = target.y,
+					cy = cy,
+					sameFloor = sameFloor,
+					fromX = failState and failState.x,
+					fromY = failState and failState.y,
+					at = os.clock(),
+				}
 				if factoryAlive(gen) then
 					setFactoryStatus(string.format("Factory: %s X=%d Y=%d; coba tree lain",
 						reasonText, target.x, target.y))
