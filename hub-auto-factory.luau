@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.102",
+	version = "0.4.103",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -1309,6 +1309,8 @@ Hub.touch = Touch
 Move.panicRelease()
 
 -- Jalan ke target X. Return true kalau berhenti di dekat target.
+-- quick melewati jeda reaksi/berhenti untuk koridor panen yang sudah dicek;
+-- floorY dan alive membatalkan gerak jika jatuh, Stop, atau world berubah.
 function Move.walkTo(targetX, opts)
 	opts = opts or {}
 	-- Pastikan backend benar-benar menggerakkan karakter sebelum menghabiskan
@@ -1327,19 +1329,21 @@ function Move.walkTo(targetX, opts)
 	-- dilepas, jadi semua tekanan baru kalah. Diperbaiki sekali per langkah.
 	local oppSince, dirFixed = nil, false
 
-	if not Move.held then
+	if not Move.held and not opts.quick then
 		Move.idle(Move.cfg.reactMin, Move.cfg.reactMax)
 	end
 
 	while Move.gen == myGen and os.clock() < deadline do
+		if opts.alive and not opts.alive() then break end
 		local s = Bind.state()
 		if not s then
 			break
 		end
+		if opts.floorY and (not s.grounded or math.floor(s.y - 0.0001) + 1 ~= opts.floorY) then break end
 		local dx = targetX - s.x
 		if math.abs(dx) <= tol then
 			Move.release()
-			Move.idle(0.06, 0.16)
+			if not opts.quick then Move.idle(0.06, 0.16) end
 			return true
 		end
 
@@ -2155,7 +2159,9 @@ end
 -- Karena itu patokannya bukan hasil takeDrop, tetapi apakah drop masih ada
 -- di sekitar tile setelah ditunggu dan dijemput.
 -- Return: jumlah yang diambil, id drop yang tertinggal karena inventory penuh.
-local function collectDropsAtTile(W, inv, x, y, alive)
+-- quick untuk harvest: drop terlambat tetap ditunggu, tetapi UID yang sudah
+-- diambil penuh tidak dicoba ulang hanya karena sprite/cache belum hilang.
+local function collectDropsAtTile(W, inv, x, y, alive, quick)
 	if type(W.dropList) ~= "function" or type(W.takeDrop) ~= "function"
 		or type(inv.room) ~= "function" or type(inv.add) ~= "function" then
 		return 0, nil
@@ -2163,6 +2169,7 @@ local function collectDropsAtTile(W, inv, x, y, alive)
 	local cx, cy = x + 0.5, y + 0.5
 	local total = 0
 	local attempts = {}
+	local collectedUIDs = {}
 	local start = os.clock()
 
 	local function nearby()
@@ -2177,6 +2184,7 @@ local function collectDropsAtTile(W, inv, x, y, alive)
 		local list, nearest, nearestDist = {}, nil, nil
 		for _, drop in ipairs(drops) do
 			if type(drop) == "table" and type(drop.uid) == "number"
+				and not collectedUIDs[drop.uid]
 				and type(drop.id) == "number" and type(drop.n) == "number"
 				and type(drop.x) == "number" and type(drop.y) == "number"
 				and not (Factory.ignoredDrops and (Factory.ignoredDrops[drop.uid] or 0) > os.clock()) then
@@ -2195,7 +2203,7 @@ local function collectDropsAtTile(W, inv, x, y, alive)
 	end
 
 	local sawAny = false
-	while os.clock() - start < 1.6 do
+	while os.clock() - start < (quick and 0.6 or 1.6) do
 		if alive and not alive() then
 			break
 		end
@@ -2205,13 +2213,14 @@ local function collectDropsAtTile(W, inv, x, y, alive)
 			if sawAny or os.clock() - start >= 0.35 then
 				break
 			end
-			task.wait(0.1)
+			task.wait(quick and 0.06 or 0.1)
 		else
 			sawAny = true
 			-- Berdiri tepat di drop; jangan jalan kalau drop ada di lantai
 			-- lain (bisa memicu jatuh).
 			if nearest and nearestDist > 0.81 and math.abs(nearest.y - state.y) <= 1.05 then
-				Move.walkTo(nearest.x, { timeout = 1.2, tol = 0.22 })
+				Move.walkTo(nearest.x, { timeout = 1.2, tol = 0.22,
+					quick = quick, alive = alive, floorY = quick and (y + 1) or nil, recover = not quick })
 				state = Bind.state() or state
 			end
 			local anyRoom, took, retry = false, false, false
@@ -2223,11 +2232,12 @@ local function collectDropsAtTile(W, inv, x, y, alive)
 					anyRoom = true
 					if (attempts[drop.uid] or 0) < 3 then
 						attempts[drop.uid] = (attempts[drop.uid] or 0) + 1
-						local okT, taken = pcall(W.takeDrop, drop.uid, math.min(drop.n, available))
+						local okT, taken = pcall(W.takeDrop, drop.uid, drop.n)
 						taken = okT and tonumber(taken) or 0
 						if taken > 0 then
 							pcall(inv.add, inv, drop.id, taken)
 							total += taken
+							if quick and taken >= drop.n then collectedUIDs[drop.uid] = true end
 							took = true
 						else
 							retry = true
@@ -2240,7 +2250,7 @@ local function collectDropsAtTile(W, inv, x, y, alive)
 			if not anyRoom or (not took and not retry) then
 				break
 			end
-			task.wait(0.1)
+			task.wait(quick and 0.06 or 0.1)
 		end
 	end
 
@@ -3924,6 +3934,33 @@ local function factoryWork(W, inv, target, seedId, gen)
 		-- "harvest N" dari pohon sebelumnya selama bot menyusuri lantai, jadi
 		-- bot terlihat diam tanpa alasan.
 		local pre = Bind.state()
+		if t.kind == "harvest" and pre and pre.grounded and standingFloor(pre) == t.y + 1 then
+			-- Pohon sebelah sudah dalam jangkauan pukul: tidak perlu berjalan
+			-- ke pusat tile berdiri lain atau menghitung Dijkstra lagi.
+			if math.abs(math.floor(pre.x) - t.x) <= 1 then
+				Move.release()
+				return true
+			end
+			local fromX = math.floor(pre.x)
+			local clear = true
+			for px = math.min(fromX, t.standX), math.max(fromX, t.standX) do
+				if not Path.standable(px, t.y) then clear = false; break end
+				if px < math.max(fromX, t.standX) then
+					local fx = t.standX > fromX and px or px + 1
+					local tx = t.standX > fromX and px + 1 or px
+					if edgeBlocked(fx, t.y, tx, t.y) then clear = false; break end
+				end
+			end
+			if clear then
+				local moved = Move.walkTo(t.standX + 0.5, {
+					timeout = math.min(20, 2 + math.abs(t.standX - fromX) * 0.35),
+					tol = 0.28, quick = true, recover = false, floorY = t.y + 1, alive = alive,
+				})
+				local pos = Bind.state()
+				if moved and pos and pos.grounded and standingFloor(pos) == t.y + 1
+					and math.abs(math.floor(pos.x) - t.x) <= 1 then return true end
+			end
+		end
 		if pre and (math.abs(pre.x - (t.standX + 0.5)) > 2.5
 			or math.floor(pre.y - 0.0001) ~= t.y) then
 			setFactoryStatus(string.format("Factory: jalan ke %s X=%d Y=%d",
@@ -3997,7 +4034,7 @@ local function factoryWork(W, inv, target, seedId, gen)
 			if not factoryAlive(gen) or tileId(x, y) ~= seedId then
 				break
 			end
-			Dig.punch(x, y, true, hit > 1, false)
+			Dig.punch(x, y, true, true, false)
 			task.wait(0.02)
 		end
 		if tileId(x, y) ~= 0 then
@@ -4014,11 +4051,12 @@ local function factoryWork(W, inv, target, seedId, gen)
 			end
 		end
 		if factoryAlive(gen) and Bind.solid(x, y + 1) then
-			Move.walkTo(x + 0.5, { timeout = 1.2, tol = 0.28 })
+			Move.walkTo(x + 0.5, { timeout = 1.2, tol = 0.28, quick = true,
+				floorY = y + 1, recover = false, alive = alive })
 		end
 		local _, blockedId = collectDropsAtTile(W, inv, x, y, function()
 			return factoryAlive(gen) and W.name == Bind.name
-		end)
+		end, true)
 		if blockedId then
 			Factory.collectNeedsRoom = true
 			Factory.blockedDropId = blockedId
@@ -4485,7 +4523,6 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 				if Factory.harvestFailCount then
 					Factory.harvestFailCount[seedId .. ":harvest:" .. target.y .. ":" .. target.x] = nil
 				end
-				task.wait(0.05)
 				local _, needsRoom = collectDropsNearby(W, inv, Bind.state(), 1.35)
 				if needsRoom then Factory.collectNeedsRoom = true end
 				if factoryAlive(gen) then
@@ -4542,7 +4579,7 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 						reasonText, target.x, target.y))
 				end
 			end
-			return 0.08
+			return worked and 0.03 or 0.08
 		end
 		local ripeElsewhere = factoryHasRipeTree(W, seedId)
 		-- Beberapa target hanya ditunda beberapa detik setelah input gerak
@@ -5066,7 +5103,7 @@ local function startFactory()
 										blocked[currentSeed .. ":" .. target.kind .. ":" .. target.y .. ":" .. target.x] = os.clock() + 4
 									end
 								end
-								task.wait(0.18)
+								task.wait(target.kind == "harvest" and worked and 0.04 or 0.18)
 							else
 								collectDropsNearby(W, inv, s, 1.35)
 								setFactoryStatus(string.format("%s: belum ada pohon matang â€” %s",
