@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.92",
+	version = "0.4.93",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -3317,6 +3317,11 @@ function Path.moveTo(tx, ty, aliveFn)
 	local goalKey = keyOf(tx, ty)
 	local path, idx, expect = nil, 1, nil
 	local failedTransitions = 0
+	-- Sisa jarak terbaik sejauh ini. Selama bot makin dekat ke tile tujuan
+	-- (mis. naik satu lantai), kegagalan langkah sebelumnya tidak dihitung
+	-- sebagai jalan buntu. Tanpa ini, panjatan 4-5 lantai selalu dianggap
+	-- "tidak bisa menjangkau" hanya karena satu lompatan meleset.
+	local bestRemain = math.huge
 	local recovered = false
 	local startGen = Move.gen
 	local deadline = os.clock() + 120
@@ -3333,6 +3338,11 @@ function Path.moveTo(tx, ty, aliveFn)
 			return false
 		end
 		local cx, cy = math.floor(s.x), math.floor(s.y - 0.0001)
+		local remain = math.abs(tx - cx) + math.abs(ty - cy)
+		if remain < bestRemain then
+			bestRemain = remain
+			failedTransitions = 0
+		end
 		if cx == tx and cy == ty and s.grounded then
 			Move.release()
 			return true
@@ -3392,15 +3402,17 @@ function Path.moveTo(tx, ty, aliveFn)
 			if firstStep.kind ~= "walk" and not moved then
 				Path.blockEdge(cx, cy, firstStep.x, firstStep.y, 6)
 			end
-			if not landed or not landed.grounded or not moved then
+			-- Masih di udara / kehilangan pijakan: path dari posisi ini tidak
+			-- berarti apa-apa, biar pemanggil yang ulang.
+			if not landed or not landed.grounded then
 				return false
 			end
 			failedTransitions += 1
-			-- Satu transisi gagal (mis. kepentok drop/pemain lain) belum
-			-- berarti jalurnya buntu. Beri kesempatan lebih banyak.
+			-- Satu transisi gagal (mis. lompatan tidak jadi, kepentok drop)
+			-- belum berarti jalurnya buntu. Beri kesempatan lebih banyak.
 			if failedTransitions >= 5 then return false end
 			path, expect = nil, nil
-			task.wait(0.3)
+			task.wait(moved and 0.3 or 0.2)
 		else
 			expect = { x = step.x, y = step.y }
 			idx += stepCount
