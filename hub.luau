@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.100",
+	version = "0.4.101",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -975,7 +975,10 @@ function Move.preferTouch()
 		vkey(false, Move.vimHeld)
 		Move.vimHeld = nil
 	end
+	vkey(false, KeyLeft)
+	vkey(false, KeyRight)
 	Move.held = nil
+	Move.heldAt = nil
 	Move.backend = "touch"
 	log("mode gerak: sentuh (MobileGui)")
 	return true
@@ -1041,6 +1044,13 @@ function Move.release()
 		vkey(false, Move.vimHeld)
 		Move.vimHeld = nil
 	end
+	-- Lepas KEDUA arah, bukan hanya yang tercatat. Satu key-up bisa hilang
+	-- (fokus window berpindah, objek VIM diganti game) sehingga tombol arah
+	-- lama tetap tertahan; gerakan berikutnya jadi melawan arah dan bot
+	-- terlihat "nyandet-nyandet" atau jalan balik.
+	vkey(false, KeyLeft)
+	vkey(false, KeyRight)
+	Move.heldAt = nil
 	if Touch.ready then
 		pcall(Touch.ctrl.edit, nil)
 	end
@@ -1082,6 +1092,14 @@ end
 
 function Move.hold(kc)
 	if Move.held == kc then
+		-- Tekanan yang sama tidak dikirim ulang, padahal state game bisa
+		-- lebih dulu hilang (fokus window, objek VIM diganti). Kirim ulang
+		-- berkala dan bersihkan arah lain supaya tidak ada tombol tertinggal.
+		if Move.backend == "vim" and os.clock() - (Move.heldAt or 0) > 0.6 then
+			Move.heldAt = os.clock()
+			vkey(false, kc == KeyRight and KeyLeft or KeyRight)
+			vkey(true, kc)
+		end
 		return
 	end
 	Move.preferTouch()
@@ -1089,12 +1107,14 @@ function Move.hold(kc)
 	if Move.backend == "touch" then
 		if touchPress(kc == KeyRight and "Right" or "Left") then
 			Move.held = kc
+			Move.heldAt = os.clock()
 			return
 		end
 		Move.backend = "vim"
 		log("input sentuh gagal; kembali ke VIM")
 	end
 	Move.held = kc
+	Move.heldAt = os.clock()
 	Move.vimHeld = kc
 	vkey(true, kc)
 end
@@ -1294,6 +1314,10 @@ function Move.walkTo(targetX, opts)
 	local lastX, lastT = nil, os.clock()
 	local recovered = false
 	local retried = false
+	-- Deteksi arah berlawanan: karakter bergerak ke kiri padahal target di
+	-- kanan (atau sebaliknya). Penyebabnya tombol arah lama yang tidak pernah
+	-- dilepas, jadi semua tekanan baru kalah. Diperbaiki sekali per langkah.
+	local oppSince, dirFixed = nil, false
 
 	if not Move.held then
 		Move.idle(Move.cfg.reactMin, Move.cfg.reactMax)
@@ -1332,6 +1356,20 @@ function Move.walkTo(targetX, opts)
 		local s3 = Bind.state()
 		if s3 then
 			if not lastX or math.abs(s3.x - lastX) >= 0.05 then
+				local opp = lastX and ((dx > 0 and s3.x < lastX) or (dx < 0 and s3.x > lastX))
+				if opp then
+					oppSince = oppSince or os.clock()
+					if not dirFixed and os.clock() - oppSince > 0.4 then
+						dirFixed = true
+						Move.panicRelease()
+						Move.hold(key)
+						log(string.format(
+							"gerak: arah berlawanan (target %.1f, posisi %.2f); tombol dilepas paksa",
+							targetX, s3.x))
+					end
+				else
+					oppSince = nil
+				end
 				lastX = s3.x
 				lastT = os.clock()
 			elseif os.clock() - lastT > 1.2 then
