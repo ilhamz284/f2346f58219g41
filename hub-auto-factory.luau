@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.93",
+	version = "0.4.94",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -1392,6 +1392,8 @@ local Factory = {
 	seedGrow = nil,
 	baseId = nil,
 	baseName = nil,
+	pairId = nil,
+	pairName = nil,
 	baseLayer = nil,
 	baseAtSelf = nil,
 	workX = nil,
@@ -4134,12 +4136,15 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 	local seeds = factoryCount(inv, seedId)
 	local room = factoryRoom(inv, Factory.baseId)
 	local blockFull = blocks >= 200 or room == 0 or Factory.collectNeedsRoom == true
+	-- Mode panen saja (tanpa Auto Factory): tugasnya cuma memanen. Inventory
+	-- blok penuh bukan urusannya, jadi jangan berhenti dan jangan masuk PNB.
+	local harvestOnly = not Factory.cycle
 
 	if Factory.phase == "harvest" then
 		local cy = math.floor(state.y - 0.0001)
 		-- Blok penuh: panen cuma membuang drop (inv.room(id) == 0 membuat
 		-- takeDrop mengembalikan 0), jadi kosongkan dulu lewat PNB.
-		if blockFull and Factory.baseId then
+		if blockFull and Factory.baseId and not harvestOnly then
 			Factory.collectNeedsRoom = false
 			beginPNB(W, blocks, true)
 			return 0.1
@@ -4147,10 +4152,18 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 		-- Mode panen saja tidak punya PNB/tanam untuk mengosongkan blok.
 		-- Kalau drop panen tidak muat, berhenti memukul pohon: kalau terus
 		-- jalan, hasil panen tertinggal di belakang lalu hilang.
-		if Factory.collectNeedsRoom and not Factory.baseId then
+		if Factory.collectNeedsRoom and (harvestOnly or not Factory.baseId) then
 			local dropId = Factory.blockedDropId
 			local dropRoom = dropId and factoryRoom(inv, dropId) or 0
-			if dropRoom > 0 then
+			-- Id blok pasangan seed. Di mode cycle sama dengan Factory.baseId;
+			-- di mode panen saja baseId memang nil, jadi pakai pairId.
+			local blockItemId = Factory.baseId or Factory.pairId
+			if harvestOnly and dropId and dropId == blockItemId then
+				-- Yang penuh cuma item blok, bukan hasil panen. Biarkan panen
+				-- jalan terus.
+				Factory.collectNeedsRoom = false
+				Factory.blockedDropId = nil
+			elseif dropRoom > 0 then
 				Factory.collectNeedsRoom = false
 				Factory.blockedDropId = nil
 				local collected = collectDropsNearby(W, inv, state, 1.6)
@@ -4573,20 +4586,30 @@ local function startFactory()
 		setFactoryStatus("gagal: data world, inventory, atau definisi seed belum terbaca")
 		return false
 	end
-	local baseId, baseDef
-	if Factory.cycle then
+	-- Blok pasangan dari seed (mis. Pepper Tree Seed 4585 -> blok 4584).
+	-- PNB hanya memakainya di mode cycle, tapi id pasangannya tetap dicatat
+	-- di Factory.pairId supaya mode panen saja bisa membedakan "item blok
+	-- penuh" dari "hasil panen penuh".
+	local pairId, pairDef
+	do
 		local items = findItemDB()
-		baseId = seedId - 1
-		baseDef = items and items[baseId]
+		pairId = seedId - 1
+		pairDef = items and items[pairId]
 		-- Blok pasangan tidak harus bertanda "farmable": Dirt, Rock, dan Cave
 		-- Background juga bisa dipasang lalu dihancurkan. Di ItemDB hanya
 		-- Sugar Cane yang farmable = true, jadi syarat lama membuat factory
 		-- menolak jalan untuk semua seed lain.
-		if type(baseDef) ~= "table" or baseDef.kind == "seed"
-			or def.name ~= (tostring(baseDef.name) .. " Seed") or Dig.protectedIds[baseId] then
-			baseId, baseDef = nil, nil
-			log("PNB dimatikan: seed " .. tostring(seedId) .. " tidak punya pasangan blok yang bisa dipasang")
+		if type(pairDef) ~= "table" or pairDef.kind == "seed"
+			or def.name ~= (tostring(pairDef.name) .. " Seed") or Dig.protectedIds[pairId] then
+			pairId, pairDef = nil, nil
+			if Factory.cycle then
+				log("PNB dimatikan: seed " .. tostring(seedId) .. " tidak punya pasangan blok yang bisa dipasang")
+			end
 		end
+	end
+	local baseId, baseDef = pairId, pairDef
+	if not Factory.cycle then
+		baseId, baseDef = nil, nil
 	end
 	local state = Bind.state()
 	local floorY = state and standingFloor(state)
@@ -4612,6 +4635,7 @@ local function startFactory()
 	Factory.seedName = def.name or ("Seed " .. seedId)
 	Factory.seedGrow = tonumber(def.grow) or 0
 	Factory.baseId, Factory.baseName = baseId, baseDef and baseDef.name or nil
+	Factory.pairId, Factory.pairName = pairId, pairDef and pairDef.name or nil
 	Factory.baseLayer = baseDef and (baseDef.background == true and "bg" or "fg") or nil
 	Factory.baseAtSelf = baseDef and (baseDef.background == true or baseDef.solid == false) or nil
 	Factory.workX, Factory.workStandX, Factory.workY = nil, nil, nil
@@ -4706,7 +4730,12 @@ local function startFactory()
 						if Factory.collectNeedsRoom then
 							local dropId = Factory.blockedDropId
 							local dropRoom = dropId and factoryRoom(inv, dropId) or 0
-							if dropRoom > 0 then
+							if dropId and dropId == (Factory.baseId or Factory.pairId) then
+								-- Auto Harvest/Plant saja: item blok penuh bukan
+								-- alasan menahan panen. Biarkan panen jalan terus.
+								Factory.collectNeedsRoom = false
+								Factory.blockedDropId = nil
+							elseif dropRoom > 0 then
 								Factory.collectNeedsRoom = false
 								Factory.blockedDropId = nil
 								local picked = collectDropsNearby(W, inv, s, 1.6)
