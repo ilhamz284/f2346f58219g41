@@ -24,6 +24,8 @@ local Bind={state=function() return state end}
 local inv={blocks=30,seeds=0}
 local Factory={}
 local targetAvailable,ripeTrees,room,workReason=true,true,170,nil
+function inv.count(_,id) return id==955 and inv.seeds or inv.blocks end
+function inv.room() return room end
 local pnbCalls,workCalls,lastDrain=0,0,nil
 local function selectedItemDefinition() return {grow=1,name="Seed"} end
 local function factoryCount(_,id) return id==955 and inv.seeds or inv.blocks end
@@ -70,7 +72,7 @@ factoryCycleStep(W,inv,state,955,blocked,1)
 assert(workCalls==1 and inv.blocks==31, "harvest resumes after temporary target loss")
 print("PASS harvest keeps 30 blocks through target/route cooldown, then resumes")
 
-for _,reportedRoom in ipairs({170,0}) do
+for _,reportedRoom in ipairs({170}) do
     reset("harvest",30)
     Factory.collectNeedsRoom=true; Factory.blockedDropId=955; room=reportedRoom
     factoryCycleStep(W,inv,state,955,{},1)
@@ -117,11 +119,42 @@ Factory.harvestPathRetryAt["955:harvest:3:3"]=now+3
 factoryCycleStep(W,inv,state,955,failed,1)
 assert(Factory.harvestPathRetryAt["955:harvest:3:3"]==nil, "successful harvest clears movement retry")
 print("PASS movement retry recording and cleanup")
+
+reset("harvest",30); inv.seeds=200
+factoryCycleStep(W,inv,state,955,{},1)
+assert(Factory.phase=="plant" and workCalls==0 and pnbCalls==0,
+    "full seeds stop harvest and plant before another tree is hit")
+reset("harvest",30); room=0
+factoryCycleStep(W,inv,state,955,{},1)
+assert(Factory.phase=="pnb" and workCalls==0 and pnbCalls==1,
+    "confirmed zero room stops harvest even below stack limit")
+reset("harvest",30)
+local roomFn=inv.room
+inv.room=function() error("not ready") end
+factoryCycleStep(W,inv,state,955,{},1)
+assert(workCalls==0 and pnbCalls==0,"unknown capacity pauses without guessing a PNB transition")
+inv.room=roomFn
+reset("harvest",30); workReason="capacity"
+local postponed={}
+factoryCycleStep(W,inv,state,955,postponed,1)
+assert(next(postponed)==nil and pnbCalls==0,"mid-route capacity change is not a failed tree")
+print("PASS seed-full, zero room, unknown capacity and mid-route transition")
+inv.blocks=200; workReason=nil
+factoryCycleStep(W,inv,state,955,postponed,1)
+assert(Factory.phase=="pnb" and pnbCalls==1,"next tick resolves capacity change into PNB")
+reset("harvest",200); inv.seeds=200
+factoryCycleStep(W,inv,state,955,{},1)
+assert(Factory.phase=="plant" and Factory.resumePNB and workCalls==0,
+    "full seeds are planted first while preserving the full block batch")
+reset("harvest",200); Factory.cycle=false
+factoryCycleStep(W,inv,state,955,{},1)
+assert(workCalls==0 and pnbCalls==0,"manual harvest pauses at capacity without starting PNB")
 '''
 
 with tempfile.TemporaryDirectory(prefix="humanhub-cycle-") as directory:
     path = Path(directory) / "cycle.luau"
-    path.write_text("\n".join([prelude,cycle,cases]), encoding="utf-8")
+    guard=source[source.index("local function factoryHarvestCapacity("):source.index("local function factoryWork(")]
+    path.write_text("\n".join([prelude,guard,cycle,cases]), encoding="utf-8")
     result = subprocess.run([sys.argv[1],str(path)], capture_output=True,
                             text=True, encoding="utf-8")
     print(result.stdout,end="")

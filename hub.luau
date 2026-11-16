@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.119",
+	version = "0.4.120",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -4115,7 +4115,26 @@ local function factoryTarget(W, state, seedId, blocked, onlyKind)
 	return nil
 end
 
+-- Baca kapasitas item hasil panen yang tepat. Nil/error bukan room=0 dan
+-- flag gagal takeDrop bukan bukti penuh; data yang belum valid menahan pukul.
+local function factoryHarvestCapacity(inv, seedId, blockId)
+	local unknown = false
+	for _, item in ipairs({ { id = seedId, kind = "seed" }, { id = blockId, kind = "block" } }) do
+		if item.id then
+			local counted, n = pcall(inv.count, inv, item.id)
+			local checked, room = pcall(inv.room, inv, item.id)
+			if (counted and type(n) == "number" and n >= 200)
+				or (checked and type(room) == "number" and room <= 0) then return item.kind end
+			if not counted or type(n) ~= "number" or not checked or type(room) ~= "number" then unknown = true end
+		end
+	end
+	return unknown and "unknown" or nil
+end
+
 local function factoryWork(W, inv, target, seedId, gen)
+	if target.kind == "harvest" and factoryHarvestCapacity(inv, seedId, Factory.baseId or Factory.pairId) then
+		return false, "capacity"
+	end
 	local startState = Bind.state()
 	local checkedFloor = startState and math.floor(startState.y - 0.0001)
 	local retargeted = false
@@ -4252,14 +4271,21 @@ local function factoryWork(W, inv, target, seedId, gen)
 			local counted, count = pcall(inv.count, inv, blockId)
 			if counted then blockBefore = tonumber(count) end
 		end
+		local capacityBlocked = false
+		local function canHarvest()
+			if not alive() then return false end
+			if factoryHarvestCapacity(inv, seedId, blockId) then capacityBlocked = true; return false end
+			return true
+		end
 		for hit = 1, 12 do
 			if not factoryAlive(gen) or tileId(x, y) ~= seedId then
 				break
 			end
-			Dig.punch(x, y, true, true, false)
+			if not canHarvest() or not Dig.punch(x, y, true, true, false, nil, canHarvest) then break end
 			task.wait(0.02)
 		end
 		if tileId(x, y) ~= 0 then
+			if capacityBlocked then return false, "capacity" end
 			return false, "break"
 		end
 		Factory.harvested += 1
@@ -4863,15 +4889,31 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 	end
 	local blocks = factoryCount(inv, Factory.baseId)
 	local seeds = factoryCount(inv, seedId)
-	-- Gagal mengambil drop atau pembacaan room bukan bukti stack blok 200.
-	-- Keputusan meninggalkan harvest memakai jumlah blok yang benar-benar ada.
+	-- Batas stack berbeda dari kapasitas backpack; room per item diperiksa
+	-- terpisah sebelum harvest, tanpa mengubah error pembacaan menjadi nol.
 	local blockFull = blocks >= 200
-	-- Mode panen saja (tanpa Auto Factory): tugasnya cuma memanen. Inventory
-	-- blok penuh bukan urusannya, jadi jangan berhenti dan jangan masuk PNB.
+	-- Mode panen saja tidak mempunyai PNB; saat penuh tahan pukulan sampai
+	-- pengguna menyediakan ruang, tanpa memulai fase Factory lain.
 	local harvestOnly = not Factory.cycle
 
 	if Factory.phase == "harvest" then
 		local cy = math.floor(state.y - 0.0001)
+		local limit = factoryHarvestCapacity(inv, seedId, Factory.baseId or Factory.pairId)
+		if limit then
+			Move.release()
+			if not harvestOnly and limit == "seed" and seeds > 0 then
+				Factory.phase = "plant"
+				Factory.resumePNB = blockFull and blocks > 0
+				setFactoryStatus(string.format("Factory: seed penuh (%d); tanam sebelum lanjut panen", seeds))
+			elseif not harvestOnly and Factory.baseId and blocks > 0 and limit ~= "unknown" then
+				Factory.collectNeedsRoom = false
+				beginPNB(W, blocks, true)
+			else
+				setFactoryStatus(limit == "unknown" and "Factory: data kapasitas belum valid; panen ditahan"
+					or "Factory: inventory penuh; panen ditahan sampai ada ruang")
+			end
+			return 0.5
+		end
 		-- Stack 200: kosongkan blok lewat PNB sebelum melanjutkan panen.
 		if blockFull and Factory.baseId and not harvestOnly then
 			Factory.collectNeedsRoom = false
@@ -4924,6 +4966,10 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 						Factory.harvested, factoryCount(inv, Factory.baseId)), "harvest")
 				end
 			else
+				if reason == "capacity" then
+					setFactoryStatus("Factory: kapasitas berubah saat perjalanan; cek inventory sebelum lanjut")
+					return 0.1
+				end
 				if reason == "retarget" then
 					setFactoryStatus("Factory: pindah lantai; pilih pohon matang terdekat")
 					return 0.1
@@ -5452,7 +5498,14 @@ local function startFactory()
 						task.wait(factoryCycleStep(W, inv, s, currentSeed, blocked, gen))
 					else
 						local paused = false
-						if Factory.collectNeedsRoom then
+						if Factory.harvest and not Factory.plant
+							and factoryHarvestCapacity(inv, currentSeed, Factory.baseId or Factory.pairId) then
+							Move.release()
+							setFactoryStatus("Factory: inventory penuh atau kapasitas belum terbaca; panen ditahan")
+							task.wait(0.5)
+							paused = true
+						end
+						if not paused and Factory.collectNeedsRoom then
 							local dropId = Factory.blockedDropId
 							local dropRoom = dropId and factoryRoom(inv, dropId) or 0
 							if dropId and dropId == (Factory.baseId or Factory.pairId) then

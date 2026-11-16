@@ -55,6 +55,7 @@ local W = {name="TEST", w=100, h=60}
 local tiles = {}
 local Factory = {seedId=955,harvest=true,cycle=false,harvested=0}
 local inv = {room=function() return 200 end, add=function() end}
+function inv.count() return 0 end
 local function standingFloor(s) return math.floor(s.y-0.0001)+1 end
 local function factoryAlive() return active end
 local function tileId(x,y) return tiles[y*100+x] or 0 end
@@ -153,8 +154,9 @@ assert(#requestTimes==2 and requestTimes[2].t-requestTimes[1].t>=0.08-1e-6,
     "harvest collect requests are spaced without repeating successful drops")
 seedDrop.uid=103; blockDrop.uid=104
 clock=0; blockCount=0; seedFull=true; requestTimes={}
-assert(harvest(11.5,4,11) and blockCount==5 and #requestTimes==1,
-    "a full seed stack cannot hide the later block drop")
+collectDropsAtTile(W,inv,11,4,function() return active end,true,954)
+assert(blockCount==5 and #requestTimes==1,
+    "a full seed stack cannot hide an already-fallen block drop")
 print("PASS seed-first late-block harvest, request pacing, full seed stack")
 
 -- Several drops are in the search circle, but movement into range fails.
@@ -212,6 +214,31 @@ collectDropsAtTile(W,inv,11,4,function() return active end,true,954,0)
 assert(nativeDone and clock<0.2,"native ACK observed during collect ends the wait promptly")
 Dig.punch=originalPunch
 print("PASS native pickup while waiting and pending-RPC baseline guard")
+
+function W.dropList() return {} end
+blockCount=200; seedFull=false
+local punchBefore=punches
+assert(not harvest(11.5,4,11) and punches==punchBefore,"full blocks prevent another tree hit")
+blockCount=0; seedFull=true
+assert(not harvest(11.5,4,11) and punches==punchBefore,"full seed room prevents another tree hit")
+seedFull=false
+local normalWalk=Move.walkTo
+function Move.walkTo(x,opts)
+    local ok=normalWalk(x,opts); blockCount=200; return ok
+end
+assert(not harvest(2.5,4,11) and punches==punchBefore,
+    "inventory filling while approaching the tree prevents its first hit")
+Move.walkTo=normalWalk
+blockCount=0
+function Dig.punch(x,y,tree,skip,lava,bg,canAct)
+    blockCount=200 -- pickup completes while the hit cooldown is waiting
+    if canAct and not canAct() then return false end
+    return originalPunch(x,y)
+end
+assert(not harvest(11.5,4,11) and punches==punchBefore,
+    "post-cooldown callback checks capacity before sending the hit")
+Dig.punch=originalPunch
+print("PASS full block/seed stacks, mid-route pickup and post-cooldown capacity guard")
 '''
 
 program = "\n".join([
@@ -222,7 +249,7 @@ program = "\n".join([
     movement_tests,
     extract("local DropMemory =", "local function collectDropsNearby("),
     extract("local function collectDropsAtTile(", "local function collectNearby("),
-    extract("local function factoryWork(", "local function factoryCount("),
+    extract("local function factoryHarvestCapacity(", "local function factoryCount("),
     harvest_tests,
 ])
 with tempfile.TemporaryDirectory(prefix="humanhub-harvest-") as directory:
