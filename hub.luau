@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.111",
+	version = "0.4.112",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -2764,7 +2764,7 @@ end
 
 --// ===== 5. PATHFINDER TILE (JALAN / LOMPAT / JATUH) =====
 -- Dipakai factory untuk menjangkau seluruh world, bukan cuma 1 baris.
-local Path = { canJump = nil :: boolean? }
+local Path = { canJump = nil :: boolean?, targetRetryAt = 0 }
 
 local function keyOf(x, y)
 	return y * 1000 + x
@@ -2954,19 +2954,6 @@ function Path.explore(sx, sy, maxNodes)
 		local row = W.fg and W.fg[y]
 		return (row and row[x] or 0) == 102
 	end
-	-- Dipakai untuk memutuskan jatuh panjang aman: dari titik mendarat masih
-	-- ada pijakan lain dalam jangkauan lompat (3 tile ke atas)?
-	local function canClimbFrom(lx, ly)
-		for up = 1, 3 do
-			for dx = -2, 2 do
-				if canStand(lx + dx, ly - up) then
-					return true
-				end
-			end
-		end
-		return false
-	end
-
 	local dist, parent = {}, {}
 	local startKey = keyOf(sx, sy)
 	dist[startKey] = 0
@@ -3040,10 +3027,9 @@ function Path.explore(sx, sy, maxNodes)
 			push(cx, cy, cc, cx + 1, cy, 1, "walk")
 
 			-- Melangkah ke poros samping, lalu mendarat di lantai berikutnya.
-			-- Jatuh pendek (<= 3 tile) selalu aman. Jatuh panjang hanya dipakai
-			-- kalau kolom porosnya benar-benar kosong sampai dasar dan dari
-			-- titik mendarat masih ada pijakan untuk naik lagi; poros 1 tile
-			-- selebar bisa menjadi perangkap satu arah.
+			-- Jalur turun tidak harus sekaligus menjadi jalur naik. Pada farm,
+			-- tangga pulang bisa ada di ujung lantai yang lain. Tetap wajib ada
+			-- poros kosong dan pijakan pertama yang nyata (maksimal 24 tile).
 			for _, dir in ipairs({ -1, 1 }) do
 				local shaftX = cx + dir
 				-- Poros boleh sampai kolom terakhir (x = w-1): di world ini
@@ -3057,21 +3043,14 @@ function Path.explore(sx, sy, maxNodes)
 						local sameCol = canStand(cx, ny)
 						local shaftCol = canStand(shaftX, ny)
 						if sameCol or shaftCol then
-							local long = depth > 3
 							if sameCol then
 								-- Turun lewat poros kosong di samping lalu balik
 								-- ke kolom semula (seperti video: platform di
-								-- tepi, sebelahnya kosong). Jauh pun boleh asal
-								-- dari titik mendarat masih bisa naik.
-								if not long or (depth <= 8 and canClimbFrom(cx, ny)) then
-									push(cx, cy, cc, cx, ny, 2 + depth, "drop", shaftX)
-								end
+								-- tepi, sebelahnya kosong).
+								push(cx, cy, cc, cx, ny, 2 + depth, "drop", shaftX)
 							elseif shaftCol then
-								if not long then
-									push(cx, cy, cc, shaftX, ny, 2 + depth, "dropShaft", shaftX)
-								elseif canClimbFrom(shaftX, ny) then
-									push(cx, cy, cc, shaftX, ny, 2 + depth, "fall", shaftX)
-								end
+								push(cx, cy, cc, shaftX, ny, 2 + depth,
+									depth <= 3 and "dropShaft" or "fall", shaftX)
 							end
 							break
 						end
@@ -3950,7 +3929,19 @@ local function factoryTarget(W, state, seedId, blocked, onlyKind)
 			explored = true
 			dist = Path.explore(sx, cy, 6000) or {}
 		end
-		return pass("same") or pass("below") or pass("above")
+		local target = pass("same") or pass("below") or pass("above")
+		-- Target dipilih sebelum moveTo dipanggil. Kalau semua rute tertutup
+		-- oleh catatan input gagal, recovery di moveTo tidak pernah berjalan.
+		-- Coba ulang rute sekali, maksimal tiap 8 detik; cooldown target panen
+		-- dan tanam tetap berlaku. Tidak ada gerakan/lompatan spekulatif.
+		if not target and Path.blockedEdges and next(Path.blockedEdges) ~= nil
+			and os.clock() >= (Path.targetRetryAt or 0) then
+			Path.targetRetryAt = os.clock() + 8
+			Path.clearEdges()
+			dist = Path.explore(sx, cy, 6000) or {}
+			target = pass("same") or pass("below") or pass("above")
+		end
+		return target
 	end
 	if onlyKind == "harvest" or (not onlyKind and Factory.harvest) then
 		local target = pick("harvest")
