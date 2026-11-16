@@ -4698,7 +4698,7 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 			Factory.phase = seeds > 0 and "plant" or (hasDrops and "collect" or "plant")
 			Factory.pnbLowWater = nil
 			setFactoryStatus(string.format("Factory: PNB selesai | blok %d, seed %d; %s", blocks, seeds,
-				Factory.phase == "plant" and "mulai tanam" or "ambil drop tertinggal"))
+				(seeds > 0 or not hasDrops) and "mulai tanam" or "ambil drop tertinggal"))
 			return 0.1
 		end
 		if Factory.pnbSkipUntil and Factory.pnbSkipUntil > os.clock() then
