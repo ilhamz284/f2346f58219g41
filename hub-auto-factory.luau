@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.114",
+	version = "0.4.115",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -2192,6 +2192,8 @@ local function collectDropsNearby(W, inv, state, radius, only)
 	syncDropMemory(W, drops)
 	local collected, needsRoom = 0, false
 	local moveGen = Move.gen
+	-- Radius pencarian boleh lebar, tetapi request hanya sah dari dekat.
+	local takeRadius = math.min(radius, 0.9)
 	for _, drop in ipairs(drops) do
 		if Move.gen ~= moveGen then break end
 		if type(drop) == "table" and type(drop.uid) == "number" and type(drop.id) == "number"
@@ -2199,7 +2201,7 @@ local function collectDropsNearby(W, inv, state, radius, only)
 			and not dropIgnored(W, drop)
 			and (not only or only[drop.uid]) then
 			local dx, dy = drop.x - state.x, drop.y - state.y
-			if dx * dx + dy * dy <= radius * radius then
+			if dx * dx + dy * dy <= takeRadius * takeRadius then
 				local roomOK, room = pcall(inv.room, inv, drop.id)
 				local available = roomOK and (tonumber(room) or 0) or 0
 				if available > 0 then
@@ -2233,7 +2235,9 @@ end
 -- Return: jumlah yang diambil, id drop yang tertinggal karena inventory penuh.
 -- quick untuk harvest: drop terlambat tetap ditunggu, tetapi UID yang sudah
 -- diambil penuh tidak dicoba ulang hanya karena sprite/cache belum hilang.
-local function collectDropsAtTile(W, inv, x, y, alive, quick)
+-- expectedId saat harvest: blok pasangan seed yang ditunggu bila seed/gem
+-- sudah muncul lebih dulu; jeda request collect 80 ms khusus kunjungan ini.
+local function collectDropsAtTile(W, inv, x, y, alive, quick, expectedId)
 	if type(W.dropList) ~= "function" or type(W.takeDrop) ~= "function"
 		or type(inv.room) ~= "function" or type(inv.add) ~= "function" then
 		return 0, nil
@@ -2243,6 +2247,9 @@ local function collectDropsAtTile(W, inv, x, y, alive, quick)
 	local attempts = {}
 	local collectedUIDs = {}
 	local start = os.clock()
+	local roomOK, expectedRoom = false, 0
+	if expectedId then roomOK, expectedRoom = pcall(inv.room, inv, expectedId) end
+	local expectedPending = roomOK and (tonumber(expectedRoom) or 0) > 0
 
 	local function nearby()
 		local state = Bind.state()
@@ -2258,6 +2265,7 @@ local function collectDropsAtTile(W, inv, x, y, alive, quick)
 		for _, drop in ipairs(drops) do
 			if type(drop) == "table" and type(drop.uid) == "number"
 				and not collectedUIDs[drop.uid]
+				and (attempts[drop.uid] or 0) < 3
 				and type(drop.id) == "number" and type(drop.n) == "number"
 				and type(drop.x) == "number" and type(drop.y) == "number"
 				and not dropIgnored(W, drop) then
@@ -2283,7 +2291,9 @@ local function collectDropsAtTile(W, inv, x, y, alive, quick)
 		local list, nearest, nearestDist, state = nearby()
 		if not list or #list == 0 then
 			-- Drop bisa muncul beberapa frame setelah tile pecah.
-			if sawAny or os.clock() - start >= 0.35 then
+			-- Seed/gem bisa muncul lebih dulu daripada blok. Saat harvest,
+			-- jangan selesai hanya karena drop pertama sudah berhasil diambil.
+			if (sawAny and not expectedPending) or os.clock() - start >= (expectedPending and 0.55 or 0.35) then
 				break
 			end
 			task.wait(quick and 0.06 or 0.1)
@@ -2300,11 +2310,15 @@ local function collectDropsAtTile(W, inv, x, y, alive, quick)
 			for _, item in ipairs(list) do
 				if alive and not alive() then break end
 				local drop = item.drop
+				state = Bind.state() or state
+				local dx, dy = drop.x - state.x, drop.y - state.y
+				local inReach = dx * dx + dy * dy <= 0.81
 				local roomOK, room = pcall(inv.room, inv, drop.id)
 				local available = roomOK and (tonumber(room) or 0) or 0
 				if available > 0 then
 					anyRoom = true
-					if (attempts[drop.uid] or 0) < 3 then
+					if not inReach then retry = true end
+					if inReach and (attempts[drop.uid] or 0) < 3 then
 						attempts[drop.uid] = (attempts[drop.uid] or 0) + 1
 						local okT, taken = pcall(W.takeDrop, drop.uid, drop.n)
 						taken = okT and tonumber(taken) or 0
@@ -2314,16 +2328,21 @@ local function collectDropsAtTile(W, inv, x, y, alive, quick)
 							total += taken
 							if quick and taken >= drop.n then collectedUIDs[drop.uid] = true end
 							took = true
+							if drop.id == expectedId then expectedPending = false end
 						else
 							retry = true
 						end
-						task.wait(0.02)
+						-- Harvest menghasilkan beberapa drop berdekatan. Jarak
+						-- 80 ms mencegah burst collect tanpa memperlambat gerak.
+						task.wait(expectedId and 0.08 or 0.02)
 					end
+				elseif drop.id == expectedId then
+					expectedPending = false
 				end
 			end
 			-- Inventory penuh: tidak ada gunanya menunggu. Atau server
 			-- menolak terus: jangan tahan panen berikutnya.
-			if not anyRoom or (not took and not retry) then
+			if (not anyRoom and not expectedPending) or (anyRoom and not took and not retry) then
 				break
 			end
 			task.wait(quick and 0.06 or 0.1)
@@ -4137,7 +4156,7 @@ local function factoryWork(W, inv, target, seedId, gen)
 		end
 		local _, blockedId = collectDropsAtTile(W, inv, x, y, function()
 			return factoryAlive(gen) and W.name == Bind.name
-		end, true)
+		end, true, Factory.baseId or Factory.pairId)
 		if blockedId then
 			Factory.collectNeedsRoom = true
 			Factory.blockedDropId = blockedId

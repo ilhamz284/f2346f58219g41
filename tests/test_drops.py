@@ -119,6 +119,7 @@ local far={uid=7,id=954,n=1,x=11.5,y=4.5}
 drops={far}; rejected[7]=true
 for i=1,4 do clock+=0.2; collectDropsNearby(W,inv,state,1.35) end
 assert(not dropIgnored(W,far),"out-of-reach rejection never blacklists the UID")
+assert(not requests[7],"search radius must not send pickup packets outside the actual take radius")
 rejected[7]=nil; state.x=11.5
 assert(collectDropsNearby(W,inv,state,0.9)==1)
 print("PASS partial capacity, full inventory, network errors, out-of-reach drops")

@@ -125,6 +125,49 @@ clock=0; active=false; takenCalls=0; drop.uid=5
 collectDropsAtTile(W,inv,11,4,function() return active end,true)
 assert(takenCalls==0, "Stop prevents collection")
 print("PASS stale drop, server partial stack, full inventory, retry limit, late spawn, Stop")
+
+-- A seed/gem is replicated first; the harvested block arrives later.
+-- Exercise factoryWork itself so its expected block ID must reach collect.
+Factory.pairId=954
+local seedDrop={uid=101,id=955,n=1,x=11.5,y=4.5}
+local blockDrop={uid=102,id=954,n=5,x=11.5,y=4.5}
+local blockCount,seedCount,seedFull=0,0,false
+local requestTimes={}
+function inv.room(_,id) return id==955 and (seedFull and 0 or 200-seedCount) or 200-blockCount end
+function inv.add(_,id,n)
+    if id==955 then seedCount+=n else blockCount+=n end
+end
+function W.dropList()
+    return clock>=0.42 and {seedDrop,blockDrop} or {seedDrop}
+end
+function W.takeDrop(uid,n)
+    table.insert(requestTimes,{uid=uid,t=clock})
+    return n
+end
+clock=0; active=true
+assert(harvest(11.5,4,11) and blockCount==5 and seedCount==1,
+    "harvest must wait for delayed blocks after collecting the first seed")
+assert(#requestTimes==2 and requestTimes[2].t-requestTimes[1].t>=0.08-1e-6,
+    "harvest collect requests are spaced without repeating successful drops")
+seedDrop.uid=103; blockDrop.uid=104
+clock=0; blockCount=0; seedFull=true; requestTimes={}
+assert(harvest(11.5,4,11) and blockCount==5 and #requestTimes==1,
+    "a full seed stack cannot hide the later block drop")
+print("PASS seed-first late-block harvest, request pacing, full seed stack")
+
+-- Several drops are in the search circle, but movement into range fails.
+-- No pickup request may be sent for the unreachable neighbor.
+clock=0; seedDrop.uid=105; blockDrop.uid=106; seedFull=false
+requestTimes={}; blockCount=0; seedCount=0
+state={x=10.5,y=5,grounded=true}
+function W.dropList() return {blockDrop} end
+local walkTo=Move.walkTo
+function Move.walkTo() return false end
+collectDropsAtTile(W,inv,11,4,function() return active end,true,954)
+assert(#requestTimes==0 and not dropIgnored(W,blockDrop),
+    "failed movement cannot send out-of-range requests or mark real drops as visual")
+Move.walkTo=walkTo
+print("PASS failed positioning sends no collect packets")
 '''
 
 program = "\n".join([
