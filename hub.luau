@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.112",
+	version = "0.4.113",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -1475,6 +1475,7 @@ local Factory = {
 	harvestFailures = 0,
 	harvestSkipUntil = nil,
 	harvestFailCount = {},
+	harvestPathRetryAt = {},
 	ignoredDrops = {},
 	dropTakeFailures = {},
 	resumePNB = false,
@@ -3852,6 +3853,9 @@ local function factoryTarget(W, state, seedId, blocked, onlyKind)
 	-- Hitung koridor jalan kaki dulu; Dijkstra seluruh world hanya diperlukan
 	-- saat koridor ini habis atau tujuan berada di lantai lain.
 	local dist = {}
+	-- Grounded membuktikan tile pemain sendiri bisa dipakai untuk memukul
+	-- tree di sampingnya, meski solidAt sesaat berbeda dari posisi aktual.
+	if state.grounded then dist[keyOf(sx, cy)] = 0 end
 	if Path.standable(sx, cy) then
 		dist[keyOf(sx, cy)] = 0
 		for _, dir in ipairs({ -1, 1 }) do
@@ -3876,7 +3880,14 @@ local function factoryTarget(W, state, seedId, blocked, onlyKind)
 				if row then
 					for x = 0, (tonumber(W.w) or 100) - 1 do
 						local key = seedId .. ":" .. kind .. ":" .. y .. ":" .. x
-						if not blocked[key] or blocked[key] < os.clock() then
+						local retryAt = kind == "harvest" and Factory.harvestPathRetryAt
+							and Factory.harvestPathRetryAt[key]
+						-- Kegagalan rute ke lantai lain tidak boleh mengunci tree
+						-- saat pemain sudah ada di barisnya. Coba melalui koridor
+						-- yang terukur, maksimal tiap 3 dtk. Gagal pukul tetap tunduk
+						-- pada cooldown biasa agar tree basi tidak dipukul terus.
+						local retryHere = state.grounded and y == cy and retryAt and retryAt <= os.clock()
+						if not blocked[key] or blocked[key] < os.clock() or retryHere then
 							-- Kolom paling kanan terlihat kosong di peta, tetapi tubuh
 							-- pemain tertahan batas world sebelum bisa menanam di sana.
 							local edgeTile = kind == "plant" and x >= (tonumber(W.w) or 100) - 1
@@ -4584,16 +4595,16 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 	end
 	local blocks = factoryCount(inv, Factory.baseId)
 	local seeds = factoryCount(inv, seedId)
-	local room = factoryRoom(inv, Factory.baseId)
-	local blockFull = blocks >= 200 or room == 0 or Factory.collectNeedsRoom == true
+	-- Gagal mengambil drop atau pembacaan room bukan bukti stack blok 200.
+	-- Keputusan meninggalkan harvest memakai jumlah blok yang benar-benar ada.
+	local blockFull = blocks >= 200
 	-- Mode panen saja (tanpa Auto Factory): tugasnya cuma memanen. Inventory
 	-- blok penuh bukan urusannya, jadi jangan berhenti dan jangan masuk PNB.
 	local harvestOnly = not Factory.cycle
 
 	if Factory.phase == "harvest" then
 		local cy = math.floor(state.y - 0.0001)
-		-- Blok penuh: panen cuma membuang drop (inv.room(id) == 0 membuat
-		-- takeDrop mengembalikan 0), jadi kosongkan dulu lewat PNB.
+		-- Stack 200: kosongkan blok lewat PNB sebelum melanjutkan panen.
 		if blockFull and Factory.baseId and not harvestOnly then
 			Factory.collectNeedsRoom = false
 			beginPNB(W, blocks, true)
@@ -4637,6 +4648,7 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 				if Factory.harvestFailCount then
 					Factory.harvestFailCount[seedId .. ":harvest:" .. target.y .. ":" .. target.x] = nil
 				end
+				Factory.harvestPathRetryAt[seedId .. ":harvest:" .. target.y .. ":" .. target.x] = nil
 				local _, needsRoom = collectDropsNearby(W, inv, Bind.state(), 1.35)
 				if needsRoom then Factory.collectNeedsRoom = true end
 				if factoryAlive(gen) then
@@ -4653,6 +4665,8 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 				Factory.harvestFailCount = Factory.harvestFailCount or {}
 				local fails = (Factory.harvestFailCount[key] or 0) + 1
 				Factory.harvestFailCount[key] = fails
+				Factory.harvestPathRetryAt[key] =
+					(reason == "path" or reason == "floor" or reason == "far") and (os.clock() + 3) or nil
 				local reasonText, blockFor
 				if reason == "path" or reason == "floor" or reason == "far" then
 					-- Karakter tidak sampai ke pohon. Ini bukan gagal panen:
@@ -4696,24 +4710,15 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 			return worked and 0.03 or 0.08
 		end
 		local ripeElsewhere = factoryHasRipeTree(W, seedId)
-		-- Beberapa target hanya ditunda beberapa detik setelah input gerak
-		-- gagal. Jangan langsung pindah fase selama target itu sebenarnya
-		-- bisa dicapai dari posisi sekarang.
-		if ripeElsewhere and factoryTarget(W, state, seedId, {}, "harvest") then
-			local now, soonest = os.clock(), math.huge
-			for key, untilAt in pairs(blocked) do
-				if type(key) == "string" and key:sub(1, #(seedId .. ":harvest:")) == seedId .. ":harvest:"
-					and type(untilAt) == "number" and untilAt > now then
-					soonest = math.min(soonest, untilAt - now)
-				end
-			end
-			if soonest <= 5 then
-				setFactoryStatus("Factory: mencoba ulang target panen terdekat")
-				return math.min(0.5, soonest)
-			end
+		-- Target nil bisa berarti rute/target sedang ditunda, bukan tree habis.
+		-- Tetap di harvest selama world masih punya tree matang. Cooldown dan
+		-- pemulihan rute di factoryTarget tetap bekerja tanpa memulai PNB dini.
+		if ripeElsewhere then
+			setFactoryStatus(string.format("Factory: lanjut cari target panen | blok %d/200; tree matang masih ada", blocks))
+			return 1
 		end
-		-- Jika belum ada target panen yang dipilih, kerjakan blok/seed yang
-		-- tersedia; fase grow akan mencoba tree lagi pada putaran berikutnya.
+		-- Tree matang sudah habis: kerjakan blok/seed yang tersedia sebelum
+		-- menunggu pohon berikutnya matang.
 		if blocks <= 0 and seeds > 0 and factoryTarget(W, state, seedId, blocked, "plant") then
 			Factory.phase = "plant"
 			setFactoryStatus(string.format("Factory: target panen tertunda; lanjut tanam (%d seed)", seeds))
@@ -4722,17 +4727,11 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 		if blocks <= 0 then
 			Factory.phase = "grow"
 			local desc = factoryGrowDesc(W, seedId)
-			setFactoryStatus(ripeElsewhere
-				and ("Factory: target panen tertunda; coba lagi setelah jeda (" .. desc .. ")")
-				or ("Factory: menunggu " .. tostring(Factory.seedName or "tree") .. " matang â€” " .. desc))
+			setFactoryStatus("Factory: menunggu " .. tostring(Factory.seedName or "tree") .. " matang | " .. desc)
 			return 1
 		end
 		beginPNB(W, blocks)
-		if ripeElsewhere then
-			setFactoryStatus("Factory: target panen tertunda; lanjut PNB sambil coba ulang")
-		else
-			setFactoryStatus(string.format("Factory: tidak ada tree matang yang terjangkau di world, PNB %d blok", blocks))
-		end
+		setFactoryStatus(string.format("Factory: tidak ada tree matang di world, PNB %d blok", blocks))
 		return 0.1
 	end
 
@@ -4986,9 +4985,10 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 		return 0.1
 	end
 	local ripe = factoryTarget(W, state, seedId, blocked, "harvest")
-	if ripe and not blockFull then
+	if not blockFull and (ripe or factoryHasRipeTree(W, seedId)) then
 		Factory.phase = "harvest"
-		setFactoryStatus("Factory: tree matang; mulai harvest lagi")
+		setFactoryStatus(ripe and "Factory: tree matang; mulai harvest lagi"
+			or "Factory: tree matang masih ada; coba ulang target panen")
 	elseif blocks > 0 then
 		beginPNB(W, blocks)
 		setFactoryStatus(string.format("Factory: lanjut PNB %d blok sambil menunggu tree", blocks))
@@ -5107,6 +5107,7 @@ local function startFactory()
 	Factory.harvestFailures = 0
 	Factory.harvestSkipUntil = nil
 	Factory.harvestFailCount = {}
+	Factory.harvestPathRetryAt = {}
 	Factory.homeWorld = W.name
 	Factory.lastRejoinAt = 0
 	-- Station PNB sengaja tidak dipilih di sini: lantai pemain bisa berubah

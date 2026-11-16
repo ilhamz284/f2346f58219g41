@@ -115,6 +115,37 @@ Path.clearEdges()
 distances=Path.explore(5,15,6000)
 assert(distances[keyOf(5,3)], "one-way platform staircase remains traversable upward")
 print("PASS upward platform staircase")
+
+-- A route failure while approaching another floor must not hide the same
+-- tree for a minute once the player is beside it on an open row.
+reset(12,10)
+floor(4,0,11); floor(2,0,11)
+W.fg[3][3]=955
+local key="955:harvest:3:3"
+local cooldown={[key]=now+60}
+Factory.harvestPathRetryAt={[key]=now+3}
+state={x=8.5,y=4,grounded=true}
+assert(not factoryTarget(W,state,955,cooldown,"harvest"), "movement retry respects three-second cooldown")
+now+=3
+target=factoryTarget(W,state,955,cooldown,"harvest")
+assert(target and target.x==3 and target.y==3, "same-floor tree retries a failed route promptly")
+Factory.harvestPathRetryAt={}
+assert(not factoryTarget(W,state,955,cooldown,"harvest"), "failed punches retain their cooldown")
+print("PASS same-floor movement retry without bypassing failed-punch cooldown")
+
+-- Actual grounded position can already reach the adjacent tree, even if
+-- a collision query rejects the occupied tile. No route search is needed.
+local standable,explore=Path.standable,Path.explore
+Path.standable=function() return false end
+Path.explore=function() error("adjacent tree must use the actual grounded position") end
+state={x=4.5,y=4,grounded=true}
+target=factoryTarget(W,state,955,{},"harvest")
+assert(target and target.x==3 and target.standX==4, "grounded player can harvest adjacent tree directly")
+Path.explore=function() return {} end
+state.grounded=false
+assert(not factoryTarget(W,state,955,{},"harvest"), "airborne position cannot bypass route discovery")
+Path.standable=standable; Path.explore=explore
+print("PASS adjacent tree without pathfinder dependence")
 '''
 
 program = "\n".join([
