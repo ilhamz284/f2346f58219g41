@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.121",
+	version = "0.4.122",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -633,7 +633,7 @@ Hub.quest = Quest
 --// ===== 2. BINDING KE DALAM GAME =====
 -- W = tabel world (fg/bg/name/w/h + goTo), CT = controller (state/solidAt),
 -- hit = fungsi pukul tile milik game, setTile = fungsi pasang tile.
-local Bind = { W = nil, CT = nil, hit = nil, setTile = nil, inv = nil, name = nil, retryAt = 0 }
+local Bind = { W = nil, CT = nil, hit = nil, setTile = nil, inv = nil, context = nil :: any, name = nil, retryAt = 0 }
 
 local function pickTable(matches, need)
 	if type(matches) ~= "table" then
@@ -672,6 +672,11 @@ local function findFnByWorld(fname, world)
 				if okUp and v == world then
 					return f
 				end
+				-- Game v1945 memindahkan fungsi aksi ke modul context. Tetap
+				-- cocokkan identitas world, bukan nama/path modul obfuscate.
+				if okUp and type(v) == "table" and v.world == world then
+					return f, v
+				end
 			end
 		end
 	end
@@ -679,22 +684,23 @@ local function findFnByWorld(fname, world)
 end
 
 function Bind.invalidate()
-	Bind.W, Bind.CT, Bind.hit, Bind.setTile, Bind.inv, Bind.name = nil, nil, nil, nil, nil, nil
+	Bind.W, Bind.CT, Bind.hit, Bind.setTile, Bind.inv, Bind.name, Bind.context = nil, nil, nil, nil, nil, nil, nil
 end
 
-local function findInventory()
-	local function valid(t)
+local function validInventory(t)
 		return type(t) == "table" and type(t.slots) == "table"
 			and type(t.count) == "function" and type(t.select) == "function"
 			and type(t.remove) == "function" and type(t.room) == "function"
-	end
+end
+
+local function findInventory()
 	for _, keys in ipairs({ { "slots", "capacity", "changed" }, { "slots", "capacity" }, { "slots" } }) do
 		local ok, list = pcall(function() return filtergc("table", { Keys = keys }) end)
 		if ok and type(list) == "table" then
-			if valid(list) then return list end
+			if validInventory(list) then return list end
 			if type(list[1]) ~= "table" then list = { list } end
 			for _, t in ipairs(list) do
-				if valid(t) then return t end
+				if validInventory(t) then return t end
 			end
 		end
 	end
@@ -727,14 +733,23 @@ function Bind.resolve(force)
 	local okC, ctList = pcall(function() return filtergc("table", { Keys = { "state", "onHurt", "onDie" } }) end)
 	local CT = okC and pickTable(ctList, { "state", "solidAt" }) or nil
 
-	local hit = findFnByWorld("hit", W)
-	local setTile = findFnByWorld("setTile", W)
-	local inv = findInventory() or Bind.inv
+	local hit, hitContext = findFnByWorld("hit", W)
+	local setTile, placeContext = findFnByWorld("setTile", W)
+	local context = hitContext or placeContext
+	local inv
+	if context then
+		-- Context adalah sumber inventory yang sedang digunakan game. Saat
+		-- belum siap, jangan memilih tabel inventory lain yang tertinggal di GC.
+		inv = validInventory(context.inv) and context.inv or nil
+	else
+		inv = findInventory() or Bind.inv
+	end
 
 	Bind.W, Bind.CT, Bind.hit, Bind.setTile, Bind.inv, Bind.name = W, CT, hit, setTile, inv, W.name
+	Bind.context = context
 	log(string.format("bind world=%s %sx%s hit=%s setTile=%s inv=%s", tostring(W.name), tostring(W.w), tostring(W.h),
 		hit and "ok" or "NIL", setTile and "ok" or "NIL", inv and "ok" or "NIL"))
-	return W ~= nil and CT ~= nil and hit ~= nil and inv ~= nil
+	return W ~= nil and CT ~= nil and hit ~= nil and setTile ~= nil and inv ~= nil
 end
 
 function Bind.getW()
@@ -2581,6 +2596,11 @@ end
 -- milik world (mis. Pepper Tree baseGrow 105233 -> grow 63140). Memakai nilai
 -- katalog membuat pohon yang sudah siap panen dianggap belum matang.
 local function findWorldItemDB()
+	local context = Bind.context
+	if context and context.world == Bind.W and itemDBCandidate(context.Items) then
+		itemWorldDBCache, itemWorldDBHit = context.Items, Bind.hit
+		return itemWorldDBCache
+	end
 	if itemWorldDBCache and itemWorldDBHit == Bind.hit then
 		return itemWorldDBCache
 	end
@@ -3918,6 +3938,11 @@ end
 
 -- Data pohon (upvalue spliceAt) dipakai untuk cek matang dan sisa waktu.
 local function factoryEnsureTreeMap(W)
+	local context = Bind.context
+	if context and context.world == W and type(context.trees) == "table" then
+		Factory.treeMap, Factory.treeMapWorld = context.trees, W
+		return Factory.treeMap
+	end
 	if Factory.treeMapWorld ~= W then
 		Factory.treeMap = nil
 		Factory.treeMapWorld = W
@@ -5390,8 +5415,15 @@ local function startFactory()
 	local W, inv = Bind.W, Bind.inv
 	local seedId = Factory.seedId
 	local def = seedId and selectedItemDefinition(seedId)
-	if not (W and inv and Bind.CT and Bind.hit and Bind.setTile and def and def.kind == "seed") then
-		setFactoryStatus("gagal: data world, inventory, atau definisi seed belum terbaca")
+	local missing = {}
+	if not W then table.insert(missing, "world") end
+	if not inv then table.insert(missing, "inventory") end
+	if not Bind.CT then table.insert(missing, "controller") end
+	if type(Bind.hit) ~= "function" then table.insert(missing, "fungsi pukul") end
+	if type(Bind.setTile) ~= "function" then table.insert(missing, "fungsi pasang") end
+	if type(def) ~= "table" or def.kind ~= "seed" then table.insert(missing, "definisi seed") end
+	if #missing > 0 then
+		setFactoryStatus("gagal membaca: " .. table.concat(missing, ", "))
 		return false
 	end
 	-- Blok pasangan dari seed (mis. Pepper Tree Seed 4585 -> blok 4584).
