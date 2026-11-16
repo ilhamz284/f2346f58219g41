@@ -12,6 +12,7 @@ start = source.index("local DropMemory =")
 functions = source[start:source.index("local function collectDropsAtTile(", start)]
 prelude = r'''
 local clock=0
+local Hub={onUnload=function() end}
 local os={clock=function() return clock end}
 local scheduled={}
 local task={}
@@ -144,6 +145,35 @@ W.drops={gem,display,pending}
 collectDropsNearby(W,inv,state,0.9)
 assert(rpcCount==before,"gems use native collector; display/pending drops are not pickup requests")
 print("PASS native gems and non-collectible records")
+
+Factory.running=true; Factory.cycle=true; Factory.phase="pnb"
+W.drops={}; inv.n=200; serverGot=1; serverDelay=0
+local original=W.takeDrop
+Factory.setPickupGate(W,true)
+before=rpcCount
+for i=1,200 do
+    inv.n-=1
+    local block=drop(30000+i,1); table.insert(W.drops,block)
+    local taken=W.takeDrop(block.uid,block.n) -- native auto pickup
+    inv.n+=taken
+    assert(inv.n==200-i,"native collector must not refill the PNB inventory")
+end
+assert(inv.n==0 and rpcCount==before,"200 to zero cannot send collect packets during PNB")
+local held=W.drops[1]
+syncDropMemory(W,W.drops)
+assert(collectDropsNearby(W,inv,state,0.9)==0 and not dropIgnored(W,held),
+    "a held real block is not classified as a visual failure")
+local seed=drop(31001,1); seed.id=955; table.insert(W.drops,seed)
+local gem2=drop(31002,1); gem2.id=112; table.insert(W.drops,gem2)
+assert(W.takeDrop(seed.uid,1)==1 and W.takeDrop(gem2.uid,1)==1,
+    "PNB gate allows native seed and gem pickup")
+Factory.phase="collect"; Factory.setPickupGate(W,false)
+assert(W.takeDrop==original and W.takeDrop(held.uid,1)==1,
+    "leaving PNB restores normal collect and its original function")
+Factory.phase="pnb"; Factory.setPickupGate(W,true)
+Factory.running=false; Factory.setPickupGate(nil,false)
+assert(W.takeDrop==original,"Stop restores the original native collector")
+print("PASS native PNB 200-to-zero, script hold, seeds/gems, collect resume and Stop cleanup")
 '''
 
 with tempfile.TemporaryDirectory(prefix="humanhub-collect-protocol-") as directory:

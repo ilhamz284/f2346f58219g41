@@ -17,6 +17,7 @@ def extract(start, end):
 
 prelude = r'''
 local clock = 0
+local Hub={onUnload=function() end}
 local os = {clock = function() return clock end}
 local state = {x=10.5, y=5, grounded=true}
 local active, direction, idleCount = true, 0, 0

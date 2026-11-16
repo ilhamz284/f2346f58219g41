@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.120",
+	version = "0.4.121",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -1495,6 +1495,7 @@ local Factory = {
 	onMode = nil,
 	statusMode = nil :: string?,
 	currentStatus = nil :: any,
+	pickupGate = nil :: any,
 	syncingUI = false,
 }
 local Dig = { protectedIds = { [6] = true, [8] = true, [202] = true, [204] = true, [206] = true, [240] = true, [242] = true, [1796] = true, [7188] = true, [9640] = true } }
@@ -2222,6 +2223,9 @@ end
 
 local function requestDropTake(W, inv, drop, state, room, alive)
 	local now = os.clock()
+	if Factory.running and Factory.cycle and Factory.phase == "pnb" and drop.id == Factory.baseId then
+		return false, 0, "held"
+	end
 	if (tonumber(drop.n) or 0) <= 0 or dropIgnored(W, drop) then return false, 0, "gone" end
 	if drop.display or drop.pending or drop.taking then return false, 0, "pending" end
 	if now < (tonumber(drop.readyAt) or 0) or now < (DropMemory.retryAt[drop.uid] or 0)
@@ -2265,6 +2269,40 @@ local function requestDropTake(W, inv, drop, state, room, alive)
 	end
 	return request.ok, request.taken, request.status
 end
+
+-- Collector bawaan juga memanggil W.takeDrop. Menahan collector script saja
+-- tidak cukup: native pickup dapat mengisi kembali slot 199 menjadi 200.
+function Factory.setPickupGate(W, enabled)
+	local gate = Factory.pickupGate
+	if enabled and gate and gate.world == W and gate.grid == W.fg and gate.name == W.name
+		and W.takeDrop == gate.wrapper then return end
+	if gate then
+		if gate.world.takeDrop == gate.wrapper then gate.world.takeDrop = gate.original end
+		Factory.pickupGate = nil
+	end
+	if not enabled or not W or type(W.takeDrop) ~= "function" or type(W.dropList) ~= "function" then return end
+	gate = { world = W, grid = W.fg, name = W.name, original = W.takeDrop, drops = {} }
+	gate.wrapper = function(uid, want)
+		if Factory.running and Factory.cycle and Factory.phase == "pnb"
+			and W.fg == gate.grid and W.name == gate.name then
+			local drop = gate.drops[uid]
+			if not drop then
+				local ok, list = pcall(W.dropList)
+				if ok and type(list) == "table" then
+					-- Drop baru berada di akhir list; tidak ada scan GC/worker frame.
+					for i = #list, 1, -1 do
+						if list[i].uid == uid then drop = list[i]; gate.drops[uid] = drop; break end
+					end
+				end
+			end
+			if drop and drop.id == Factory.baseId then return 0 end
+		end
+		return gate.original(uid, want)
+	end
+	Factory.pickupGate = gate
+	W.takeDrop = gate.wrapper
+end
+Hub.onUnload(function() Factory.setPickupGate(nil, false) end)
 
 -- `only` (opsional) = tabel uid drop yang boleh diambil. Dipakai saat blok
 -- penuh: yang dijemput hanya drop lama, drop pecahan baru dibiarkan supaya
@@ -2840,6 +2878,7 @@ function Factory.stop(reason)
 		return
 	end
 	Factory.running = false
+	Factory.setPickupGate(nil, false)
 	Factory.gen += 1
 	Factory.harvest = false
 	Factory.plant = false
@@ -4818,15 +4857,16 @@ local factoryStoreSeeds
 -- Kosongkan seluruh blok sebelum fase tanam.
 local PNB_DRAIN_BATCH = 8
 
--- `drain` = slot blok penuh. PNB dipakai untuk membuat ruang, jadi drop tiap
--- blok jangan langsung diambil (200 -> 199 -> 200, tidak ada kemajuan).
+-- Semua batch Factory secara default menghabiskan inventory dahulu. Drop
+-- pecahan jangan langsung diambil (200 -> 199 -> 200, tidak ada kemajuan).
 -- Kalau ada drop lama di lantai: habiskan DULU semua blok di inventory (drop
 -- pecahannya dibiarkan), tanam seed yang ada, baru jemput drop lama. Dengan
 -- begitu slot benar-benar kosong dan siklus tidak berulang tiap 8 blok.
 local function beginPNB(W, blocks, drain)
 	Factory.phase = "pnb"
 	Factory.pnbLowWater = 0
-	Factory.pnbDraining = drain == true
+	Factory.pnbDraining = drain ~= false
+	Factory.setPickupGate(W, true)
 	Factory.pnbDrainCount = 0
 	Factory.pnbOldDrops = nil
 	Factory.dropFilter = nil
@@ -4879,6 +4919,7 @@ local function finishPNBDrain(inv)
 end
 
 local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
+	if type(Factory.setPickupGate) == "function" then Factory.setPickupGate(W, Factory.phase == "pnb") end
 	-- ItemDB world bisa baru terisi setelah factory mulai; pakai nilai grow
 	-- terbaru supaya pohon matang tidak dianggap belum siap.
 	local seedDef = selectedItemDefinition(seedId)
@@ -5065,7 +5106,7 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 		end
 		-- Batch pecah blok selesai (atau blok sudah habis): sekarang jemput
 		-- drop LAMA saja. Drop pecahan batch ini tetap di lantai.
-		if Factory.pnbDraining and (Factory.pnbDrainCount >= (Factory.pnbDrainTarget or PNB_DRAIN_BATCH) or blocks <= 0) then
+		if Factory.pnbDraining and blocks <= 0 then
 			finishPNBDrain(inv)
 			return 0.2
 		end

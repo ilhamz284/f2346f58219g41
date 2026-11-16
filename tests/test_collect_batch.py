@@ -13,6 +13,7 @@ source = (root / "hub.luau").read_text(encoding="utf-8-sig")
 
 prelude = r'''
 local clock,active,onWait=0,true,nil
+local Hub={onUnload=function() end}
 local os={clock=function() return clock end}
 local scheduled={}
 local task={}

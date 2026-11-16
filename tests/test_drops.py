@@ -16,6 +16,7 @@ def extract(start, end):
 
 prelude = r'''
 local clock=0
+local Hub={onUnload=function() end}
 local os={clock=function() return clock end}
 local task={wait=function(dt) clock+=dt or 0.016 end}
 function task.spawn(fn) fn() end

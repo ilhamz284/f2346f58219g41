@@ -38,6 +38,7 @@ local function pnbTileId(_,layer,x,y) return W[layer][y] and W[layer][y][x] or 0
 local function standingFloor(s) return math.floor(s.y-0.0001)+1 end
 local Factory={baseId=954,seedId=955,baseLayer="fg",baseAtSelf=true,
     workX=10,workStandX=10,workY=4,pnb=0,cycle=true}
+function Factory.setPickupGate() end
 local function factoryAlive() return active end
 local function factoryCount(_,id) return inv:count(id) end
 local function factoryWorkSpot() return 10,10,4 end
@@ -171,8 +172,10 @@ assert(Factory.phase=="plant" and Factory.resumeCollect,
 Factory.phase="pnb"; Factory.pnbDraining=true; Factory.pnbDrainCount=8; Factory.pnbDrainTarget=8
 Factory.pnbOldDrops={}; inv.blocks=4; inv.seeds=5
 factoryCycleStep(W,inv,state,955,{},1)
-assert(Factory.phase=="plant" and Factory.resumePNB,
-    "interrupted batch remembers remaining PNB after planting")
+assert(Factory.phase=="pnb" and inv.blocks==3,
+    "reaching the original batch counter cannot finish while blocks remain")
+finishPNBDrain(inv)
+assert(Factory.phase=="plant" and Factory.resumePNB,"an explicit interruption preserves remaining PNB")
 baseDrops={}; inv.blocks=0; inv.seeds=0; Factory.resumePNB=false
 Factory.phase="pnb"; Factory.pnbDraining=true; Factory.pnbDrainCount=200; Factory.pnbDrainTarget=200
 Factory.pnbOldDrops={[17]=true}
