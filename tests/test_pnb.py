@@ -121,8 +121,19 @@ print("PASS stationary PNB, solid station, gap fallback, Stop, empty inventory, 
 phase_helpers = r'''
 local function selectedItemDefinition() return {grow=1} end
 local function factoryRoom() return 200 end
-local function factoryBaseDrops() return {} end
+local baseDrops={}
+local function factoryBaseDrops() return baseDrops end
 local function setFactoryStatus() end
+local phasePlantCalls=0
+local function factoryTarget(_,_,_,_,kind)
+    assert(kind=="plant", "post-PNB planting must not search for harvest targets")
+    return {kind="plant"}
+end
+local function factoryWork(_,_,target)
+    assert(target.kind=="plant" and inv.seeds>0)
+    phasePlantCalls+=1; inv.seeds-=1; Factory.planted=(Factory.planted or 0)+1
+    return true
+end
 '''
 
 phase_tests = r'''
@@ -134,7 +145,43 @@ assert(Factory.phase=="plant" and Factory.resumePNB and inv.blocks==10 and hits=
 Factory.phase="pnb"; inv.seeds=0; inv.blocks=0
 factoryCycleStep(W,inv,state,955,{},1)
 assert(Factory.phase=="plant", "empty blocks advance to planting")
+Factory.phase="pnb"; inv.seeds=23; inv.blocks=0
+Factory.pnbDraining=true; Factory.pnbDrainCount=200; Factory.pnbDrainTarget=200; Factory.pnbOldDrops={}
+factoryCycleStep(W,inv,state,955,{},1)
+assert(Factory.phase=="plant" and inv.seeds==23 and not Factory.resumeCollect,
+    "full-inventory drain plants existing seeds below 200 before harvesting")
+for i=1,23 do
+    factoryCycleStep(W,inv,state,955,{},1)
+    assert(Factory.phase=="plant" and inv.seeds==23-i, "stay in plant until every seed is used")
+end
+assert(phasePlantCalls==23, "all seeds below 200 are planted")
+factoryCycleStep(W,inv,state,955,{},1)
+assert(Factory.phase=="grow", "only leave plant once seeds are empty")
+inv.seeds=23
+Factory.phase="pnb"; Factory.pnbDraining=true; Factory.pnbDrainCount=200; Factory.pnbDrainTarget=200
+Factory.pnbOldDrops={[17]=true}
+factoryCycleStep(W,inv,state,955,{},1)
+assert(Factory.phase=="plant" and Factory.resumeCollect and Factory.dropFilter[17],
+    "old drops wait until existing seeds are planted")
+Factory.phase="pnb"; Factory.pnbDraining=false; inv.seeds=9
+baseDrops={{uid=17,id=954,n=2}}
+factoryCycleStep(W,inv,state,955,{},1)
+assert(Factory.phase=="plant" and Factory.resumeCollect,
+    "normal PNB also plants available seeds before leftover block drops")
+Factory.phase="pnb"; Factory.pnbDraining=true; Factory.pnbDrainCount=8; Factory.pnbDrainTarget=8
+Factory.pnbOldDrops={}; inv.blocks=4; inv.seeds=5
+factoryCycleStep(W,inv,state,955,{},1)
+assert(Factory.phase=="plant" and Factory.resumePNB,
+    "interrupted batch remembers remaining PNB after planting")
+baseDrops={}; inv.blocks=0; inv.seeds=0; Factory.resumePNB=false
+Factory.phase="pnb"; Factory.pnbDraining=true; Factory.pnbDrainCount=200; Factory.pnbDrainTarget=200
+Factory.pnbOldDrops={[17]=true}
+factoryCycleStep(W,inv,state,955,{},1)
+assert(Factory.phase=="plant" and Factory.resumeCollect, "drain always enters plant even without seeds")
+factoryCycleStep(W,inv,state,955,{},1)
+assert(Factory.phase=="collect", "empty seeds continue deferred old-drop collection")
 print("PASS full seeds switch to plant, empty blocks switch to plant")
+print("PASS post-drain seeds below 200, deferred old drops, normal PNB seeds, remaining blocks, empty seeds")
 '''
 
 
@@ -148,6 +195,7 @@ def run(text, outer_wait, regression=False):
     if regression:
         parts.append(regressions)
         parts.extend([phase_helpers,
+                      extract(text, "local PNB_DRAIN_BATCH =", "local function factoryCycleStep("),
                       extract(text, "local function factoryCycleStep(", "local function startFactory("),
                       phase_tests])
     with tempfile.TemporaryDirectory(prefix="humanhub-pnb-") as directory:
