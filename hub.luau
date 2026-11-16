@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.108",
+	version = "0.4.109",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -5944,8 +5944,41 @@ cycleToggle = factorySec:Toggle({
 	end,
 })
 
+-- Pecah scan UI panjang menjadi beberapa frame saat label belum terbentuk.
+function Hub.findParagraphLabel(root, title)
+	local queue, head = { root }, 1
+	local sliceStarted = os.clock()
+	while head <= #queue and not Hub.dead do
+		local inst = queue[head]
+		local children = inst:GetChildren()
+		if inst.Name == "TitleFrame" then
+			local foundTitle, body = false, nil
+			for _, child in ipairs(children) do
+				if child:IsA("TextLabel") then
+					if tostring(child.Text) == title then foundTitle = true else body = body or child end
+				end
+			end
+			if foundTitle and body then return body end
+		end
+		for _, child in ipairs(children) do queue[#queue + 1] = child end
+		head += 1
+		if head % 64 == 0 and os.clock() - sliceStarted >= 0.002 then
+			task.wait()
+			sliceStarted = os.clock()
+		end
+	end
+	return nil
+end
+
 local factoryStatusPara = factorySec:Paragraph({ Title = "Status Harvest/Plant", Desc = "idle" })
+local nextFactoryLayoutAt = 0
 Factory.onStatus = function(message)
+	-- Worker UI sudah menulis ke label; hindari layout/animation SetDesc
+	-- berulang setiap blok saat paragrafnya sudah ditemukan.
+	if Factory.statusLabel and Factory.statusLabel.Parent then return end
+	local now = os.clock()
+	if now < nextFactoryLayoutAt then return end
+	nextFactoryLayoutAt = now + 1
 	if factoryStatusPara then
 		if factoryStatusPara.SetDesc then
 			pcall(factoryStatusPara.SetDesc, factoryStatusPara, message)
@@ -5961,30 +5994,16 @@ end
 do
 	local root = (gethui and gethui()) or game:GetService("CoreGui")
 	local function findStatusLabel(inst)
-		for _, c in ipairs(inst:GetChildren()) do
-			if c:IsA("TextLabel") then
-				local parent = c.Parent
-				if parent and parent.Name == "TitleFrame" then
-					for _, s in ipairs(parent:GetChildren()) do
-						if s:IsA("TextLabel") and s ~= c and tostring(s.Text) == "Status Harvest/Plant" then
-							return c
-						end
-					end
-				end
-			end
-			local found = findStatusLabel(c)
-			if found then
-				return found
-			end
-		end
-		return nil
+		return Hub.findParagraphLabel(inst, "Status Harvest/Plant")
 	end
 	Factory.statusLabel = findStatusLabel(root)
 	task.spawn(function()
 		local label = Factory.statusLabel
+		local nextSearchAt = os.clock() + 5
 		while _G.__HumanHub == Hub do
 			task.wait(0.3)
-			if not label or not label.Parent then
+			if (not label or not label.Parent) and os.clock() >= nextSearchAt then
+				nextSearchAt = os.clock() + 5
 				label = findStatusLabel(root)
 				Factory.statusLabel = label
 			end
@@ -6027,30 +6046,16 @@ local questStatusPara = factorySec:Paragraph({ Title = "Quest harian", Desc = "m
 do
 	local root = (gethui and gethui()) or game:GetService("CoreGui")
 	local function findQuestLabel(inst)
-		for _, c in ipairs(inst:GetChildren()) do
-			if c:IsA("TextLabel") then
-				local parent = c.Parent
-				if parent and parent.Name == "TitleFrame" then
-					for _, s in ipairs(parent:GetChildren()) do
-						if s:IsA("TextLabel") and s ~= c and tostring(s.Text) == "Quest harian" then
-							return c
-						end
-					end
-				end
-			end
-			local found = findQuestLabel(c)
-			if found then
-				return found
-			end
-		end
-		return nil
+		return Hub.findParagraphLabel(inst, "Quest harian")
 	end
 	Quest.statusLabel = findQuestLabel(root)
 	task.spawn(function()
 		local label = Quest.statusLabel
+		local nextSearchAt = os.clock() + 5
 		while _G.__HumanHub == Hub do
 			task.wait(0.5)
-			if not label or not label.Parent then
+			if (not label or not label.Parent) and os.clock() >= nextSearchAt then
+				nextSearchAt = os.clock() + 5
 				label = findQuestLabel(root)
 				Quest.statusLabel = label
 			end
