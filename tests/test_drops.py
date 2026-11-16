@@ -29,6 +29,7 @@ function inv.room(_,id) return 200-inv:count(id) end
 function inv.add(_,id,n) if id==955 then inv.seeds+=n else inv.blocks+=n end end
 local function standingFloor(s) return math.floor(s.y-0.0001)+1 end
 local function keyOf(x,y) return y*1000+x end
+local function edgeBlocked() return false end
 local function factoryAlive() return true end
 local function setFactoryStatus() end
 local drops,requests,listCalls={}, {},0
@@ -55,6 +56,7 @@ function W.takeDrop(uid,n)
 end
 local forceMoveFail=false
 local Move={walkTo=function(x) if forceMoveFail then return false end; state.x=x; return true end}
+function Move.release() end
 local Path={}
 local plans,moves=0,0
 function Path.standable() return true end
@@ -75,7 +77,7 @@ local blocked={}
 assert(factoryCollectDrop(W,inv,state,blocked,1)=="ignored")
 assert(requests[1]==3 and not requests[2] and inv.blocks==0,
     "target failure cannot be masked by another nearby drop")
-assert(plans==1 and moves==1 and clock<=0.35,
+assert(plans==0 and moves==0 and clock<=0.35,
     "visual drop is tested in one short visit, without repeated pathfinding")
 clock+=0.1
 assert(factoryCollectDrop(W,inv,state,blocked,1)=="collected" and inv.blocks==3)

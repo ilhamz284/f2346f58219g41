@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.116",
+	version = "0.4.117",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -2220,6 +2220,7 @@ end
 
 local function requestDropTake(W, inv, drop, state, room, alive)
 	local now = os.clock()
+	if (tonumber(drop.n) or 0) <= 0 or dropIgnored(W, drop) then return false, 0, "gone" end
 	if drop.display or drop.pending or drop.taking then return false, 0, "pending" end
 	if now < (tonumber(drop.readyAt) or 0) or now < (DropMemory.retryAt[drop.uid] or 0)
 		or now - (tonumber(drop.refused) or -math.huge) < 1 then return false, 0, "cooldown" end
@@ -4555,6 +4556,49 @@ local function factoryBaseDrops(W, baseId)
 	return result
 end
 
+-- Sesudah target utama berhasil, ambil beberapa UID lain yang sudah dalam
+-- jangkauan tanpa pilih rute/rapikan posisi ulang. Tetap serial, minimal
+-- 80 ms antar-request dan dibatasi 12 UID / 1,25 dtk per kunjungan.
+local function factoryCollectCluster(W, inv, candidates, firstUID, blocked, gen)
+	local added, attempts = 0, 1
+	local deadline = os.clock() + 1.25
+	local alive = function() return factoryAlive(gen) and W.name == Bind.name end
+	for _, drop in ipairs(candidates) do
+		if not alive() or DropMemory.inFlight or attempts >= 12 or os.clock() >= deadline
+			or factoryRoom(inv, Factory.baseId) <= 0 or factoryCount(inv, Factory.seedId) >= 200 then break end
+		local now = os.clock()
+		if drop.uid ~= firstUID and drop.n > 0 and not drop.taking and not dropIgnored(W, drop)
+			and now >= (tonumber(drop.readyAt) or 0) and now >= (DropMemory.retryAt[drop.uid] or 0)
+			and now - (tonumber(drop.refused) or -math.huge) >= 1
+			and now >= (blocked["drop:" .. drop.uid] or 0) then
+			local pos = Bind.state()
+			if pos and pos.grounded and standingFloor(pos) == math.floor(drop.y) + 1
+				and (drop.x - pos.x)^2 + (drop.y - pos.y)^2 <= 0.81 then
+				-- Collector target utama sudah menunggu 20 ms; 60 ms sisanya
+				-- diberikan sebelum request berikutnya, bukan jeda 1 dtk/stack.
+				task.wait(0.06)
+				pos = Bind.state()
+				if not alive() or not pos or not pos.grounded
+					or standingFloor(pos) ~= math.floor(drop.y) + 1
+					or (drop.x - pos.x)^2 + (drop.y - pos.y)^2 > 0.81
+					or factoryCount(inv, Factory.seedId) >= 200 then break end
+				local room = factoryRoom(inv, Factory.baseId)
+				if room <= 0 then break end
+				local ok, taken, status = requestDropTake(W, inv, drop, pos, room, alive)
+				attempts += 1
+				added += taken
+				task.wait(0.02)
+				if not ok then
+					if status == "pending" then break end
+				elseif taken <= 0 then
+					blocked["drop:" .. drop.uid] = os.clock() + 0.5
+				end
+			end
+		end
+	end
+	return added
+end
+
 local function factoryCollectDrop(W, inv, state, blocked, gen)
 	local drops = factoryBaseDrops(W, Factory.baseId)
 	if #drops == 0 then
@@ -4575,10 +4619,21 @@ local function factoryCollectDrop(W, inv, state, blocked, gen)
 	end
 	if #ready == 0 then return "cooldown", #drops end
 	drops = ready
-	local dist = Path.explore(math.floor(state.x), math.floor(state.y - 0.0001), 6000)
 	local best, bestCost, eligible = nil, nil, false
-	for _, drop in ipairs(drops) do
-		if room > 0 then
+	local sx, sy = math.floor(state.x), math.floor(state.y - 0.0001)
+	-- Tumpukan di kaki tidak perlu Dijkstra atau gerak ke tengah tile lagi.
+	if state.grounded then
+		for _, drop in ipairs(drops) do
+			if standingFloor(state) == math.floor(drop.y) + 1
+				and (drop.x - state.x)^2 + (drop.y - state.y)^2 <= 0.81
+				and now >= (blocked["drop:" .. drop.uid] or 0) then
+				best = { drop = drop, x = sx, y = sy, nearby = true }
+				break
+			end
+		end
+	end
+	local function choose(dist, corridor)
+		for _, drop in ipairs(drops) do
 			eligible = true
 			local y = math.floor(drop.y)
 			local x = math.floor(drop.x)
@@ -4589,16 +4644,41 @@ local function factoryCollectDrop(W, inv, state, blocked, gen)
 					and dx * dx + dy * dy <= 0.9 * 0.9
 					and (not blocked["drop:" .. drop.uid] or blocked["drop:" .. drop.uid] < os.clock())
 					and (not bestCost or cost < bestCost) then
-					best, bestCost = { drop = drop, x = standX, y = y }, cost
+					best, bestCost = { drop = drop, x = standX, y = y, corridor = corridor }, cost
 				end
 			end
 		end
 	end
 	if not best then
+		-- Koridor di lantai yang sama diperiksa dulu. Perhitungan seluruh
+		-- world hanya dipakai jika drop yang tersedia ada di lantai lain.
+		local dist = {}
+		if state.grounded and Path.standable(sx, sy) then
+			dist[keyOf(sx, sy)] = 0
+			for _, dir in ipairs({ -1, 1 }) do
+				for x = sx + dir, dir < 0 and 0 or (tonumber(W.w) or 100) - 1, dir do
+					if not Path.standable(x, sy) or edgeBlocked(x - dir, sy, x, sy) then break end
+					dist[keyOf(x, sy)] = math.abs(x - sx)
+				end
+			end
+		end
+		choose(dist, true)
+		if not best then choose(Path.explore(sx, sy, 6000), false) end
+	end
+	if not best then
 		return eligible and "path" or "room", #drops
 	end
 	local alive = function() return factoryAlive(gen) and W.name == Bind.name end
-	if not Path.moveTo(best.x, best.y, alive) then
+	local moved = best.nearby
+	if best.nearby then
+		Move.release()
+	elseif best.corridor then
+		moved = Move.walkTo(best.x + 0.5, { timeout = math.min(20, 2 + math.abs(best.x - sx) * 0.35),
+			tol = 0.25, quick = true, recover = false, floorY = best.y + 1, alive = alive })
+	else
+		moved = Path.moveTo(best.x, best.y, alive)
+	end
+	if not moved then
 		-- Dulu drop dikunci 15 dtk setiap gagal. Selama terkunci tidak ada
 		-- kandidat lain, jadi fase collect cuma berdiri diam (terukur 9-15
 		-- dtk dengan status "mencoba ulang drop blok"). Jeda sekarang naik
@@ -4618,7 +4698,10 @@ local function factoryCollectDrop(W, inv, state, blocked, gen)
 		return "path", #drops
 	end
 	Factory.dropPathFails = nil
-	if not Move.walkTo(best.x + 0.5, { timeout = 2, tol = 0.25, quick = true,
+	local positioned = Bind.state()
+	local inReach = positioned and positioned.grounded and standingFloor(positioned) == best.y + 1
+		and (best.drop.x - positioned.x)^2 + (best.drop.y - positioned.y)^2 <= 0.81
+	if not inReach and not Move.walkTo(best.x + 0.5, { timeout = 2, tol = 0.25, quick = true,
 		recover = false, floorY = best.y + 1, alive = alive }) then
 		blocked["drop:" .. best.drop.uid] = os.clock() + 2
 		return "path", #drops
@@ -4632,7 +4715,9 @@ local function factoryCollectDrop(W, inv, state, blocked, gen)
 		if not alive() then return "take", #drops end
 		local current = Bind.state()
 		local collected, _, status = collectDropsNearby(W, inv, current, 0.9, only)
-		if collected > 0 then return "collected", collected end
+		if collected > 0 then
+			return "collected", collected + factoryCollectCluster(W, inv, drops, best.drop.uid, blocked, gen)
+		end
 		if dropIgnored(W, best.drop) then return "ignored", #drops end
 		if status then return status, #drops end
 		if factoryRoom(inv, Factory.baseId) <= 0 then return "room", #drops end
