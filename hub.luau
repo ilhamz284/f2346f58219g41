@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.117",
+	version = "0.4.118",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -2335,7 +2335,7 @@ end
 -- diambil penuh tidak dicoba ulang hanya karena sprite/cache belum hilang.
 -- expectedId saat harvest: blok pasangan seed yang ditunggu bila seed/gem
 -- sudah muncul lebih dulu; jeda request collect 80 ms khusus kunjungan ini.
-local function collectDropsAtTile(W, inv, x, y, alive, quick, expectedId)
+local function collectDropsAtTile(W, inv, x, y, alive, quick, expectedId, expectedBefore)
 	if type(W.dropList) ~= "function" or type(W.takeDrop) ~= "function"
 		or type(inv.room) ~= "function" or type(inv.add) ~= "function" then
 		return 0, nil
@@ -2348,6 +2348,7 @@ local function collectDropsAtTile(W, inv, x, y, alive, quick, expectedId)
 	local roomOK, expectedRoom = false, 0
 	if expectedId then roomOK, expectedRoom = pcall(inv.room, inv, expectedId) end
 	local expectedPending = roomOK and (tonumber(expectedRoom) or 0) > 0
+	local expectedDelivered = false
 	local collectUntil = start + (quick and 0.6 or 1.6)
 
 	local function nearby()
@@ -2389,11 +2390,22 @@ local function collectDropsAtTile(W, inv, x, y, alive, quick, expectedId)
 			break
 		end
 		local list, nearest, nearestDist, state = nearby()
+		-- Collector bawaan dapat menyelesaikan pickup ketika bot berjalan ke
+		-- tile panen. Jika jumlah blok sudah bertambah sejak SEBELUM pukulan,
+		-- jangan tetap menunggu 0,55 dtk untuk drop yang sudah masuk inventory.
+		-- Drop nyata yang masih terlihat di tile ini tetap dikerjakan.
+		if expectedPending and type(expectedBefore) == "number" and type(inv.count) == "function" then
+			local counted, count = pcall(inv.count, inv, expectedId)
+			if counted and (tonumber(count) or 0) > expectedBefore then
+				expectedPending, expectedDelivered = false, true
+			end
+		end
 		if not list or #list == 0 then
 			-- Drop bisa muncul beberapa frame setelah tile pecah.
 			-- Seed/gem bisa muncul lebih dulu daripada blok. Saat harvest,
 			-- jangan selesai hanya karena drop pertama sudah berhasil diambil.
-			if (sawAny and not expectedPending) or os.clock() - start >= (expectedPending and 0.55 or 0.35) then
+			if expectedDelivered or (sawAny and not expectedPending)
+				or os.clock() - start >= (expectedPending and 0.55 or 0.35) then
 				break
 			end
 			task.wait(quick and 0.06 or 0.1)
@@ -4231,6 +4243,12 @@ local function factoryWork(W, inv, target, seedId, gen)
 			Factory.treeMap = nil
 			return false, "gone"
 		end
+		local blockId = Factory.baseId or Factory.pairId
+		local blockBefore = nil
+		if blockId and type(inv.count) == "function" and not DropMemory.inFlight then
+			local counted, count = pcall(inv.count, inv, blockId)
+			if counted then blockBefore = tonumber(count) end
+		end
 		for hit = 1, 12 do
 			if not factoryAlive(gen) or tileId(x, y) ~= seedId then
 				break
@@ -4257,7 +4275,7 @@ local function factoryWork(W, inv, target, seedId, gen)
 		end
 		local _, blockedId = collectDropsAtTile(W, inv, x, y, function()
 			return factoryAlive(gen) and W.name == Bind.name
-		end, true, Factory.baseId or Factory.pairId)
+		end, true, blockId, blockBefore)
 		if blockedId then
 			Factory.collectNeedsRoom = true
 			Factory.blockedDropId = blockedId

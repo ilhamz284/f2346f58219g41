@@ -134,6 +134,7 @@ local seedDrop={uid=101,id=955,n=1,x=11.5,y=4.5}
 local blockDrop={uid=102,id=954,n=5,x=11.5,y=4.5}
 local blockCount,seedCount,seedFull=0,0,false
 local requestTimes={}
+function inv.count(_,id) return id==955 and seedCount or blockCount end
 function inv.room(_,id) return id==955 and (seedFull and 0 or 200-seedCount) or 200-blockCount end
 function inv.add(_,id,n)
     if id==955 then seedCount+=n else blockCount+=n end
@@ -178,6 +179,39 @@ assert(harvest(11.5,4,11) and blockCount==5 and #requestTimes==1,
     "harvest waits for the visible block's actual readyAt before leaving")
 assert(requestTimes[1].t>=1,"no premature take packets while the game pickup delay is active")
 print("PASS harvest honors actual pickup readiness")
+
+-- Native collection can complete before factoryWork enters its collector.
+-- Inventory growth must use the baseline from before the tree was punched.
+local originalPunch=Dig.punch
+function Dig.punch(x,y)
+    originalPunch(x,y)
+    blockCount+=2 -- native collector got the block during the punch
+    return true
+end
+function W.dropList() return {} end
+clock=0; blockCount=0; seedFull=false; requestTimes={}
+for i=1,20 do assert(harvest(11.5,4,11)) end
+assert(blockCount==40 and #requestTimes==0 and clock<1,
+    "twenty native pickups cannot pay twenty redundant half-second waits")
+print(string.format("PASS native pickup before collect: 20 trees in %.3f simulated seconds",clock))
+
+-- An unrelated outstanding script pickup is not evidence for the new tree.
+blockCount=0; clock=0; DropMemory.inFlight={}
+assert(harvest(11.5,4,11) and clock>=0.5,
+    "pending previous RPC cannot falsely satisfy the current tree's pickup baseline")
+DropMemory.inFlight=nil
+
+-- If native pickup finishes while the collector is waiting, exit promptly.
+clock=0; blockCount=0
+local nativeDone=false
+function W.dropList()
+    if clock>=0.12 and not nativeDone then blockCount+=2; nativeDone=true end
+    return {}
+end
+collectDropsAtTile(W,inv,11,4,function() return active end,true,954,0)
+assert(nativeDone and clock<0.2,"native ACK observed during collect ends the wait promptly")
+Dig.punch=originalPunch
+print("PASS native pickup while waiting and pending-RPC baseline guard")
 '''
 
 program = "\n".join([
