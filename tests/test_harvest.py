@@ -129,6 +129,8 @@ print("PASS stale drop, server partial stack, full inventory, retry limit, late 
 
 program = "\n".join([
     prelude,
+    "math.randomseed(1701)",
+    extract("local function rnd(", "local function log("),
     extract("function Move.walkTo(", "--// ===== 4. PUKUL"),
     movement_tests,
     extract("local function collectDropsAtTile(", "local function collectNearby("),

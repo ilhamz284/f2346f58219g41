@@ -95,6 +95,10 @@ assert(target and factoryWork(W,inv,target,955,1))
 assert(Factory.planted>5 and Factory.planted<=24 and paths==0 and plans==0,
     "bounded row sweep avoids pathfinder on a clear row")
 assert(rejected==0 and inv.seeds==200-Factory.planted, "range, pacing and seed accounting")
+local d1=placedAt[2].t-placedAt[1].t
+local d2=placedAt[3].t-placedAt[2].t
+assert(d1>=0.14-1e-6 and d1<=0.17+1e-6 and d2>=0.14-1e-6 and d2<=0.17+1e-6
+    and math.abs(d1-d2)>1e-7, "plant timing varies within the short allowed range")
 reset(200)
 onWait=function() active=false end
 target=factoryTarget(W,state,955,{},"plant")
@@ -143,7 +147,8 @@ print(string.format("WORLD_RESULT %.3f %d %d %d",clock,paths,plans,rejected))
 
 
 def run(text, regression):
-    program = "\n".join([prelude,
+    program = "\n".join([prelude, "math.randomseed(1701)",
+        extract(text, "local function rnd(", "local function log("),
         extract(text, "local function factoryTarget(", "local function factoryWork("),
         extract(text, "local function factoryWork(", "local function factoryCount("),
         batch_tests if regression else "", world_tests])

@@ -22,7 +22,6 @@ local task = {wait=function(dt)
     clock+=dt or 0.016
     if clock>=stopAt then active=false end
 end}
-local function rnd(a,b) return (a+b)/2 end
 local function log() end
 local state={x=10.5,y=5,grounded=true}
 local W={name="TEST",w=100,h=60,fg={[4]={}},bg={[4]={}}}
@@ -140,7 +139,8 @@ print("PASS full seeds switch to plant, empty blocks switch to plant")
 
 
 def run(text, outer_wait, regression=False):
-    parts = [prelude,
+    parts = [prelude, "math.randomseed(1701)",
+             extract(text, "local function rnd(", "local function log("),
              extract(text, "function Dig.punch(", "-- Gali tile sampai hancur"),
              extract(text, "local function centerOnTile(", "local function findPNBTarget("),
              extract(text, "local function factoryPNBOne(", "local function factoryHasTrees("),

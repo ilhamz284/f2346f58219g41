@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.105",
+	version = "0.4.106",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -4038,7 +4038,7 @@ local function factoryWork(W, inv, target, seedId, gen)
 				break
 			end
 			Dig.punch(x, y, true, true, false)
-			task.wait(0.02)
+			task.wait(rnd(0.02, 0.035))
 		end
 		if tileId(x, y) ~= 0 then
 			return false, "break"
@@ -4102,7 +4102,7 @@ local function factoryWork(W, inv, target, seedId, gen)
 		-- Jeda antar-penempatan: server menolak kalau beberapa tile dikirim
 		-- dalam frame yang sama (terukur: 0,10 dtk -> 95% diterima/0,67 tile/dtk;
 		-- 0,14 dtk -> 100% diterima/1,0 tile/dtk).
-		task.wait(0.14)
+		task.wait(rnd(0.14, 0.17))
 		return true
 	end
 	if not plantTile(x) then
@@ -4289,7 +4289,7 @@ local function factoryPNBOne(W, inv, gen, blocked, skipCollect)
 			break
 		end
 		if not Dig.punch(x, y, false, true, Factory.baseId == 4, Factory.baseLayer == "bg", alive) then break end
-		task.wait(0.02)
+		task.wait(rnd(0.02, 0.035))
 	end
 	if pnbTileId(W, Factory.baseLayer, x, y) ~= 0 then
 		log(string.format("PNB: blok %s tidak hancur di X=%d Y=%d", tostring(baseId), x, y))
@@ -4628,7 +4628,7 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 						reasonText, target.x, target.y))
 				end
 			end
-			return worked and 0.03 or 0.08
+			return worked and rnd(0.03, 0.06) or 0.08
 		end
 		local ripeElsewhere = factoryHasRipeTree(W, seedId)
 		-- Beberapa target hanya ditunda beberapa detik setelah input gerak
@@ -4797,7 +4797,7 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 				return 0.3
 			end
 		end
-		return worked and 0.04 or 1
+		return worked and rnd(0.04, 0.07) or 1
 	end
 
 	if Factory.phase == "collect" then
@@ -4875,7 +4875,7 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 						target.x, target.y, tostring(reason or "tile berubah")))
 				end
 			end
-			return 0.06
+			return rnd(0.06, 0.08)
 		end
 		if factoryHasPlantTile(W) then
 			setFactoryStatus(string.format("Factory: menunggu jalur tile tanam terbuka (%d seed tersisa)", seeds))
@@ -5152,7 +5152,7 @@ local function startFactory()
 										blocked[currentSeed .. ":" .. target.kind .. ":" .. target.y .. ":" .. target.x] = os.clock() + 4
 									end
 								end
-								task.wait(target.kind == "harvest" and worked and 0.04 or 0.18)
+								task.wait(target.kind == "harvest" and worked and rnd(0.04, 0.06) or rnd(0.18, 0.21))
 							else
 								collectDropsNearby(W, inv, s, 1.35)
 								setFactoryStatus(string.format("%s: belum ada pohon matang â€” %s",
