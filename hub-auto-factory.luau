@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.118",
+	version = "0.4.119",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -1493,6 +1493,8 @@ local Factory = {
 	status = "idle",
 	onStatus = nil,
 	onMode = nil,
+	statusMode = nil :: string?,
+	currentStatus = nil :: any,
 	syncingUI = false,
 }
 local Dig = { protectedIds = { [6] = true, [8] = true, [202] = true, [204] = true, [206] = true, [240] = true, [242] = true, [1796] = true, [7188] = true, [9640] = true } }
@@ -2824,7 +2826,8 @@ local function startPNB()
 end
 
 --// ===== 7. AUTO HARVEST / AUTO PLANT =====
-local function setFactoryStatus(message)
+local function setFactoryStatus(message, mode)
+	Factory.statusMode = mode
 	if Factory.status == message then return end
 	Factory.status = message
 	if Factory.onStatus then
@@ -4290,6 +4293,7 @@ local function factoryWork(W, inv, target, seedId, gen)
 		return false, "seed"
 	end
 	local batchStart = Factory.planted
+	setFactoryStatus(string.format("Factory: plant %d | sisa seed %d", Factory.planted, tonumber(count) or 0), "plant")
 	local batchLimit = 24
 	local function plantable(px)
 		return px >= 0 and px < (tonumber(W.w) or 100) - 1
@@ -4359,6 +4363,27 @@ local function factoryCount(inv, itemId)
 	end
 	local ok, count = pcall(inv.count, inv, itemId)
 	return ok and (tonumber(count) or 0) or 0
+end
+
+-- Dipanggil worker UI yang sudah ada. Hanya membaca counter inventory lokal;
+-- tidak meminta data server, scan GC, atau menyentuh layout setiap aksi.
+function Factory.currentStatus()
+	local mode, inv = Factory.statusMode, Bind.inv
+	if not Factory.running or not mode or not inv then return Factory.status end
+	local seeds = factoryCount(inv, Factory.seedId)
+	if mode == "plant" then
+		return string.format("Factory: plant %d | sisa seed %d", Factory.planted, seeds)
+	end
+	local blocks = factoryCount(inv, Factory.baseId or Factory.pairId)
+	if mode == "drain" then
+		return string.format("Factory: pecah %d blok | blok sekarang %d/200, seed %d/200; drop nanti dijemput",
+			Factory.pnbDrainCount, blocks, seeds)
+	elseif mode == "pnb" then
+		return string.format("Factory: PNB %d | blok %d/200, seed %d/200", Factory.pnb, blocks, seeds)
+	elseif mode == "harvest" then
+		return string.format("Factory: harvest %d | blok %d/200, seed %d/200", Factory.harvested, blocks, seeds)
+	end
+	return Factory.status
 end
 
 -- Cari tile kosong untuk PNB. Lantai pemain dicoba dulu supaya jalurnya
@@ -4896,7 +4921,7 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 				if needsRoom then Factory.collectNeedsRoom = true end
 				if factoryAlive(gen) then
 					setFactoryStatus(string.format("Factory: harvest %d | blok %d/200",
-						Factory.harvested, factoryCount(inv, Factory.baseId)))
+						Factory.harvested, factoryCount(inv, Factory.baseId)), "harvest")
 				end
 			else
 				if reason == "retarget" then
@@ -5033,6 +5058,8 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 			setFactoryStatus(string.format("Factory: menunggu jalur PNB; %d blok tersisa", blocks))
 			return 1
 		end
+		setFactoryStatus(string.format("Factory: PNB %d | blok %d, seed %d", Factory.pnb, blocks, seeds),
+			Factory.pnbDraining and "drain" or "pnb")
 		local worked, reason = factoryPNBOne(W, inv, gen, blocked, Factory.pnbDraining)
 		if worked then
 			Factory.pnbPathFailures = 0
@@ -5040,13 +5067,12 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 			if Factory.pnbDraining then
 				Factory.pnbDrainCount += 1
 				if factoryAlive(gen) then
-					setFactoryStatus(string.format("Factory: pecah blok %d/%d (blok %d sisa); drop nanti dijemput",
-						Factory.pnbDrainCount, Factory.pnbDrainTarget or PNB_DRAIN_BATCH,
-						factoryCount(inv, Factory.baseId)))
+					setFactoryStatus(string.format("Factory: pecah %d blok | blok sekarang %d/200; drop nanti dijemput",
+						Factory.pnbDrainCount, factoryCount(inv, Factory.baseId)), "drain")
 				end
 			elseif factoryAlive(gen) then
 				setFactoryStatus(string.format("Factory: PNB %d | blok %d, seed %d",
-					Factory.pnb, factoryCount(inv, Factory.baseId), factoryCount(inv, seedId)))
+					Factory.pnb, factoryCount(inv, Factory.baseId), factoryCount(inv, seedId)), "pnb")
 			end
 		else
 			if reason == "path" or reason == "position" or reason == "occupied" then
@@ -5169,7 +5195,7 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 			if worked then
 				if factoryAlive(gen) then
 					setFactoryStatus(string.format("Factory: plant %d | sisa seed %d",
-						Factory.planted, factoryCount(inv, seedId)))
+						Factory.planted, factoryCount(inv, seedId)), "plant")
 				end
 			else
 				local now = Bind.state() or state
@@ -6293,6 +6319,7 @@ Factory.onStatus = function(message)
 	local now = os.clock()
 	if now < nextFactoryLayoutAt then return end
 	nextFactoryLayoutAt = now + 1
+	message = Factory.currentStatus and Factory.currentStatus() or message
 	if factoryStatusPara then
 		if factoryStatusPara.SetDesc then
 			pcall(factoryStatusPara.SetDesc, factoryStatusPara, message)
@@ -6315,13 +6342,13 @@ do
 		local label = Factory.statusLabel
 		local nextSearchAt = os.clock() + 5
 		while _G.__HumanHub == Hub do
-			task.wait(0.3)
+			task.wait(0.15)
 			if (not label or not label.Parent) and os.clock() >= nextSearchAt then
 				nextSearchAt = os.clock() + 5
 				label = findStatusLabel(root)
 				Factory.statusLabel = label
 			end
-			local message = Factory.status
+			local message = Factory.currentStatus and Factory.currentStatus() or Factory.status
 			if label and label.Parent and message and label.Text ~= message then
 				local ok = pcall(function()
 					label.Text = message
@@ -6329,6 +6356,10 @@ do
 				if not ok then
 					return
 				end
+			elseif (not label or not label.Parent) and Factory.running and Factory.statusMode and Factory.onStatus then
+				-- Jika label belum ditemukan, fallback tetap maksimal 1 layout/dtk
+				-- melalui pembatas Factory.onStatus, termasuk di tengah batch tanam.
+				pcall(Factory.onStatus, message)
 			end
 		end
 	end)
