@@ -33,38 +33,52 @@ local function setFactoryStatus() end
 local drops,requests,listCalls={}, {},0
 local rejected={}
 local throwError=false
-function W.dropList() listCalls+=1; return drops end
+local jitter=false
+function W.dropList()
+    listCalls+=1
+    if jitter then
+        for _,d in ipairs(drops) do
+            if d.uid==1 then
+                d.x=10.5+(listCalls%3-1)*0.02
+                d.y=4.5+(listCalls%2)*0.01
+            end
+        end
+    end
+    return drops
+end
 function W.takeDrop(uid,n)
     requests[uid]=(requests[uid] or 0)+1
     if throwError then error("network failure") end
     if rejected[uid] or n>inv:room(954) then return 0 end
     return n
 end
-local Move={walkTo=function(x) state.x=x; return true end}
+local forceMoveFail=false
+local Move={walkTo=function(x) if forceMoveFail then return false end; state.x=x; return true end}
 local Path={}
+local plans,moves=0,0
 function Path.standable() return true end
 function Path.explore()
+    plans+=1
     local dist={}
     for x=0,99 do dist[keyOf(x,4)]=math.abs(state.x-x-0.5) end
     return dist
 end
-function Path.moveTo(x,y) state.x=x+0.5; state.y=y+1; return true end
+function Path.moveTo(x,y) moves+=1; state.x=x+0.5; state.y=y+1; return true end
 '''
 
 checks = r'''
 local ghost={uid=1,id=954,n=5,x=10.5,y=4.5}
 local good={uid=2,id=954,n=3,x=10.5,y=4.5}
-drops={ghost,good}; rejected[1]=true
+drops={ghost,good}; rejected[1]=true; jitter=true
 local blocked={}
-assert(factoryCollectDrop(W,inv,state,blocked,1)=="take")
-assert(requests[1]==1 and not requests[2] and inv.blocks==0,
+assert(factoryCollectDrop(W,inv,state,blocked,1)=="ignored")
+assert(requests[1]==3 and not requests[2] and inv.blocks==0,
     "target failure cannot be masked by another nearby drop")
+assert(plans==1 and moves==1 and clock<=0.25,
+    "visual drop is tested in one short visit, without repeated pathfinding")
 clock+=0.1
 assert(factoryCollectDrop(W,inv,state,blocked,1)=="collected" and inv.blocks==3)
-clock+=0.6
-assert(factoryCollectDrop(W,inv,state,blocked,1)=="take")
-clock+=0.6
-assert(factoryCollectDrop(W,inv,state,blocked,1)=="ignored" and requests[1]==3,
+assert(requests[1]==3,
     "three in-range failures with enough room ignore the UID")
 local nextDrop={uid=3,id=954,n=7,x=11.5,y=4.5}
 drops={ghost,good,nextDrop}
@@ -81,7 +95,7 @@ local sameTile={uid=4,id=954,n=5,x=10.5,y=4.5}
 drops={ghost,sameTile}; state.x=10.5
 assert(collectDropsNearby(W,inv,state,0.9)==5 and requests[4]==1,
     "new UID at the ghost's position is still collected")
-print("PASS per-UID failures, other-drop progress, long PNB memory, stale success, no collect/PNB loop, new UID")
+print("PASS one-visit verification, visual bobbing, per-UID failures, other-drop progress, long PNB memory, new UID")
 
 local partial={uid=5,id=954,n=5,x=10.5,y=4.5}
 drops={partial}; inv.blocks=198
@@ -108,6 +122,23 @@ assert(not dropIgnored(W,far),"out-of-reach rejection never blacklists the UID")
 rejected[7]=nil; state.x=11.5
 assert(collectDropsNearby(W,inv,state,0.9)==1)
 print("PASS partial capacity, full inventory, network errors, out-of-reach drops")
+
+local unreachable={uid=8,id=954,n=1,x=10.5,y=4.5}
+drops={unreachable}; inv.blocks=0; forceMoveFail=true
+assert(factoryCollectDrop(W,inv,state,{},1)=="path" and not requests[8]
+    and not dropIgnored(W,unreachable),"failed centering must not mark a real drop as visual")
+forceMoveFail=false
+local transient={uid=9,id=954,n=1,x=10.5,y=4.5}
+drops={transient}
+local originalTake=W.takeDrop
+function W.takeDrop(uid,n)
+    if uid==9 and (requests[uid] or 0)<2 then requests[uid]=(requests[uid] or 0)+1; return 0 end
+    return originalTake(uid,n)
+end
+assert(factoryCollectDrop(W,inv,state,{},1)=="collected" and requests[9]==3 and inv.blocks==1,
+    "a transient failure can recover during the verification visit")
+W.takeDrop=originalTake
+print("PASS failed positioning, transient rejection recovery")
 
 state.x=10.5; inv.blocks=0; drops={ghost}; rejected[1]=nil
 ghost.n=6

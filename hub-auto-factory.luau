@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.110",
+	version = "0.4.111",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -2139,7 +2139,8 @@ end
 
 local function dropIgnored(W, drop)
 	local record = DropMemory.records[drop.uid]
-	if record and (record.id ~= drop.id or record.n ~= drop.n or record.x ~= drop.x or record.y ~= drop.y) then
+	if record and (record.id ~= drop.id or record.n ~= drop.n
+		or math.abs(record.x - drop.x) > 0.25 or math.abs(record.y - drop.y) > 0.25) then
 		DropMemory.records[drop.uid] = nil
 		record = nil
 	end
@@ -4476,17 +4477,29 @@ local function factoryCollectDrop(W, inv, state, blocked, gen)
 		return "path", #drops
 	end
 	Factory.dropPathFails = nil
-	Move.walkTo(best.x + 0.5, { timeout = 2, tol = 0.25 })
+	if not Move.walkTo(best.x + 0.5, { timeout = 2, tol = 0.25, quick = true,
+		recover = false, floorY = best.y + 1, alive = alive }) then
+		blocked["drop:" .. best.drop.uid] = os.clock() + 2
+		return "path", #drops
+	end
 	-- Nilai hasil harus milik target ini; drop lain yang berhasil tidak boleh
 	-- menyembunyikan kegagalan target visual yang tetap ada.
-	local collected = collectDropsNearby(W, inv, Bind.state(), 0.9, { [best.drop.uid] = true })
-	if collected <= 0 then
+	local only = { [best.drop.uid] = true }
+	-- Verifikasi dalam satu kunjungan, bukan bolak-balik menghitung rute untuk
+	-- UID yang sama. Maksimal 3 panggilan dengan jeda pendek, tidak ada worker baru.
+	for attempt = 1, 3 do
+		if not alive() then return "take", #drops end
+		local current = Bind.state()
+		local collected = collectDropsNearby(W, inv, current, 0.9, only)
+		if collected > 0 then return "collected", collected end
 		if dropIgnored(W, best.drop) then return "ignored", #drops end
-		if best.drop.n > room then return "room", #drops end
-		blocked["drop:" .. best.drop.uid] = os.clock() + 0.5
-		return "take", #drops
+		if best.drop.n > factoryRoom(inv, Factory.baseId) then return "room", #drops end
+		if not current or not current.grounded or standingFloor(current) ~= best.y + 1
+			or (best.drop.x - current.x)^2 + (best.drop.y - current.y)^2 > 0.81 then break end
+		if attempt < 3 then task.wait(0.12) end
 	end
-	return "collected", collected
+	blocked["drop:" .. best.drop.uid] = os.clock() + 0.5
+	return "take", #drops
 end
 
 local function factoryHasPlantTile(W)
@@ -4893,7 +4906,7 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 			collectDropsNearby(W, inv, Bind.state() or state, 0.9)
 			setFactoryStatus(string.format("Factory: mencoba ulang drop blok (%d tersisa, %s)", amount, result))
 		end
-		return result == "collected" and 0.15 or 1
+		return (result == "collected" or result == "ignored") and 0.15 or 1
 	end
 
 	if Factory.phase == "plant" then
