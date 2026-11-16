@@ -209,7 +209,7 @@ def run(text, outer_wait, regression=False):
         return float(result.stdout.split("DRAIN_SECONDS ")[1].splitlines()[0])
 
 
-current = run(source, 0.04, regression=True)
+current = run(source, 0.06, regression=True)
 if len(sys.argv) > 2:
     baseline = subprocess.run(["git", "show", f"{sys.argv[2]}:hub.luau"], cwd=root,
                               capture_output=True, text=True, encoding="utf-8", check=True).stdout

@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.113",
+	version = "0.4.114",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -1569,7 +1569,7 @@ function Dig.punch(x, y, isTree, skipAim, allowLava, forceBg, canAct)
 	if canAct and not canAct() then return false end
 
 	local ok = pcall(Bind.hit, x, y, isTree == true)
-	W.punchReady = os.clock() + rnd(0.21, 0.24)
+	W.punchReady = os.clock() + rnd(0.23, 0.26)
 	return ok
 end
 
@@ -2191,7 +2191,9 @@ local function collectDropsNearby(W, inv, state, radius, only)
 	end
 	syncDropMemory(W, drops)
 	local collected, needsRoom = 0, false
+	local moveGen = Move.gen
 	for _, drop in ipairs(drops) do
+		if Move.gen ~= moveGen then break end
 		if type(drop) == "table" and type(drop.uid) == "number" and type(drop.id) == "number"
 			and type(drop.n) == "number" and type(drop.x) == "number" and type(drop.y) == "number"
 			and not dropIgnored(W, drop)
@@ -2212,6 +2214,9 @@ local function collectDropsNearby(W, inv, state, radius, only)
 					elseif drop.id == Factory.baseId and drop.n > available then
 						needsRoom = true
 					end
+					-- Pisahkan request antar-drop agar tumpukan di tile yang sama
+					-- tidak semuanya dikirim dalam satu frame.
+					task.wait(0.02)
 				end
 			end
 		end
@@ -2293,6 +2298,7 @@ local function collectDropsAtTile(W, inv, x, y, alive, quick)
 			end
 			local anyRoom, took, retry = false, false, false
 			for _, item in ipairs(list) do
+				if alive and not alive() then break end
 				local drop = item.drop
 				local roomOK, room = pcall(inv.room, inv, drop.id)
 				local available = roomOK and (tonumber(room) or 0) or 0
@@ -2311,6 +2317,7 @@ local function collectDropsAtTile(W, inv, x, y, alive, quick)
 						else
 							retry = true
 						end
+						task.wait(0.02)
 					end
 				end
 			end
@@ -4173,7 +4180,8 @@ local function factoryWork(W, inv, target, seedId, gen)
 		-- Jeda antar-penempatan: server menolak kalau beberapa tile dikirim
 		-- dalam frame yang sama (terukur: 0,10 dtk -> 95% diterima/0,67 tile/dtk;
 		-- 0,14 dtk -> 100% diterima/1,0 tile/dtk).
-		task.wait(0.14)
+		-- Tambahan 20 ms untuk merenggangkan pengiriman aksi.
+		task.wait(0.16)
 		return true
 	end
 	if not plantTile(x) then
@@ -4341,7 +4349,7 @@ local function factoryPNBOne(W, inv, gen, blocked, skipCollect)
 	pcall(inv.remove, inv, baseId, 1)
 	-- Jangan memperpendek cooldown pukulan terakhir saat memasang blok baru.
 	-- Dig.punch menunggu sisa cooldown ini; tidak perlu jeda pasang terpisah.
-	W.punchReady = math.max(tonumber(W.punchReady) or 0, os.clock() + 0.15)
+	W.punchReady = math.max(tonumber(W.punchReady) or 0, os.clock() + 0.17)
 	-- Kalau karakter tergeser dari tile blok setelah blok terpasang, pukulan
 	-- akan mengenai tile lain dan blok tidak pernah hancur. Berhenti lebih awal
 	-- daripada memukul 30 kali tanpa hasil.
@@ -4707,7 +4715,7 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 						reasonText, target.x, target.y))
 				end
 			end
-			return worked and 0.03 or 0.08
+			return worked and 0.05 or 0.08
 		end
 		local ripeElsewhere = factoryHasRipeTree(W, seedId)
 		-- Target nil bisa berarti rute/target sedang ditunda, bukan tree habis.
@@ -4863,7 +4871,7 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 				return 0.3
 			end
 		end
-		return worked and 0.04 or 1
+		return worked and 0.06 or 1
 	end
 
 	if Factory.phase == "collect" then
@@ -5220,7 +5228,7 @@ local function startFactory()
 										blocked[currentSeed .. ":" .. target.kind .. ":" .. target.y .. ":" .. target.x] = os.clock() + 4
 									end
 								end
-								task.wait(target.kind == "harvest" and worked and 0.04 or 0.18)
+								task.wait(target.kind == "harvest" and worked and 0.06 or 0.18)
 							else
 								collectDropsNearby(W, inv, s, 1.35)
 								setFactoryStatus(string.format("%s: belum ada pohon matang â€” %s",

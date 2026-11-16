@@ -74,7 +74,7 @@ local blocked={}
 assert(factoryCollectDrop(W,inv,state,blocked,1)=="ignored")
 assert(requests[1]==3 and not requests[2] and inv.blocks==0,
     "target failure cannot be masked by another nearby drop")
-assert(plans==1 and moves==1 and clock<=0.25,
+assert(plans==1 and moves==1 and clock<=0.35,
     "visual drop is tested in one short visit, without repeated pathfinding")
 clock+=0.1
 assert(factoryCollectDrop(W,inv,state,blocked,1)=="collected" and inv.blocks==3)
@@ -156,6 +156,28 @@ collectDropsNearby(W,inv,state,0.9)
 assert(listCalls==before+1 and next(DropMemory.records)==nil,
     "distant drop scan creates no records and requests no additional snapshot")
 print("PASS changed stack, world scope, world reload, cleanup, lightweight distant-drop scan")
+
+local requestTimes={}
+function W.takeDrop(uid,n)
+    table.insert(requestTimes,clock)
+    return originalTake(uid,n)
+end
+drops={}; inv.blocks=0; Move.gen=0
+for i=1,3 do drops[i]={uid=20000+i,id=954,n=1,x=10.5,y=4.5} end
+assert(collectDropsNearby(W,inv,state,0.9)==3 and #requestTimes==3)
+for i=2,#requestTimes do
+    assert(requestTimes[i]-requestTimes[i-1]>=0.02-1e-6,
+        "nearby drop requests cannot burst in the same frame")
+end
+local originalWait=task.wait
+task.wait=function(dt) originalWait(dt); Move.gen+=1 end
+drops={}; requestTimes={}
+for i=1,3 do drops[i]={uid=21000+i,id=954,n=1,x=10.5,y=4.5} end
+assert(collectDropsNearby(W,inv,state,0.9)==1 and #requestTimes==1,
+    "Stop during request pacing prevents the rest of the collection batch")
+task.wait=originalWait
+W.takeDrop=originalTake
+print("PASS collection request spacing and Stop during pacing")
 '''
 
 program = "\n".join([
