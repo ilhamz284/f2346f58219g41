@@ -111,17 +111,17 @@ function inv.add(_,_,n) added+=n; room-=n end
 clock=0
 local n,blocked=collectDropsAtTile(W,inv,11,4,function() return active end,true)
 assert(n==5 and added==5 and takenCalls==1 and not blocked and clock<0.2, "successful stale drop is not retried")
-takenCalls=0; added=0; room=2; accepted=2; clock=0
+takenCalls=0; added=0; room=2; accepted=2; clock=0; drop.uid=2
 n,blocked=collectDropsAtTile(W,inv,11,4,function() return active end,true)
 assert(request==5 and added==2 and blocked==954, "server handles partial stack, full inventory reported")
-room=200; accepted=0; takenCalls=0; clock=0
+room=200; accepted=0; takenCalls=0; clock=0; drop.uid=3
 collectDropsAtTile(W,inv,11,4,function() return active end,true)
 assert(takenCalls==3 and clock<0.7, "rejected drop has bounded retries")
-clock=0; room=200; accepted=5; takenCalls=0
+clock=0; room=200; accepted=5; takenCalls=0; drop.uid=4
 function W.dropList() if clock<0.3 then return {} else return {drop} end end
 n=collectDropsAtTile(W,inv,11,4,function() return active end,true)
 assert(n==5 and takenCalls==1, "late spawn still collected")
-clock=0; active=false; takenCalls=0
+clock=0; active=false; takenCalls=0; drop.uid=5
 collectDropsAtTile(W,inv,11,4,function() return active end,true)
 assert(takenCalls==0, "Stop prevents collection")
 print("PASS stale drop, server partial stack, full inventory, retry limit, late spawn, Stop")
@@ -133,6 +133,7 @@ program = "\n".join([
     extract("local function rnd(", "local function log("),
     extract("function Move.walkTo(", "--// ===== 4. PUKUL"),
     movement_tests,
+    extract("local DropMemory =", "local function collectDropsNearby("),
     extract("local function collectDropsAtTile(", "local function collectNearby("),
     extract("local function factoryWork(", "local function factoryCount("),
     harvest_tests,

@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.109",
+	version = "0.4.110",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -2111,6 +2111,68 @@ function PNB.stop(reason)
 	setPNBStatus(reason or "dihentikan")
 end
 
+-- Ingat hasil per UID selama kunjungan world ini. Visual yang tetap muncul
+-- tidak dicoba ulang tiap siklus PNB; UID baru tetap boleh diambil.
+local DropMemory = { world = nil, name = nil, grid = nil, records = {}, pruneAt = 0, seenAt = 0 }
+local function syncDropMemory(W, drops)
+	if DropMemory.world ~= W or DropMemory.name ~= W.name or DropMemory.grid ~= W.fg then
+		DropMemory.world, DropMemory.name, DropMemory.grid = W, W.name, W.fg
+		DropMemory.records, DropMemory.pruneAt = {}, 0
+		Factory.ignoredDrops, Factory.dropTakeFailures = {}, {}
+	end
+	-- Pakai snapshot yang sudah diminta kolektor, tanpa panggilan dropList
+	-- tambahan. Bersihkan UID hilang tiap 5 detik; visual yang masih muncul
+	-- tetap diingat meskipun satu batch PNB berlangsung lama.
+	local now = os.clock()
+	DropMemory.seenAt = now
+	if drops and now >= DropMemory.pruneAt then
+		DropMemory.pruneAt = now + 5
+		for _, drop in ipairs(drops) do
+			local record = type(drop) == "table" and DropMemory.records[drop.uid]
+			if record then record.seenAt = now end
+		end
+		for uid, record in pairs(DropMemory.records) do
+			if record.seenAt ~= now then DropMemory.records[uid] = nil end
+		end
+	end
+end
+
+local function dropIgnored(W, drop)
+	local record = DropMemory.records[drop.uid]
+	if record and (record.id ~= drop.id or record.n ~= drop.n or record.x ~= drop.x or record.y ~= drop.y) then
+		DropMemory.records[drop.uid] = nil
+		record = nil
+	end
+	if record then record.seenAt = DropMemory.seenAt end
+	return (record and record.ignore == true)
+		or (Factory.ignoredDrops and (Factory.ignoredDrops[drop.uid] or 0) > os.clock()) or false
+end
+
+local function recordDropTake(W, drop, taken, state, room)
+	if taken > 0 then
+		DropMemory.records[drop.uid] = taken >= drop.n and {
+			id = drop.id, n = drop.n, x = drop.x, y = drop.y, ignore = true, seenAt = DropMemory.seenAt,
+		} or nil
+		return
+	end
+	-- Penuh / belum sampai tile drop / jaringan error bukan bukti drop visual.
+	if room < drop.n or not state or not state.grounded
+		or standingFloor(state) ~= math.floor(drop.y) + 1 then return end
+	local dx, dy = drop.x - state.x, drop.y - state.y
+	if dx * dx + dy * dy > 0.81 then return end
+	local record = DropMemory.records[drop.uid]
+	if not record then
+		record = { id = drop.id, n = drop.n, x = drop.x, y = drop.y, failures = 0,
+			lastAt = -math.huge, seenAt = DropMemory.seenAt }
+		DropMemory.records[drop.uid] = record
+	end
+	local now = os.clock()
+	if now - (record.lastAt or -math.huge) < 0.1 then return end
+	record.failures = (record.failures or 0) + 1
+	record.lastAt = now
+	if record.failures >= 3 then record.ignore = true end
+end
+
 -- `only` (opsional) = tabel uid drop yang boleh diambil. Dipakai saat blok
 -- penuh: yang dijemput hanya drop lama, drop pecahan baru dibiarkan supaya
 -- blok di inventory benar-benar berkurang dulu.
@@ -2125,11 +2187,12 @@ local function collectDropsNearby(W, inv, state, radius, only)
 	if not ok or type(drops) ~= "table" then
 		return 0
 	end
+	syncDropMemory(W, drops)
 	local collected, needsRoom = 0, false
 	for _, drop in ipairs(drops) do
 		if type(drop) == "table" and type(drop.uid) == "number" and type(drop.id) == "number"
 			and type(drop.n) == "number" and type(drop.x) == "number" and type(drop.y) == "number"
-			and not (Factory.ignoredDrops and (Factory.ignoredDrops[drop.uid] or 0) > os.clock())
+			and not dropIgnored(W, drop)
 			and (not only or only[drop.uid]) then
 			local dx, dy = drop.x - state.x, drop.y - state.y
 			if dx * dx + dy * dy <= radius * radius then
@@ -2140,6 +2203,7 @@ local function collectDropsNearby(W, inv, state, radius, only)
 					-- bagian yang diterima ketika inventory hampir penuh.
 					local takeOK, taken = pcall(W.takeDrop, drop.uid, drop.n)
 					taken = takeOK and tonumber(taken) or 0
+					if takeOK then recordDropTake(W, drop, taken, state, available) end
 					if taken > 0 then
 						pcall(inv.add, inv, drop.id, taken)
 						collected += taken
@@ -2182,13 +2246,14 @@ local function collectDropsAtTile(W, inv, x, y, alive, quick)
 		if not ok or type(drops) ~= "table" then
 			return nil
 		end
+		syncDropMemory(W, drops)
 		local list, nearest, nearestDist = {}, nil, nil
 		for _, drop in ipairs(drops) do
 			if type(drop) == "table" and type(drop.uid) == "number"
 				and not collectedUIDs[drop.uid]
 				and type(drop.id) == "number" and type(drop.n) == "number"
 				and type(drop.x) == "number" and type(drop.y) == "number"
-				and not (Factory.ignoredDrops and (Factory.ignoredDrops[drop.uid] or 0) > os.clock()) then
+				and not dropIgnored(W, drop) then
 				local ox, oy = drop.x - cx, drop.y - cy
 				if ox * ox + oy * oy <= 2.25 then
 					local dx, dy = drop.x - state.x, drop.y - state.y
@@ -2235,6 +2300,7 @@ local function collectDropsAtTile(W, inv, x, y, alive, quick)
 						attempts[drop.uid] = (attempts[drop.uid] or 0) + 1
 						local okT, taken = pcall(W.takeDrop, drop.uid, drop.n)
 						taken = okT and tonumber(taken) or 0
+						if okT then recordDropTake(W, drop, taken, state, available) end
 						if taken > 0 then
 							pcall(inv.add, inv, drop.id, taken)
 							total += taken
@@ -2286,12 +2352,13 @@ local function nearestCollectibleDrop(W, inv, state)
 	if not ok or type(drops) ~= "table" then
 		return nil
 	end
+	syncDropMemory(W, drops)
 	local floorY = standingFloor(state)
 	local bestX, bestDistance
 	for _, drop in ipairs(drops) do
 		if type(drop) == "table" and type(drop.id) == "number" and type(drop.n) == "number"
 			and type(drop.x) == "number" and type(drop.y) == "number" and drop.n > 0
-			and math.abs(drop.y - state.y) <= 1.1 then
+			and math.abs(drop.y - state.y) <= 1.1 and not dropIgnored(W, drop) then
 			local distance = math.abs(drop.x - state.x)
 			if distance > PNB.collectRadius and distance <= PNB.searchRadius
 				and (not bestDistance or distance < bestDistance) then
@@ -3656,10 +3723,11 @@ dropSweepTile = function(W, x, y, itemId, alive)
 	if not ok or type(list) ~= "table" then
 		return false
 	end
+	syncDropMemory(W, list)
 	local best
 	for _, drop in ipairs(list) do
 		if type(drop) == "table" and drop.id == itemId
-			and type(drop.x) == "number" and type(drop.y) == "number" then
+			and type(drop.x) == "number" and type(drop.y) == "number" and not dropIgnored(W, drop) then
 			local row = math.floor(drop.y)
 			local dx = math.abs(drop.x - (x + 0.5))
 			local dyRow = math.abs(row - y)
@@ -4342,12 +4410,13 @@ local function factoryBaseDrops(W, baseId)
 	if not baseId or type(W.dropList) ~= "function" then return {} end
 	local ok, drops = pcall(W.dropList)
 	if not ok or type(drops) ~= "table" then return {} end
+	syncDropMemory(W, drops)
 	local result = {}
 	for _, drop in ipairs(drops) do
 		if type(drop) == "table" and drop.id == baseId and type(drop.uid) == "number"
 			and type(drop.n) == "number" and drop.n > 0
 			and type(drop.x) == "number" and type(drop.y) == "number"
-			and not (Factory.ignoredDrops and (Factory.ignoredDrops[drop.uid] or 0) > os.clock())
+			and not dropIgnored(W, drop)
 			and (not Factory.dropFilter or Factory.dropFilter[drop.uid]) then
 			table.insert(result, drop)
 		end
@@ -4408,22 +4477,15 @@ local function factoryCollectDrop(W, inv, state, blocked, gen)
 	end
 	Factory.dropPathFails = nil
 	Move.walkTo(best.x + 0.5, { timeout = 2, tol = 0.25 })
-	local collected = collectDropsNearby(W, inv, Bind.state(), 0.9, Factory.dropFilter)
+	-- Nilai hasil harus milik target ini; drop lain yang berhasil tidak boleh
+	-- menyembunyikan kegagalan target visual yang tetap ada.
+	local collected = collectDropsNearby(W, inv, Bind.state(), 0.9, { [best.drop.uid] = true })
 	if collected <= 0 then
-		Factory.dropTakeFailures = Factory.dropTakeFailures or {}
-		local uid = best.drop.uid
-		local failures = (Factory.dropTakeFailures[uid] or 0) + 1
-		Factory.dropTakeFailures[uid] = failures
-		if failures >= 3 then
-			Factory.ignoredDrops = Factory.ignoredDrops or {}
-			Factory.ignoredDrops[uid] = os.clock() + 180
-			return "ignored", #drops
-		end
+		if dropIgnored(W, best.drop) then return "ignored", #drops end
 		if best.drop.n > room then return "room", #drops end
-		blocked["drop:" .. best.drop.uid] = os.clock() + 5
+		blocked["drop:" .. best.drop.uid] = os.clock() + 0.5
 		return "take", #drops
 	end
-	Factory.dropTakeFailures[best.drop.uid] = nil
 	return "collected", collected
 end
 
@@ -4824,7 +4886,7 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 		elseif result == "collected" then
 			setFactoryStatus(string.format("Factory: mengambil drop blok +%d", amount))
 		elseif result == "ignored" then
-			setFactoryStatus("Factory: drop tidak terjangkau berulang kali; lewati 90 dtk, lanjut target lain")
+			setFactoryStatus("Factory: lewati drop yang gagal; lanjut drop atau pekerjaan lain")
 		else
 			-- Saat menunggu jeda drop, jemput dulu apa pun yang sudah dalam
 			-- jangkauan. Tanpa ini jeda blok benar-benar diam.
@@ -5009,7 +5071,7 @@ local function startFactory()
 	Factory.gen += 1
 	Factory.treeMap = nil
 	Factory.treeMapWorld = nil
-	Factory.ignoredDrops = {}
+	syncDropMemory(W)
 	Factory.dropTakeFailures = {}
 	Factory.harvested, Factory.planted = 0, 0
 	Factory.pnb = 0
