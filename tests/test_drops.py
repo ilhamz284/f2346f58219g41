@@ -18,6 +18,7 @@ prelude = r'''
 local clock=0
 local os={clock=function() return clock end}
 local task={wait=function(dt) clock+=dt or 0.016 end}
+function task.spawn(fn) fn() end
 local Factory={baseId=954,seedId=955,ignoredDrops={},dropTakeFailures={}}
 local W={name="TEST",fg={}}
 local state={x=10.5,y=5,grounded=true}
@@ -114,6 +115,8 @@ inv.blocks=0; throwError=true
 for i=1,4 do clock+=0.2; collectDropsNearby(W,inv,state,0.9) end
 assert(not dropIgnored(W,full),"executor/network errors are not visual evidence")
 throwError=false
+assert(collectDropsNearby(W,inv,state,0.9)==0,"network errors retain a short backoff")
+clock+=2
 assert(collectDropsNearby(W,inv,state,0.9)==1)
 local far={uid=7,id=954,n=1,x=11.5,y=4.5}
 drops={far}; rejected[7]=true

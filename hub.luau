@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.115",
+	version = "0.4.116",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -2114,17 +2114,22 @@ end
 
 -- Ingat hasil per UID selama kunjungan world ini. Visual yang tetap muncul
 -- tidak dicoba ulang tiap siklus PNB; UID baru tetap boleh diambil.
-local DropMemory = { world = nil, name = nil, grid = nil, records = {}, pruneAt = 0, seenAt = 0 }
+local DropMemory = { world = nil, name = nil, grid = nil, records = {}, pruneAt = 0, seenAt = 0,
+	liveList = nil :: any, setter = nil :: any, setterList = nil :: any, setterRetryAt = 0,
+	inFlight = nil :: any, retryAt = {} }
 local function syncDropMemory(W, drops)
 	if DropMemory.world ~= W or DropMemory.name ~= W.name or DropMemory.grid ~= W.fg then
 		DropMemory.world, DropMemory.name, DropMemory.grid = W, W.name, W.fg
 		DropMemory.records, DropMemory.pruneAt = {}, 0
+		DropMemory.setter, DropMemory.setterList, DropMemory.setterRetryAt = nil, nil, 0
+		DropMemory.retryAt = {}
 		Factory.ignoredDrops, Factory.dropTakeFailures = {}, {}
 	end
 	-- Pakai snapshot yang sudah diminta kolektor, tanpa panggilan dropList
 	-- tambahan. Bersihkan UID hilang tiap 5 detik; visual yang masih muncul
 	-- tetap diingat meskipun satu batch PNB berlangsung lama.
 	local now = os.clock()
+	if drops then DropMemory.liveList = drops end
 	DropMemory.seenAt = now
 	if drops and now >= DropMemory.pruneAt then
 		DropMemory.pruneAt = now + 5
@@ -2175,6 +2180,89 @@ local function recordDropTake(W, drop, taken, state, room)
 	if record.failures >= 3 then record.ignore = true end
 end
 
+-- takeDrop sudah mengirim paket take/took. Seperti collector bawaan, sesudah
+-- ACK positif kita juga wajib mengurangi cache drop dan membersihkan sprite.
+-- Cari setter hanya sekali per daftar drop, dengan identitas upvalue tepat.
+local function finishDropVisual(drop, wanted, taken, list)
+	if not drop.frame or type(list) ~= "table" or not table.find(list, drop) then return end
+	if DropMemory.setterList ~= list then
+		DropMemory.setter, DropMemory.setterList, DropMemory.setterRetryAt = nil, list, 0
+	end
+	if not DropMemory.setter and os.clock() >= DropMemory.setterRetryAt and type(filtergc) == "function" then
+		DropMemory.setterRetryAt = os.clock() + 5
+		local ok, functions = pcall(function() return filtergc("function", { Name = "setDropCount" }) end)
+		if ok and type(functions) == "table" then
+			for _, fn in ipairs(functions) do
+				local got, upvalues = pcall(debug.getupvalues, fn)
+				if got and type(upvalues) == "table" then
+					for _, value in ipairs(upvalues) do
+						if value == list then DropMemory.setter = fn; break end
+					end
+				end
+				if DropMemory.setter then break end
+			end
+		end
+	end
+	local left = math.max(0, math.min(tonumber(drop.n) or wanted, wanted - taken))
+	if DropMemory.setter and pcall(DropMemory.setter, drop, left) then return end
+	-- Fallback untuk executor yang tidak dapat menemukan closure setter.
+	drop.n = left
+	if left <= 0 then
+		local index = table.find(list, drop)
+		if index then table.remove(list, index) end
+		pcall(function() drop.frame:Destroy() end)
+	elseif type(drop.setGem) == "function" then
+		pcall(drop.setGem, left)
+	elseif drop.count and type(drop.count.set) == "function" then
+		pcall(drop.count.set, drop.count, left > 1 and tostring(left) or "")
+	end
+end
+
+local function requestDropTake(W, inv, drop, state, room, alive)
+	local now = os.clock()
+	if drop.display or drop.pending or drop.taking then return false, 0, "pending" end
+	if now < (tonumber(drop.readyAt) or 0) or now < (DropMemory.retryAt[drop.uid] or 0)
+		or now - (tonumber(drop.refused) or -math.huge) < 1 then return false, 0, "cooldown" end
+	-- Satu request yang belum dibalas saja. ask() bawaan dapat menunggu 5 dtk;
+	-- loop factory tidak ikut tertahan dan tidak mengirim request duplikat.
+	if DropMemory.inFlight then return false, 0, "pending" end
+	if alive and not alive() then return false, 0, "cancelled" end
+	local wanted = drop.n
+	local snapshot = { uid = drop.uid, id = drop.id, n = wanted, x = drop.x, y = drop.y }
+	local grid, list = W.fg, DropMemory.liveList
+	local request = { done = false, ok = false, taken = 0, status = "pending" }
+	DropMemory.inFlight = request
+	drop.taking = true
+	task.spawn(function()
+		local ok, result = pcall(W.takeDrop, drop.uid, wanted)
+		local taken = ok and tonumber(result) or nil
+		local currentWorld = DropMemory.world == W and DropMemory.grid == grid
+			and DropMemory.name == W.name and DropMemory.liveList == list
+		if currentWorld and taken then
+			taken = math.max(0, taken)
+			recordDropTake(W, snapshot, taken, state, room)
+			if taken > 0 then
+				pcall(inv.add, inv, drop.id, taken)
+				pcall(finishDropVisual, drop, wanted, taken, list)
+			end
+		elseif currentWorld then
+			-- Timeout/error bukan bukti drop visual. Beri waktu jaringan pulih.
+			DropMemory.retryAt[drop.uid] = os.clock() + 2
+		end
+		drop.taking = false
+		request.ok, request.taken = currentWorld and ok and taken ~= nil, currentWorld and taken or 0
+		request.status = not currentWorld and "cancelled" or (taken and "done" or (ok and "timeout" or "error"))
+		request.done = true
+		if DropMemory.inFlight == request then DropMemory.inFlight = nil end
+	end)
+	local deadline = os.clock() + 0.3
+	while not request.done and os.clock() < deadline do
+		if alive and not alive() then return false, 0, "pending" end
+		task.wait(0.02)
+	end
+	return request.ok, request.taken, request.status
+end
+
 -- `only` (opsional) = tabel uid drop yang boleh diambil. Dipakai saat blok
 -- penuh: yang dijemput hanya drop lama, drop pecahan baru dibiarkan supaya
 -- blok di inventory benar-benar berkurang dulu.
@@ -2190,13 +2278,23 @@ local function collectDropsNearby(W, inv, state, radius, only)
 		return 0
 	end
 	syncDropMemory(W, drops)
-	local collected, needsRoom = 0, false
+	local collected, needsRoom, pending = 0, false, nil
 	local moveGen = Move.gen
 	-- Radius pencarian boleh lebar, tetapi request hanya sah dari dekat.
 	local takeRadius = math.min(radius, 0.9)
+	local candidates = {}
 	for _, drop in ipairs(drops) do
+		if type(drop) == "table" and type(drop.x) == "number" and type(drop.y) == "number"
+			and (drop.x - state.x)^2 + (drop.y - state.y)^2 <= takeRadius * takeRadius then
+			table.insert(candidates, drop)
+		end
+	end
+	-- Snapshot kandidat kecil: ACK dapat menghapus entri pada list live.
+	for _, drop in ipairs(candidates) do
 		if Move.gen ~= moveGen then break end
 		if type(drop) == "table" and type(drop.uid) == "number" and type(drop.id) == "number"
+			-- Gems tetap di collector bawaan: jalurnya addGems, bukan inv.add.
+			and drop.id ~= 112 and not drop.display and not drop.pending
 			and type(drop.n) == "number" and type(drop.x) == "number" and type(drop.y) == "number"
 			and not dropIgnored(W, drop)
 			and (not only or only[drop.uid]) then
@@ -2207,11 +2305,10 @@ local function collectDropsNearby(W, inv, state, radius, only)
 				if available > 0 then
 					-- Minta satu tumpukan penuh. Game yang menentukan berapa
 					-- bagian yang diterima ketika inventory hampir penuh.
-					local takeOK, taken = pcall(W.takeDrop, drop.uid, drop.n)
-					taken = takeOK and tonumber(taken) or 0
-					if takeOK then recordDropTake(W, drop, taken, state, available) end
+					local takeOK, taken, status = requestDropTake(W, inv, drop, state, available,
+						function() return Move.gen == moveGen end)
+					if not takeOK then pending = status end
 					if taken > 0 then
-						pcall(inv.add, inv, drop.id, taken)
 						collected += taken
 					elseif drop.id == Factory.baseId and drop.n > available then
 						needsRoom = true
@@ -2223,7 +2320,7 @@ local function collectDropsNearby(W, inv, state, radius, only)
 			end
 		end
 	end
-	return collected, needsRoom
+	return collected, needsRoom, pending
 end
 
 -- Drop hasil pukulan duduk di tengah tile yang pecah (x+0.5, y+0.5). Pemain
@@ -2250,6 +2347,7 @@ local function collectDropsAtTile(W, inv, x, y, alive, quick, expectedId)
 	local roomOK, expectedRoom = false, 0
 	if expectedId then roomOK, expectedRoom = pcall(inv.room, inv, expectedId) end
 	local expectedPending = roomOK and (tonumber(expectedRoom) or 0) > 0
+	local collectUntil = start + (quick and 0.6 or 1.6)
 
 	local function nearby()
 		local state = Bind.state()
@@ -2264,6 +2362,7 @@ local function collectDropsAtTile(W, inv, x, y, alive, quick, expectedId)
 		local list, nearest, nearestDist = {}, nil, nil
 		for _, drop in ipairs(drops) do
 			if type(drop) == "table" and type(drop.uid) == "number"
+				and drop.id ~= 112 and not drop.display and not drop.pending
 				and not collectedUIDs[drop.uid]
 				and (attempts[drop.uid] or 0) < 3
 				and type(drop.id) == "number" and type(drop.n) == "number"
@@ -2284,7 +2383,7 @@ local function collectDropsAtTile(W, inv, x, y, alive, quick, expectedId)
 	end
 
 	local sawAny = false
-	while os.clock() - start < (quick and 0.6 or 1.6) do
+	while os.clock() < collectUntil do
 		if alive and not alive() then
 			break
 		end
@@ -2317,16 +2416,17 @@ local function collectDropsAtTile(W, inv, x, y, alive, quick, expectedId)
 				local available = roomOK and (tonumber(room) or 0) or 0
 				if available > 0 then
 					anyRoom = true
+					if drop.id == expectedId and type(drop.readyAt) == "number" then
+						collectUntil = math.max(collectUntil, math.min(start + 1.5, drop.readyAt + 0.3))
+					end
 					if not inReach then retry = true end
 					if inReach and (attempts[drop.uid] or 0) < 3 then
-						attempts[drop.uid] = (attempts[drop.uid] or 0) + 1
-						local okT, taken = pcall(W.takeDrop, drop.uid, drop.n)
-						taken = okT and tonumber(taken) or 0
-						if okT then recordDropTake(W, drop, taken, state, available) end
+						local wanted = drop.n
+						local _, taken, status = requestDropTake(W, inv, drop, state, available, alive)
+						if status == "done" then attempts[drop.uid] = (attempts[drop.uid] or 0) + 1 end
 						if taken > 0 then
-							pcall(inv.add, inv, drop.id, taken)
 							total += taken
-							if quick and taken >= drop.n then collectedUIDs[drop.uid] = true end
+							if quick and taken >= wanted then collectedUIDs[drop.uid] = true end
 							took = true
 							if drop.id == expectedId then expectedPending = false end
 						else
@@ -4444,6 +4544,7 @@ local function factoryBaseDrops(W, baseId)
 	local result = {}
 	for _, drop in ipairs(drops) do
 		if type(drop) == "table" and drop.id == baseId and type(drop.uid) == "number"
+			and not drop.display and not drop.pending
 			and type(drop.n) == "number" and drop.n > 0
 			and type(drop.x) == "number" and type(drop.y) == "number"
 			and not dropIgnored(W, drop)
@@ -4463,6 +4564,17 @@ local function factoryCollectDrop(W, inv, state, blocked, gen)
 	end
 	local room = factoryRoom(inv, Factory.baseId)
 	if room <= 0 then return "room", #drops end
+	if DropMemory.inFlight then return "pending", #drops end
+	local ready, now = {}, os.clock()
+	for _, drop in ipairs(drops) do
+		if not drop.taking and now >= (tonumber(drop.readyAt) or 0)
+			and now >= (DropMemory.retryAt[drop.uid] or 0)
+			and now - (tonumber(drop.refused) or -math.huge) >= 1 then
+			table.insert(ready, drop)
+		end
+	end
+	if #ready == 0 then return "cooldown", #drops end
+	drops = ready
 	local dist = Path.explore(math.floor(state.x), math.floor(state.y - 0.0001), 6000)
 	local best, bestCost, eligible = nil, nil, false
 	for _, drop in ipairs(drops) do
@@ -4519,10 +4631,11 @@ local function factoryCollectDrop(W, inv, state, blocked, gen)
 	for attempt = 1, 3 do
 		if not alive() then return "take", #drops end
 		local current = Bind.state()
-		local collected = collectDropsNearby(W, inv, current, 0.9, only)
+		local collected, _, status = collectDropsNearby(W, inv, current, 0.9, only)
 		if collected > 0 then return "collected", collected end
 		if dropIgnored(W, best.drop) then return "ignored", #drops end
-		if best.drop.n > factoryRoom(inv, Factory.baseId) then return "room", #drops end
+		if status then return status, #drops end
+		if factoryRoom(inv, Factory.baseId) <= 0 then return "room", #drops end
 		if not current or not current.grounded or standingFloor(current) ~= best.y + 1
 			or (best.drop.x - current.x)^2 + (best.drop.y - current.y)^2 > 0.81 then break end
 		if attempt < 3 then task.wait(0.12) end
@@ -4917,13 +5030,17 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 			setFactoryStatus(string.format("Factory: mengambil drop blok +%d", amount))
 		elseif result == "ignored" then
 			setFactoryStatus("Factory: lewati drop yang gagal; lanjut drop atau pekerjaan lain")
+		elseif result == "pending" or result == "cooldown" or result == "timeout" or result == "error" then
+			setFactoryStatus(result == "pending" and "Factory: menunggu balasan collect; tidak mengirim ulang"
+				or "Factory: drop belum siap / jaringan tertunda; beri waktu sebelum coba lagi")
 		else
 			-- Saat menunggu jeda drop, jemput dulu apa pun yang sudah dalam
 			-- jangkauan. Tanpa ini jeda blok benar-benar diam.
 			collectDropsNearby(W, inv, Bind.state() or state, 0.9)
 			setFactoryStatus(string.format("Factory: mencoba ulang drop blok (%d tersisa, %s)", amount, result))
 		end
-		return (result == "collected" or result == "ignored") and 0.15 or 1
+		return (result == "collected" or result == "ignored") and 0.15
+			or ((result == "pending" or result == "cooldown") and 0.2 or 1)
 	end
 
 	if Factory.phase == "plant" then

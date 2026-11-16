@@ -31,6 +31,7 @@ local task = {wait=function(dt)
     clock+=dt
     state.x+=direction*7*dt
 end}
+function task.spawn(fn) fn() end
 local Bind = {name="TEST"}
 function Bind.state() return state end
 local function log() end
@@ -168,6 +169,15 @@ assert(#requestTimes==0 and not dropIgnored(W,blockDrop),
     "failed movement cannot send out-of-range requests or mark real drops as visual")
 Move.walkTo=walkTo
 print("PASS failed positioning sends no collect packets")
+
+-- A live drop can be visible but still carry the game's pickup delay.
+clock=0; active=true; state={x=11.5,y=5,grounded=true}
+blockDrop.uid=107; blockDrop.readyAt=1
+blockCount=0; requestTimes={}
+assert(harvest(11.5,4,11) and blockCount==5 and #requestTimes==1,
+    "harvest waits for the visible block's actual readyAt before leaving")
+assert(requestTimes[1].t>=1,"no premature take packets while the game pickup delay is active")
+print("PASS harvest honors actual pickup readiness")
 '''
 
 program = "\n".join([
