@@ -246,6 +246,6 @@ current = run(source, 0.06, regression=True)
 if len(sys.argv) > 2:
     baseline = subprocess.run(["git", "show", f"{sys.argv[2]}:hub.luau"], cwd=root,
                               capture_output=True, text=True, encoding="utf-8", check=True).stdout
-    old = run(baseline, 0.3)
+    old = run(baseline, 0.06)
     assert current < old
     print(f"SIMULATED 200-block drain: {old:.3f}s -> {current:.3f}s; real game not measured")

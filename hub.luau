@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.128",
+	version = "0.4.129",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -1532,7 +1532,7 @@ function Dig.isProtected(id, x, y)
 end
 
 -- Pukul satu tile satu kali. Return true kalau panggilan game berhasil.
-function Dig.punch(x, y, isTree, skipAim, allowLava, forceBg, canAct)
+function Dig.punch(x, y, isTree, skipAim, allowLava, forceBg, canAct, pnbFast)
 	local W = Bind.getW()
 	if not W or not Bind.hit then
 		return false
@@ -1589,7 +1589,9 @@ function Dig.punch(x, y, isTree, skipAim, allowLava, forceBg, canAct)
 	if canAct and not canAct() then return false end
 
 	local ok = pcall(Bind.hit, x, y, isTree == true)
-	W.punchReady = os.clock() + rnd(0.23, 0.26)
+	-- PNB terpusat memakai interval tetap dengan margin di atas cooldown
+	-- aksi game. Panen dan Dirt Farm mempertahankan pacing sebelumnya.
+	W.punchReady = os.clock() + (pnbFast and 0.22 or rnd(0.23, 0.26))
 	return ok
 end
 
@@ -4649,7 +4651,7 @@ local function factoryPNBOne(W, inv, gen, blocked, skipCollect)
 		pcall(inv.remove, inv, baseId, 1)
 		-- Jangan memperpendek cooldown pukulan terakhir saat memasang blok baru.
 		-- Dig.punch menunggu sisa cooldown ini; tidak perlu jeda pasang terpisah.
-		W.punchReady = math.max(tonumber(W.punchReady) or 0, os.clock() + 0.17)
+		W.punchReady = math.max(tonumber(W.punchReady) or 0, os.clock() + 0.15)
 	end
 	-- Kalau karakter tergeser dari tile blok setelah blok terpasang, pukulan
 	-- akan mengenai tile lain dan blok tidak pernah hancur. Berhenti lebih awal
@@ -4668,7 +4670,7 @@ local function factoryPNBOne(W, inv, gen, blocked, skipCollect)
 		if not alive() or pnbTileId(W, Factory.baseLayer, x, y) ~= baseId then
 			break
 		end
-		if not Dig.punch(x, y, false, true, Factory.baseId == 4, Factory.baseLayer == "bg", alive) then break end
+		if not Dig.punch(x, y, false, true, Factory.baseId == 4, Factory.baseLayer == "bg", alive, true) then break end
 		task.wait(0.02)
 	end
 	if pnbTileId(W, Factory.baseLayer, x, y) ~= 0 then
