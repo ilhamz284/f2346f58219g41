@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.129",
+	version = "0.4.130",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -1577,9 +1577,19 @@ function Dig.punch(x, y, isTree, skipAim, allowLava, forceBg, canAct, pnbFast)
 	end
 
 	-- hormati cooldown pukul milik game
-	local now = os.clock()
-	if type(W.punchReady) == "number" and now < W.punchReady then
-		task.wait(math.min(0.28, W.punchReady - now))
+	while true do
+		if canAct and not canAct() then return false end
+		local now = os.clock()
+		local ready = tonumber(W.punchReady) or now
+		-- hit() game mengabaikan tile yang baru dipasang selama 300 ms.
+		-- Timestamp dapat diperbarui oleh echo server ketika kita menunggu;
+		-- baca ulang agar pukulan pertama benar-benar menghitung damage.
+		local layer = fg ~= 0 and "fg" or "bg"
+		local placements = W.placedAt and W.placedAt[layer]
+		local placed = placements and placements[y * (tonumber(W.w) or 100) + x]
+		if type(placed) == "number" then ready = math.max(ready, placed + 0.31) end
+		if now >= ready then break end
+		task.wait(math.min(0.05, ready - now))
 	end
 
 	-- "membidik" sebentar sebelum pukulan pertama

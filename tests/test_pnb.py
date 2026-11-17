@@ -17,14 +17,16 @@ def extract(text, start, end):
 
 prelude = r'''
 local clock, active, stopAt = 0, true, math.huge
+local onWait=nil
 local os = {clock=function() return clock end}
 local task = {wait=function(dt)
     clock+=dt or 0.016
+    if onWait then onWait() end
     if clock>=stopAt then active=false end
 end}
 local function log() end
 local state={x=10.5,y=5,grounded=true}
-local W={name="TEST",w=100,h=60,fg={[4]={}},bg={[4]={}}}
+local W={name="TEST",w=100,h=60,fg={[4]={}},bg={[4]={}},placedAt={fg={},bg={}}}
 local inv={selected=954,blocks=200,seeds=0}
 function inv.count(_,id) return id==955 and inv.seeds or inv.blocks end
 function inv.select(_,id) inv.selected=id end
@@ -67,9 +69,10 @@ local Dig={isProtected=function() return false end}
 local placedAt,lastHit,hitsOnTile=0,-100,0
 function Bind.setTile(layer,x,y,id)
     W[layer][y][x]=id; placedAt=clock; hitsOnTile=0
+    W.placedAt[layer][y*100+x]=clock
 end
 function Bind.hit(x,y)
-    if clock-lastHit<0.21-1e-6 or clock-placedAt<0.14-1e-6 then
+    if clock-lastHit<0.21-1e-6 or clock-placedAt<0.3-1e-6 then
         rejected+=1; return
     end
     lastHit=clock; hits+=1; hitsOnTile+=1
@@ -213,6 +216,16 @@ local remaining=inv.blocks
 Factory.baseLayer="fg";W.fg[4][10]=954;hitsOnTile=0;placedAt=clock-1
 assert(factoryPNBOne(W,inv,1,{},true) and W.fg[4][10]==0 and inv.blocks==remaining,
  "resume a leftover farm block without placing or consuming another inventory block")
+local began=clock;local echoAt=nil
+W.fg[4][10]=954;W.placedAt.fg[410]=clock;W.punchReady=clock;placedAt=clock;hitsOnTile=0
+onWait=function()
+ if clock>=began+0.1 then
+  echoAt=clock;placedAt=clock;W.placedAt.fg[410]=clock;onWait=nil
+ end
+end
+assert(Dig.punch(10,4,false,true,false,false,function() return true end,true))
+assert(echoAt and lastHit>=echoAt+0.31-1e-6 and rejected==0,
+ "first punch waits for the latest server placement echo instead of wasting a hit inside the grace period")
 print("PASS full seeds switch to plant, empty blocks switch to plant")
 print("PASS post-drain seeds below 200, leftover-drop phase, normal PNB seeds, remaining blocks, empty seeds")
 '''
