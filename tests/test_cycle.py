@@ -149,6 +149,19 @@ assert(Factory.phase=="plant" and Factory.resumePNB and workCalls==0,
 reset("harvest",200); Factory.cycle=false
 factoryCycleStep(W,inv,state,955,{},1)
 assert(workCalls==0 and pnbCalls==0,"manual harvest pauses at capacity without starting PNB")
+
+reset("harvest",199)
+Factory.syncInventory=function(_,_,block,seed)
+ assert(block==954 and seed==955);inv.blocks=200;return true
+end
+factoryCycleStep(W,inv,state,955,{},1)
+assert(Factory.phase=="pnb" and workCalls==0 and pnbCalls==1,
+ "199 local / 200 server transitions to PNB before harvesting another tree")
+reset("harvest",199)
+Factory.syncInventory=function() return false,"pending" end
+factoryCycleStep(W,inv,state,955,{},1)
+assert(workCalls==0 and pnbCalls==0,"pending pickup pauses instead of racing inventory reconciliation")
+print("PASS server capacity reconciliation before harvest and pending-pickup pause")
 '''
 
 with tempfile.TemporaryDirectory(prefix="humanhub-cycle-") as directory:

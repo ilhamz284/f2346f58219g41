@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.125",
+	version = "0.4.126",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -1510,6 +1510,8 @@ local Factory = {
 	onMode = nil,
 	statusMode = nil :: string?,
 	currentStatus = nil :: any,
+	inventorySyncAt = 0,
+	inventorySync = nil :: any,
 	pickupGate = nil :: any,
 	syncingUI = false,
 }
@@ -4443,6 +4445,54 @@ local function factoryCount(inv, itemId)
 	return ok and (tonumber(count) or 0) or 0
 end
 
+-- Inventory client bisa tertinggal dari server (terukur 199 lokal / 200
+-- server). Baca snapshot resmi saat mulai dan mendekati penuh, bukan menebak
+-- jumlah dari drop yang ditolak. Tidak ada polling per-frame / remote take baru.
+function Factory.syncInventory(W, inv, blockId, seedId)
+	local now = os.clock()
+	if DropMemory.inFlight then return false, "pending" end
+	if now < (Factory.inventorySyncAt or 0) then return false, "cooldown" end
+	Factory.inventorySyncAt = now + 10
+	local context = Bind.context
+	if not context or context.world ~= W or not context.Shared then return false, "unavailable" end
+	local before, ids = {}, {}
+	for _, item in ipairs({ { id = blockId }, { id = seedId } }) do
+		local id = item.id
+		if id and not before[id] and type(inv.count) == "function" then
+			local ok, count = pcall(inv.count, inv, id)
+			if ok and type(count) == "number" then before[id] = count; table.insert(ids, id) end
+		end
+	end
+	local grid, name = W.fg, W.name
+	Move.release()
+	local ok, data = pcall(function() return require(context.Shared.Net).call("GetInventory") end)
+	if not ok or type(data) ~= "table" or type(data.slots) ~= "table" then return false, "response" end
+	if Hub.dead or Bind.W ~= W or W.fg ~= grid or W.name ~= name or Bind.inv ~= inv then
+		return false, "world"
+	end
+	local counts = {}
+	for _, slot in pairs(data.slots) do
+		if type(slot) ~= "table" or type(slot[1]) ~= "number" or type(slot[2]) ~= "number"
+			or slot[2] < 0 or slot[2] % 1 ~= 0 then return false, "response" end
+		counts[slot[1]] = (counts[slot[1]] or 0) + slot[2]
+	end
+	local applied = {}
+	for _, id in ipairs(ids) do
+		local target = counts[id] or 0
+		-- Jangan menimpa pickup yang masuk selama menunggu jawaban server.
+		local counted, current = pcall(inv.count, inv, id)
+		if counted and current == before[id] and target <= 200 then
+			local delta = target - current
+			if delta > 0 then pcall(inv.add, inv, id, delta)
+			elseif delta < 0 then pcall(inv.remove, inv, id, -delta) end
+			applied[id] = target
+		end
+	end
+	Factory.inventorySync = { at = now, before = before, server = counts, applied = applied }
+	Factory.collectNeedsRoom, Factory.blockedDropId = false, nil
+	return true
+end
+
 -- Dipanggil worker UI yang sudah ada. Hanya membaca counter inventory lokal;
 -- tidak meminta data server, scan GC, atau menyentuh layout setiap aksi.
 function Factory.currentStatus()
@@ -4944,6 +4994,16 @@ local function finishPNBDrain(inv)
 end
 
 local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
+	local blockId = Factory.baseId or Factory.pairId
+	if type(Factory.syncInventory) == "function" and
+		(factoryCount(inv, blockId) >= 199 or factoryCount(inv, seedId) >= 199 or Factory.collectNeedsRoom) then
+		local _, reason = Factory.syncInventory(W, inv, blockId, seedId)
+		if reason == "pending" then
+			Move.release()
+			setFactoryStatus("Factory: menunggu collect selesai sebelum cek inventory server")
+			return 0.2
+		end
+	end
 	-- ItemDB world bisa baru terisi setelah factory mulai; pakai nilai grow
 	-- terbaru supaya pohon matang tidak dianggap belum siap.
 	local seedDef = selectedItemDefinition(seedId)
@@ -5449,6 +5509,8 @@ local function startFactory()
 	if not Factory.cycle then
 		baseId, baseDef = nil, nil
 	end
+	Factory.inventorySyncAt = 0
+	Factory.syncInventory(W, inv, pairId, seedId)
 	local state = Bind.state()
 	local floorY = state and standingFloor(state)
 	if not floorY or not Path.standable(math.floor(state.x), floorY - 1) then
