@@ -44,6 +44,8 @@ local function factoryCount(_,id) return inv:count(id) end
 local function factoryWorkSpot() return 10,10,4 end
 local Path={}
 local paths,walks,collections,sweeps,rejected,hits=0,0,0,0,0,0
+local quickCollections=0
+local function collectDropsNearby() quickCollections+=1; return 0 end
 local obstacle=false
 function Path.standable(x,y) return y==4 and not (obstacle and x==11) end
 function Path.moveTo(x,y,alive)
@@ -85,7 +87,8 @@ for i=1,200 do
     task.wait(OUTER_WAIT)
 end
 assert(inv.blocks==0 and Factory.pnb==200 and hits==400, "drain all 200 blocks")
-assert(collections==0 and sweeps==0, "drain must not recollect its own blocks")
+assert(collections==0 and sweeps==0 and quickCollections==200,
+    "self-tile PNB services fresh pickup without a wait, sweep or path search")
 assert(rejected==0, "cooldown must not be bypassed")
 print(string.format("DRAIN_SECONDS %.3f",clock))
 '''
@@ -114,7 +117,8 @@ assert(not ok and why=="occupied" and inv.blocks==2, "occupied station never con
 W.fg[4][10]=0; Factory.workX=10; Factory.workY=4; Factory.workStandX=10
 Factory.baseLayer="bg"
 assert(factoryPNBOne(W,inv,1,{},true) and W.bg[4][10]==0, "background block is broken on correct layer")
-assert(factoryPNBOne(W,inv,1,{},false) and sweeps==1 and sweepCollections==2,
+local beforeCollect=collections
+assert(factoryPNBOne(W,inv,1,{},false) and sweeps==1 and sweepCollections==beforeCollect+1,
     "check lower-floor drops after collector waits for delayed spawns")
 print("PASS stationary PNB, solid station, gap fallback, Stop, empty inventory, occupied station, background, cooldown, full drain")
 '''
@@ -162,8 +166,8 @@ inv.seeds=23
 Factory.phase="pnb"; Factory.pnbDraining=true; Factory.pnbDrainCount=200; Factory.pnbDrainTarget=200
 Factory.pnbOldDrops={[17]=true}
 factoryCycleStep(W,inv,state,955,{},1)
-assert(Factory.phase=="plant" and Factory.resumeCollect and Factory.dropFilter[17],
-    "old drops wait until existing seeds are planted")
+assert(Factory.phase=="plant" and Factory.resumeCollect and Factory.dropFilter==nil,
+    "old drops wait until seeds are planted; leftover fresh drops are also eligible afterwards")
 Factory.phase="pnb"; Factory.pnbDraining=false; inv.seeds=9
 baseDrops={{uid=17,id=954,n=2}}
 factoryCycleStep(W,inv,state,955,{},1)

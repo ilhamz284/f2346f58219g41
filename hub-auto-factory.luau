@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.123",
+	version = "0.4.124",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -2143,6 +2143,12 @@ local function dropInReach(drop, state)
 		and state.y - 0.95 < drop.y + 0.3 and drop.y - 0.3 < state.y
 end
 
+local function pnbDeferredDrop(drop)
+	return Factory.running and Factory.cycle and Factory.phase == "pnb"
+		and drop.id == Factory.baseId and Factory.pnbOldDrops ~= nil
+		and Factory.pnbOldDrops[drop.uid] == true
+end
+
 local function syncDropMemory(W, drops)
 	if DropMemory.world ~= W or DropMemory.name ~= W.name or DropMemory.grid ~= W.fg then
 		DropMemory.world, DropMemory.name, DropMemory.grid = W, W.name, W.fg
@@ -2261,7 +2267,7 @@ end
 
 local function requestDropTake(W, inv, drop, state, room, alive)
 	local now = os.clock()
-	if Factory.running and Factory.cycle and Factory.phase == "pnb" and drop.id == Factory.baseId then
+	if pnbDeferredDrop(drop) then
 		return false, 0, "held"
 	end
 	if (tonumber(drop.n) or 0) <= 0 or dropIgnored(W, drop) then return false, 0, "gone" end
@@ -2312,8 +2318,8 @@ local function requestDropTake(W, inv, drop, state, room, alive)
 	return request.ok, request.taken, request.status
 end
 
--- Collector bawaan juga memanggil W.takeDrop. Menahan collector script saja
--- tidak cukup: native pickup dapat mengisi kembali slot 199 menjadi 200.
+-- Tahan hanya UID blok yang sudah ada SEBELUM batch PNB. Drop hasil break
+-- baru tetap dikoleksi seperti pickup manual, termasuk lewat collector native.
 function Factory.setPickupGate(W, enabled)
 	local gate = Factory.pickupGate
 	if enabled and gate and gate.world == W and gate.grid == W.fg and gate.name == W.name
@@ -2337,7 +2343,8 @@ function Factory.setPickupGate(W, enabled)
 					end
 				end
 			end
-			if drop and drop.id == Factory.baseId then return 0 end
+			if drop and drop.id == Factory.baseId and Factory.pnbOldDrops
+				and Factory.pnbOldDrops[uid] == true then return 0 end
 		end
 		return gate.original(uid, want)
 	end
@@ -2346,9 +2353,8 @@ function Factory.setPickupGate(W, enabled)
 end
 Hub.onUnload(function() Factory.setPickupGate(nil, false) end)
 
--- `only` (opsional) = tabel uid drop yang boleh diambil. Dipakai saat blok
--- penuh: yang dijemput hanya drop lama, drop pecahan baru dibiarkan supaya
--- blok di inventory benar-benar berkurang dulu.
+-- `only` (opsional) = tabel UID target. UID lama yang ditunda selama PNB
+-- tetap disaring terpisah; drop pecahan baru boleh masuk inventory.
 local function collectDropsNearby(W, inv, state, radius, only)
 	if not state or type(W.dropList) ~= "function" or type(W.takeDrop) ~= "function" then
 		return 0
@@ -2379,7 +2385,7 @@ local function collectDropsNearby(W, inv, state, radius, only)
 			-- Gems tetap di collector bawaan: jalurnya addGems, bukan inv.add.
 			and drop.id ~= 112 and not drop.display and not drop.pending
 			and type(drop.n) == "number" and type(drop.x) == "number" and type(drop.y) == "number"
-			and not dropIgnored(W, drop)
+			and not dropIgnored(W, drop) and not pnbDeferredDrop(drop)
 			and (not only or only[drop.uid]) then
 			local dx, dy = drop.x - state.x, drop.y - state.y
 			if dx * dx + dy * dy <= takeRadius * takeRadius and dropInReach(drop, state) then
@@ -2451,7 +2457,7 @@ local function collectDropsAtTile(W, inv, x, y, alive, quick, expectedId, expect
 				and (attempts[drop.uid] or 0) < 3
 				and type(drop.id) == "number" and type(drop.n) == "number"
 				and type(drop.x) == "number" and type(drop.y) == "number"
-				and not dropIgnored(W, drop) then
+				and not dropIgnored(W, drop) and not pnbDeferredDrop(drop) then
 				local ox, oy = drop.x - cx, drop.y - cy
 				if ox * ox + oy * oy <= 2.25 then
 					local dx, dy = drop.x - state.x, drop.y - state.y
@@ -4655,8 +4661,10 @@ local function factoryPNBOne(W, inv, gen, blocked, skipCollect)
 		return false, "break"
 	end
 	Factory.pnb += 1
-	if skipCollect then
-		-- Mode hemat ruang: drop pecahan dibiarkan di lantai, tidak dijemput.
+	if skipCollect and Factory.baseAtSelf then
+		-- Pickup baru di kaki tetap dilayani tanpa menunggu/menyisir world
+		-- setiap pukulan. UID lama ditunda; native menangani spawn terlambat.
+		collectDropsNearby(W, inv, Bind.state(), 0.9)
 		return true
 	end
 	if factoryAlive(gen) and not Factory.baseAtSelf and Bind.solid(x, y + 1) then
@@ -4668,7 +4676,7 @@ local function factoryPNBOne(W, inv, gen, blocked, skipCollect)
 		Factory.collectNeedsRoom = true
 		Factory.blockedDropId = blockedId
 	end
-	if alive() and not blockedId and Factory.baseAtSelf and dropSweepTile then
+	if not skipCollect and alive() and not blockedId and Factory.baseAtSelf and dropSweepTile then
 		-- Cek lantai lain setelah kolektor memberi waktu drop untuk muncul.
 		-- Tanpa urutan ini, drop terlambat bisa terlewat saat blok terakhir habis.
 		if dropSweepTile(W, x, y, baseId, alive) and alive() then
@@ -4920,11 +4928,8 @@ local factoryStoreSeeds
 -- Kosongkan seluruh blok sebelum fase tanam.
 local PNB_DRAIN_BATCH = 8
 
--- Semua batch Factory secara default menghabiskan inventory dahulu. Drop
--- pecahan jangan langsung diambil (200 -> 199 -> 200, tidak ada kemajuan).
--- Kalau ada drop lama di lantai: habiskan DULU semua blok di inventory (drop
--- pecahannya dibiarkan), tanam seed yang ada, baru jemput drop lama. Dengan
--- begitu slot benar-benar kosong dan siklus tidak berulang tiap 8 blok.
+-- Habiskan inventory beserta blok yang kembali dari break. Tumpukan lama
+-- sebelum batch ditunda supaya tidak mengisi ulang inventory setiap 1 blok.
 local function beginPNB(W, blocks, drain)
 	Factory.phase = "pnb"
 	Factory.pnbLowWater = 0
@@ -4972,7 +4977,9 @@ local function finishPNBDrain(inv)
 	end
 	local left = factoryCount(inv, Factory.baseId)
 	local seeds = factoryCount(inv, Factory.seedId)
-	Factory.dropFilter = anyOld and old or nil
+	-- Jemput semua sisa yang masih nyata setelah tanam, termasuk hasil break
+	-- yang belum siap pickup saat PNB selesai. Jangan membatasi hanya UID lama.
+	Factory.dropFilter = nil
 	Factory.resumePNB = left > 0
 	Factory.resumeCollect = anyOld
 	Factory.pnbLowWater = nil
@@ -5167,8 +5174,7 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 			setFactoryStatus(string.format("Factory: seed penuh %d/200; tanam dulu, sisa %d blok untuk PNB", seeds, blocks))
 			return 0.1
 		end
-		-- Batch pecah blok selesai (atau blok sudah habis): sekarang jemput
-		-- drop LAMA saja. Drop pecahan batch ini tetap di lantai.
+		-- Inventory sudah habis: tanam seed sebelum fase collect berikutnya.
 		if Factory.pnbDraining and blocks <= 0 then
 			finishPNBDrain(inv)
 			return 0.2
@@ -5217,7 +5223,7 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 			if Factory.pnbDraining then
 				Factory.pnbDrainCount += 1
 				if factoryAlive(gen) then
-					setFactoryStatus(string.format("Factory: pecah %d blok | blok sekarang %d/200; drop nanti dijemput",
+					setFactoryStatus(string.format("Factory: pecah %d blok | blok sekarang %d/200; drop lama ditunda",
 						Factory.pnbDrainCount, factoryCount(inv, Factory.baseId)), "drain")
 				end
 			elseif factoryAlive(gen) then

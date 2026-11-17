@@ -165,6 +165,7 @@ assert(rpcCount==before,"gems use native collector; display/pending drops are no
 print("PASS native gems and non-collectible records")
 
 Factory.running=true; Factory.cycle=true; Factory.phase="pnb"
+Factory.pnbOldDrops={}
 W.drops={}; inv.n=200; serverGot=1; serverDelay=0
 local original=W.takeDrop
 Factory.setPickupGate(W,true)
@@ -172,6 +173,7 @@ before=rpcCount
 for i=1,200 do
     inv.n-=1
     local block=drop(30000+i,1); table.insert(W.drops,block)
+    Factory.pnbOldDrops[block.uid]=true -- UID from before the current PNB batch.
     local taken=W.takeDrop(block.uid,block.n) -- native auto pickup
     inv.n+=taken
     assert(inv.n==200-i,"native collector must not refill the PNB inventory")
@@ -181,6 +183,12 @@ local held=W.drops[1]
 syncDropMemory(W,W.drops)
 assert(collectDropsNearby(W,inv,state,0.9)==0 and not dropIgnored(W,held),
     "a held real block is not classified as a visual failure")
+local fresh=drop(40001,1); table.insert(W.drops,fresh)
+assert(collectDropsNearby(W,inv,state,0.9)==1 and inv.n==1 and fresh.frame.destroyed,
+    "new real block from breaking is collected during PNB, even beside deferred old stacks")
+local nativeFresh=drop(40002,1); table.insert(W.drops,nativeFresh)
+assert(W.takeDrop(nativeFresh.uid,1)==1,
+    "native pickup also accepts a fresh PNB block")
 local seed=drop(31001,1); seed.id=955; table.insert(W.drops,seed)
 local gem2=drop(31002,1); gem2.id=112; table.insert(W.drops,gem2)
 assert(W.takeDrop(seed.uid,1)==1 and W.takeDrop(gem2.uid,1)==1,
@@ -191,7 +199,7 @@ assert(W.takeDrop==original and W.takeDrop(held.uid,1)==1,
 Factory.phase="pnb"; Factory.setPickupGate(W,true)
 Factory.running=false; Factory.setPickupGate(nil,false)
 assert(W.takeDrop==original,"Stop restores the original native collector")
-print("PASS native PNB 200-to-zero, script hold, seeds/gems, collect resume and Stop cleanup")
+print("PASS PNB holds old UIDs only, collects fresh blocks/seeds/gems, resume and Stop cleanup")
 '''
 
 with tempfile.TemporaryDirectory(prefix="humanhub-collect-protocol-") as directory:
