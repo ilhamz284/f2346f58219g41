@@ -38,7 +38,6 @@ local function pnbTileId(_,layer,x,y) return W[layer][y] and W[layer][y][x] or 0
 local function standingFloor(s) return math.floor(s.y-0.0001)+1 end
 local Factory={baseId=954,seedId=955,baseLayer="fg",baseAtSelf=true,
     workX=10,workStandX=10,workY=4,pnb=0,cycle=true}
-function Factory.setPickupGate() end
 local function factoryAlive() return active end
 local function factoryCount(_,id) return inv:count(id) end
 local function factoryWorkSpot() return 10,10,4 end
@@ -167,7 +166,7 @@ Factory.phase="pnb"; Factory.pnbDraining=true; Factory.pnbDrainCount=200; Factor
 Factory.pnbOldDrops={[17]=true}
 factoryCycleStep(W,inv,state,955,{},1)
 assert(Factory.phase=="plant" and Factory.resumeCollect and Factory.dropFilter==nil,
-    "old drops wait until seeds are planted; leftover fresh drops are also eligible afterwards")
+    "post-PNB collect may check any remaining drop after planting, without a UID restriction")
 Factory.phase="pnb"; Factory.pnbDraining=false; inv.seeds=9
 baseDrops={{uid=17,id=954,n=2}}
 factoryCycleStep(W,inv,state,955,{},1)
@@ -188,7 +187,7 @@ assert(Factory.phase=="plant" and Factory.resumeCollect, "drain always enters pl
 factoryCycleStep(W,inv,state,955,{},1)
 assert(Factory.phase=="collect", "empty seeds continue deferred old-drop collection")
 print("PASS full seeds switch to plant, empty blocks switch to plant")
-print("PASS post-drain seeds below 200, deferred old drops, normal PNB seeds, remaining blocks, empty seeds")
+print("PASS post-drain seeds below 200, leftover-drop phase, normal PNB seeds, remaining blocks, empty seeds")
 '''
 
 

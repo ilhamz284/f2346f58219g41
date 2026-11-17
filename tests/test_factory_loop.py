@@ -1,6 +1,6 @@
 """Run actual factory phase transitions with a simulated native collector.
 
-Farm actions and server replies are mocked; phase/gate/drain code is extracted
+Farm actions and server replies are mocked; phase/drain code is extracted
 from hub.luau. Other tests exercise the actual plant/PNB/collect actions.
 Usage: python tests/test_factory_loop.py <luau.exe>
 """
@@ -31,10 +31,9 @@ local firstTakePhase=nil
 function W.dropList() return W.drops end
 function W.takeDrop(uid,n)
     wireCalls+=1; firstTakePhase=firstTakePhase or Factory.phase
-    assert(not Factory.pnbOldDrops or not Factory.pnbOldDrops[uid]
-        or Factory.phase~="pnb","old block pickup reached the server during PNB")
     return n
 end
+local nativeTake=W.takeDrop
 local function factoryCount(_,id) return inv:count(id) end
 local function factoryRoom(_,id) return inv:room(id) end
 local function factoryBaseDrops() return W.drops end
@@ -79,9 +78,11 @@ local function factoryCollectDrop()
 end
 '''
 checks=r'''
-local function step() factoryCycleStep(W,inv,state,955,{},1); clock+=0.1 end
+local function step()
+    factoryCycleStep(W,inv,state,955,{},1); clock+=0.1
+    assert(W.takeDrop==nativeTake,"Factory phases must not replace or gate native takeDrop")
+end
 local function run(initial,extra)
-    if Factory.pickupGate then Factory.setPickupGate(nil,false) end
     Factory.phase="harvest"; Factory.planted=0; Factory.pnb=0; Factory.resumePNB=false
     Factory.resumeCollect=false; Factory.pnbDraining=false; Factory.pnbDrainCount=0
     W.drops={{uid=1,id=954,n=1,x=10.5,y=4.5}}
@@ -91,27 +92,26 @@ local function run(initial,extra)
         step()
         if Factory.phase=="plant" then break end
     end
-    assert(inv.blocks==0 and broken==initial+extra+returned and wireCalls==returned,
-        "PNB collects and rebreaks fresh returns, defers old drops and reaches actual zero")
+    assert(inv.blocks==0 and broken==initial+extra+returned+1 and wireCalls==returned+1,
+        "PNB collects/rebreaks both old and fresh blocks and reaches actual zero without changing phase early")
     local seeds=inv.seeds
     for i=1,1000 do
         step()
         if Factory.phase=="collect" then break end
     end
-    assert(inv.seeds==0 and Factory.planted==seeds and wireCalls==returned,
-        "plant consumes all seeds before collecting the old stack")
+    assert(inv.seeds==0 and Factory.planted==seeds and wireCalls==returned+1,
+        "plant consumes all seeds after PNB has exhausted actual stock")
     step()
-    assert(wireCalls==returned+1 and firstTakePhase=="pnb" and inv.blocks==1,
-        "fresh pickup runs during PNB; the old stack resumes after planting")
+    assert(wireCalls==returned+1 and firstTakePhase=="pnb" and inv.blocks==0,
+        "collect finds no leftover old stack because it was already picked during PNB")
 end
 run(200,0)
 run(169,31)
 run(40,0)
-print("PASS full factory: fresh block returns collected/rebroken, old stacks deferred until after plant")
+print("PASS full factory: old/fresh blocks collected and rebroken during PNB, then all seeds planted")
 print("PASS late ACK cannot finish at stale 169-block target; default partial-stock PNB also drains")
 '''
-gate=extract("function Factory.setPickupGate(","Hub.onUnload(function() Factory.setPickupGate")
-program="\n".join([prelude,gate,
+program="\n".join([prelude,
     extract("local function factoryHarvestCapacity(","local function factoryWork("),
     extract("local PNB_DRAIN_BATCH =","local function startFactory("),
     checks])
