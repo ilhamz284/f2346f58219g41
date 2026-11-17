@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.127",
+	version = "0.4.128",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -4517,6 +4517,7 @@ end
 -- Cari tile kosong untuk PNB. Lantai pemain dicoba dulu supaya jalurnya
 -- cuma jalan kaki (transisi turun/jatuh tidak selalu mendarat tepat).
 local function factoryWorkSpot(W, state, blocked)
+	local w = tonumber(W.w) or 100
 	local dist = Path.explore(math.floor(state.x), math.floor(state.y - 0.0001), 6000)
 	if not dist then return nil end
 	local cy = math.floor(state.y - 0.0001)
@@ -4528,8 +4529,9 @@ local function factoryWorkSpot(W, state, blocked)
 					local blockKey = "pnb:" .. y .. ":" .. x
 					local blockedUntil = blocked and blocked[blockKey]
 					if (not blockedUntil or blockedUntil < os.clock())
-						and tileId(x, y) == 0 and Bind.solid(x, y + 1)
-						and (Factory.baseLayer ~= "bg" or bgId(x, y) == 0) then
+						and (tileId(x, y) == 0 or (Factory.baseLayer == "fg" and tileId(x, y) == Factory.baseId))
+						and Bind.solid(x, y + 1)
+						and (Factory.baseLayer ~= "bg" or bgId(x, y) == 0 or bgId(x, y) == Factory.baseId) then
 						local candidates = Factory.baseAtSelf and { x } or { x - 1, x + 1 }
 						for _, standX in ipairs(candidates) do
 							local standKey = keyOf(standX, y)
@@ -4574,7 +4576,9 @@ local function factoryPNBOne(W, inv, gen, blocked, skipCollect)
 	local function releaseStation()
 		Factory.workX, Factory.workStandX, Factory.workY = nil, nil, nil
 	end
-	if pnbTileId(W, Factory.baseLayer, x, y) ~= 0 or tileId(x, y) ~= 0
+	local existing = pnbTileId(W, Factory.baseLayer, x, y) == baseId
+	if (pnbTileId(W, Factory.baseLayer, x, y) ~= 0 and not existing)
+		or (tileId(x, y) ~= 0 and not (existing and Factory.baseLayer == "fg"))
 		or not Bind.solid(x, y + 1) then
 		releaseStation()
 		return false, "occupied"
@@ -4612,7 +4616,8 @@ local function factoryPNBOne(W, inv, gen, blocked, skipCollect)
 	end
 	local arrived = Bind.state()
 	if not alive() or not arrived or standingFloor(arrived) ~= y + 1
-		or pnbTileId(W, Factory.baseLayer, x, y) ~= 0 or tileId(x, y) ~= 0 then
+		or (pnbTileId(W, Factory.baseLayer, x, y) ~= 0 and pnbTileId(W, Factory.baseLayer, x, y) ~= baseId)
+		or (tileId(x, y) ~= 0 and not (Factory.baseLayer == "fg" and tileId(x, y) == baseId)) then
 		if blocked then
 			blocked["pnb:" .. y .. ":" .. x] = os.clock() + 25
 		end
@@ -4635,14 +4640,17 @@ local function factoryPNBOne(W, inv, gen, blocked, skipCollect)
 		end
 	end
 	pcall(inv.select, inv, baseId)
-	local placed = pcall(Bind.setTile, Factory.baseLayer, x, y, baseId, false, false)
-	if not placed or pnbTileId(W, Factory.baseLayer, x, y) ~= baseId then
-		return false, "place"
+	existing = pnbTileId(W, Factory.baseLayer, x, y) == baseId
+	if not existing then
+		local placed = pcall(Bind.setTile, Factory.baseLayer, x, y, baseId, false, false)
+		if not placed or pnbTileId(W, Factory.baseLayer, x, y) ~= baseId then
+			return false, "place"
+		end
+		pcall(inv.remove, inv, baseId, 1)
+		-- Jangan memperpendek cooldown pukulan terakhir saat memasang blok baru.
+		-- Dig.punch menunggu sisa cooldown ini; tidak perlu jeda pasang terpisah.
+		W.punchReady = math.max(tonumber(W.punchReady) or 0, os.clock() + 0.17)
 	end
-	pcall(inv.remove, inv, baseId, 1)
-	-- Jangan memperpendek cooldown pukulan terakhir saat memasang blok baru.
-	-- Dig.punch menunggu sisa cooldown ini; tidak perlu jeda pasang terpisah.
-	W.punchReady = math.max(tonumber(W.punchReady) or 0, os.clock() + 0.17)
 	-- Kalau karakter tergeser dari tile blok setelah blok terpasang, pukulan
 	-- akan mengenai tile lain dan blok tidak pernah hancur. Berhenti lebih awal
 	-- daripada memukul 30 kali tanpa hasil.

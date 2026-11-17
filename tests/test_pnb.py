@@ -209,6 +209,10 @@ Factory.workX=10;Factory.workStandX=10;Factory.workY=4;state.x=10.5
 W.fg[4][10]=0;W.bg[4][10]=0
 factoryCycleStep(W,inv,state,955,{},1)
 assert(Factory.phase=="pnb" and inv.blocks==199,"PNB resumes once a working tile becomes available")
+local remaining=inv.blocks
+Factory.baseLayer="fg";W.fg[4][10]=954;hitsOnTile=0;placedAt=clock-1
+assert(factoryPNBOne(W,inv,1,{},true) and W.fg[4][10]==0 and inv.blocks==remaining,
+ "resume a leftover farm block without placing or consuming another inventory block")
 print("PASS full seeds switch to plant, empty blocks switch to plant")
 print("PASS post-drain seeds below 200, leftover-drop phase, normal PNB seeds, remaining blocks, empty seeds")
 '''
