@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.126",
+	version = "0.4.127",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -4534,7 +4534,9 @@ local function factoryWorkSpot(W, state, blocked)
 						for _, standX in ipairs(candidates) do
 							local standKey = keyOf(standX, y)
 							local distance = dist[standKey]
-							if distance and (not bestDistance or distance < bestDistance) then
+							-- Tengah kolom terakhir berada di luar batas gerak badan;
+							-- platform tepi boleh jadi jalur, bukan station PNB.
+							if standX >= 0 and standX < w - 1 and distance and (not bestDistance or distance < bestDistance) then
 								bestX, bestStandX, bestY, bestDistance = x, standX, y, distance
 							end
 						end
@@ -5206,10 +5208,9 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 		end
 		if Factory.pnbSkipUntil and Factory.pnbSkipUntil > os.clock() then
 			if Factory.pnbDraining then
-				-- Jalur ke tile kerja sedang diblokir; jangan tahan batch pecah
-				-- blok sampai 20 detik, selesaikan saja.
-				finishPNBDrain(inv)
-				return 0.2
+				setFactoryStatus(string.format("Factory: menunggu jalur tile PNB; %d blok tersisa (coba %d dtk lagi)",
+					blocks, math.ceil(Factory.pnbSkipUntil - os.clock())))
+				return 1
 			end
 			-- Jangan diam selama jeda: pakai waktunya untuk panen atau tanam
 			-- yang sudah tersedia, lalu kembali ke PNB.
@@ -5258,10 +5259,6 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 					Factory.pnbPathFailures))
 			elseif reason == "station" then
 				Factory.pnbPathFailures = 0
-				if Factory.pnbDraining then
-					finishPNBDrain(inv)
-					return 0.2
-				end
 				local ripe = factoryTarget(W, state, seedId, blocked, "harvest")
 				if ripe and factoryWork(W, inv, ripe, seedId, gen) then
 					setFactoryStatus("Factory: membuka tile kerja PNB dari tree matang")
@@ -5358,6 +5355,12 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 				setFactoryStatus("Factory: seed habis; cek drop, tree, dan sisa blok")
 			end
 			return 0.1
+		end
+		-- Sebelum memenuhi seluruh farm, cadangkan satu lokasi PNB, termasuk
+		-- setelah reload atau setelah station sebelumnya dilepas akibat gagal.
+		if (not Factory.workX or not Factory.workY) and os.clock() >= (Factory.reserveRetryAt or 0) then
+			Factory.reserveRetryAt = os.clock() + 5
+			Factory.workX, Factory.workStandX, Factory.workY = factoryWorkSpot(W, state, blocked)
 		end
 		local target = factoryTarget(W, state, seedId, blocked, "plant")
 		if target then

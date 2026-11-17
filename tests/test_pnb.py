@@ -186,6 +186,29 @@ factoryCycleStep(W,inv,state,955,{},1)
 assert(Factory.phase=="plant" and Factory.resumeCollect, "drain always enters plant even without seeds")
 factoryCycleStep(W,inv,state,955,{},1)
 assert(Factory.phase=="collect", "empty seeds continue deferred old-drop collection")
+
+Factory.phase="plant"; inv.seeds=2
+Factory.workX=nil;Factory.workY=nil;Factory.workStandX=nil;Factory.reserveRetryAt=0
+factoryCycleStep(W,inv,state,955,{},1)
+assert(Factory.workX==10 and Factory.workY==4,"plant reserves a PNB station before filling empty tiles")
+local normalPNB=factoryPNBOne
+local normalTarget=factoryTarget
+factoryTarget=function(_,_,_,_,kind) if kind=="harvest" then return nil end end
+factoryPNBOne=function() return false,"station" end
+Factory.phase="pnb";Factory.pnbDraining=true;inv.blocks=200;inv.seeds=0
+for i=1,10 do
+ factoryCycleStep(W,inv,state,955,{},1)
+ assert(Factory.phase=="pnb" and inv.blocks==200,"no station must not finish PNB or oscillate into plant")
+end
+Factory.pnbSkipUntil=clock+20
+factoryCycleStep(W,inv,state,955,{},1)
+assert(Factory.phase=="pnb","route cooldown cannot complete a nonempty PNB batch")
+Factory.pnbSkipUntil=nil;factoryPNBOne=normalPNB
+factoryTarget=normalTarget
+Factory.workX=10;Factory.workStandX=10;Factory.workY=4;state.x=10.5
+W.fg[4][10]=0;W.bg[4][10]=0
+factoryCycleStep(W,inv,state,955,{},1)
+assert(Factory.phase=="pnb" and inv.blocks==199,"PNB resumes once a working tile becomes available")
 print("PASS full seeds switch to plant, empty blocks switch to plant")
 print("PASS post-drain seeds below 200, leftover-drop phase, normal PNB seeds, remaining blocks, empty seeds")
 '''
