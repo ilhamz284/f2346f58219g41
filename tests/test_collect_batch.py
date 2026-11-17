@@ -61,9 +61,11 @@ function Path.moveTo(x,y)
 end
 function W.dropList() return W.drops end
 local rpcDelay=0.12
+local rejectCapacity=false
 function W.takeDrop(uid,n)
     table.insert(requests,{uid=uid,n=n,t=clock})
     if rpcDelay>0 then coroutine.yield(rpcDelay) end
+    if rejectCapacity then return 0 end
     return math.min(n,inv:room(954))
 end
 local function setter(drop,n)
@@ -136,6 +138,24 @@ reset(1); W.drops[1].y=7.5
 assert(factoryCollectDrop(W,inv,state,{},1)=="collected" and plans==1 and paths==1,
     "cross-floor drop retains world pathfinding")
 print("PASS old-drop filter, corridor and cross-floor fallback")
+
+reset(1); W.drops[1].x=11.2
+assert(factoryCollectDrop(W,inv,state,{},1)=="collected" and walks>0,
+    "dx=.7 cannot use underfoot shortcut; bot approaches before requesting pickup")
+print("PASS approach drops outside native overlap")
+
+reset(1); W.drops[1].n=5; inv.blocks=199; rpcDelay=0.8; rejectCapacity=true
+for i=1,3 do
+    assert(factoryCollectDrop(W,inv,state,{},1)=="pending")
+    task.wait(1)
+end
+assert(factoryCollectDrop(W,inv,state,{},1)=="room" and #requests==3,
+    "late zero ACKs preserve partial-capacity rejection across factory ticks")
+assert(not dropIgnored(W,W.drops[1]),"capacity rejection cannot erase or blacklist the real drop")
+inv.blocks=190; rejectCapacity=false; rpcDelay=0.12
+assert(factoryCollectDrop(W,inv,state,{},1)=="collected" and inv.blocks==195,
+    "capacity evidence expires when room changes; full-stack pickup resumes")
+print("PASS delayed capacity rejection exits collect and retries after room changes")
 '''
 
 benchmark = r'''

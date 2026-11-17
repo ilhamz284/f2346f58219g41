@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.122",
+	version = "0.4.123",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -2135,6 +2135,14 @@ end
 local DropMemory = { world = nil, name = nil, grid = nil, records = {}, pruneAt = 0, seenAt = 0,
 	liveList = nil :: any, setter = nil :: any, setterList = nil :: any, setterRetryAt = 0,
 	inFlight = nil :: any, retryAt = {} }
+-- Sama dengan touchesDrop game: HW=.3, DROP_SIZE=.6, tinggi pemain=.95.
+-- Lingkaran radius .9 sebelumnya menerima dx=.7 saat dy=.5, padahal
+-- sprite belum menyentuh pemain. Penolakan itu bukan bukti drop visual.
+local function dropInReach(drop, state)
+	return state ~= nil and math.abs(drop.x - state.x) < 0.6
+		and state.y - 0.95 < drop.y + 0.3 and drop.y - 0.3 < state.y
+end
+
 local function syncDropMemory(W, drops)
 	if DropMemory.world ~= W or DropMemory.name ~= W.name or DropMemory.grid ~= W.fg then
 		DropMemory.world, DropMemory.name, DropMemory.grid = W, W.name, W.fg
@@ -2181,10 +2189,9 @@ local function recordDropTake(W, drop, taken, state, room)
 		return
 	end
 	-- Penuh / belum sampai tile drop / jaringan error bukan bukti drop visual.
-	if room < drop.n or not state or not state.grounded
+	if room <= 0 or not state or not state.grounded
 		or standingFloor(state) ~= math.floor(drop.y) + 1 then return end
-	local dx, dy = drop.x - state.x, drop.y - state.y
-	if dx * dx + dy * dy > 0.81 then return end
+	if not dropInReach(drop, state) then return end
 	local record = DropMemory.records[drop.uid]
 	if not record then
 		record = { id = drop.id, n = drop.n, x = drop.x, y = drop.y, failures = 0,
@@ -2193,9 +2200,25 @@ local function recordDropTake(W, drop, taken, state, room)
 	end
 	local now = os.clock()
 	if now - (record.lastAt or -math.huge) < 0.1 then return end
-	record.failures = (record.failures or 0) + 1
 	record.lastAt = now
+	if room < drop.n then
+		-- Balasan mobile bisa tiba sesudah caller berhenti menunggu (.3 s).
+		-- Simpan penolakan kapasitas per UID/ruang agar tidak hilang saat ACK
+		-- terlambat. Ini tidak menandai drop sebagai visual atau menghapusnya.
+		if record.capacityRoom ~= room then record.capacityFailures = 0 end
+		record.capacityRoom = room
+		record.capacityFailures = (record.capacityFailures or 0) + 1
+		return
+	end
+	record.capacityRoom, record.capacityFailures = nil, nil
+	record.failures = (record.failures or 0) + 1
 	if record.failures >= 3 then record.ignore = true end
+end
+
+local function dropNeedsRoom(drop, room)
+	local record = DropMemory.records[drop.uid]
+	return room > 0 and room < drop.n and record ~= nil
+		and record.capacityRoom == room and (record.capacityFailures or 0) >= 3
 end
 
 -- takeDrop sudah mengirim paket take/took. Seperti collector bawaan, sesudah
@@ -2249,6 +2272,10 @@ local function requestDropTake(W, inv, drop, state, room, alive)
 	-- loop factory tidak ikut tertahan dan tidak mengirim request duplikat.
 	if DropMemory.inFlight then return false, 0, "pending" end
 	if alive and not alive() then return false, 0, "cancelled" end
+	-- Posisi bisa berubah selama menunggu UID sebelumnya. Periksa ulang
+	-- sebelum mengirim request, bukan hanya ketika memilih kandidat batch.
+	state = Bind.state() or state
+	if not dropInReach(drop, state) then return false, 0, "position" end
 	local wanted = drop.n
 	local snapshot = { uid = drop.uid, id = drop.id, n = wanted, x = drop.x, y = drop.y }
 	local grid, list = W.fg, DropMemory.liveList
@@ -2355,7 +2382,7 @@ local function collectDropsNearby(W, inv, state, radius, only)
 			and not dropIgnored(W, drop)
 			and (not only or only[drop.uid]) then
 			local dx, dy = drop.x - state.x, drop.y - state.y
-			if dx * dx + dy * dy <= takeRadius * takeRadius then
+			if dx * dx + dy * dy <= takeRadius * takeRadius and dropInReach(drop, state) then
 				local roomOK, room = pcall(inv.room, inv, drop.id)
 				local available = roomOK and (tonumber(room) or 0) or 0
 				if available > 0 then
@@ -2366,7 +2393,7 @@ local function collectDropsNearby(W, inv, state, radius, only)
 					if not takeOK then pending = status end
 					if taken > 0 then
 						collected += taken
-					elseif drop.id == Factory.baseId and drop.n > available then
+					elseif takeOK and status == "done" and drop.id == Factory.baseId and drop.n > available then
 						needsRoom = true
 					end
 					-- Pisahkan request antar-drop agar tumpukan di tile yang sama
@@ -2468,7 +2495,7 @@ local function collectDropsAtTile(W, inv, x, y, alive, quick, expectedId, expect
 			sawAny = true
 			-- Berdiri tepat di drop; jangan jalan kalau drop ada di lantai
 			-- lain (bisa memicu jatuh).
-			if nearest and nearestDist > 0.81 and math.abs(nearest.y - state.y) <= 1.05 then
+			if nearest and not dropInReach(nearest, state) and math.abs(nearest.y - state.y) <= 1.05 then
 				Move.walkTo(nearest.x, { timeout = 1.2, tol = 0.22,
 					quick = quick, alive = alive, floorY = quick and (y + 1) or nil, recover = not quick })
 				state = Bind.state() or state
@@ -2479,7 +2506,7 @@ local function collectDropsAtTile(W, inv, x, y, alive, quick, expectedId, expect
 				local drop = item.drop
 				state = Bind.state() or state
 				local dx, dy = drop.x - state.x, drop.y - state.y
-				local inReach = dx * dx + dy * dy <= 0.81
+				local inReach = dropInReach(drop, state)
 				local roomOK, room = pcall(inv.room, inv, drop.id)
 				local available = roomOK and (tonumber(room) or 0) or 0
 				if available > 0 then
@@ -4706,14 +4733,14 @@ local function factoryCollectCluster(W, inv, candidates, firstUID, blocked, gen)
 			and now >= (blocked["drop:" .. drop.uid] or 0) then
 			local pos = Bind.state()
 			if pos and pos.grounded and standingFloor(pos) == math.floor(drop.y) + 1
-				and (drop.x - pos.x)^2 + (drop.y - pos.y)^2 <= 0.81 then
+				and dropInReach(drop, pos) then
 				-- Collector target utama sudah menunggu 20 ms; 60 ms sisanya
 				-- diberikan sebelum request berikutnya, bukan jeda 1 dtk/stack.
 				task.wait(0.06)
 				pos = Bind.state()
 				if not alive() or not pos or not pos.grounded
 					or standingFloor(pos) ~= math.floor(drop.y) + 1
-					or (drop.x - pos.x)^2 + (drop.y - pos.y)^2 > 0.81
+					or not dropInReach(drop, pos)
 					or factoryCount(inv, Factory.seedId) >= 200 then break end
 				local room = factoryRoom(inv, Factory.baseId)
 				if room <= 0 then break end
@@ -4758,7 +4785,7 @@ local function factoryCollectDrop(W, inv, state, blocked, gen)
 	if state.grounded then
 		for _, drop in ipairs(drops) do
 			if standingFloor(state) == math.floor(drop.y) + 1
-				and (drop.x - state.x)^2 + (drop.y - state.y)^2 <= 0.81
+				and dropInReach(drop, state)
 				and now >= (blocked["drop:" .. drop.uid] or 0) then
 				best = { drop = drop, x = sx, y = sy, nearby = true }
 				break
@@ -4772,9 +4799,8 @@ local function factoryCollectDrop(W, inv, state, blocked, gen)
 			local x = math.floor(drop.x)
 			for _, standX in ipairs({ x, x - 1, x + 1 }) do
 				local cost = dist and dist[keyOf(standX, y)]
-				local dx, dy = drop.x - (standX + 0.5), drop.y - (y + 0.999)
 				if cost and Path.standable(standX, y)
-					and dx * dx + dy * dy <= 0.9 * 0.9
+					and dropInReach(drop, { x = standX + 0.5, y = y + 0.999 })
 					and (not blocked["drop:" .. drop.uid] or blocked["drop:" .. drop.uid] < os.clock())
 					and (not bestCost or cost < bestCost) then
 					best, bestCost = { drop = drop, x = standX, y = y, corridor = corridor }, cost
@@ -4833,21 +4859,29 @@ local function factoryCollectDrop(W, inv, state, blocked, gen)
 	Factory.dropPathFails = nil
 	local positioned = Bind.state()
 	local inReach = positioned and positioned.grounded and standingFloor(positioned) == best.y + 1
-		and (best.drop.x - positioned.x)^2 + (best.drop.y - positioned.y)^2 <= 0.81
-	if not inReach and not Move.walkTo(best.x + 0.5, { timeout = 2, tol = 0.25, quick = true,
-		recover = false, floorY = best.y + 1, alive = alive }) then
-		blocked["drop:" .. best.drop.uid] = os.clock() + 2
-		return "path", #drops
+		and dropInReach(best.drop, positioned)
+	if not inReach then
+		local aligned = Move.walkTo(best.drop.x, { timeout = 2, tol = 0.12, quick = true,
+			recover = false, floorY = best.y + 1, alive = alive })
+		positioned = Bind.state()
+		if not aligned or not positioned or not positioned.grounded
+			or standingFloor(positioned) ~= best.y + 1 or not dropInReach(best.drop, positioned) then
+			blocked["drop:" .. best.drop.uid] = os.clock() + 2
+			return "path", #drops
+		end
 	end
 	-- Nilai hasil harus milik target ini; drop lain yang berhasil tidak boleh
 	-- menyembunyikan kegagalan target visual yang tetap ada.
 	local only = { [best.drop.uid] = true }
+	if dropNeedsRoom(best.drop, factoryRoom(inv, Factory.baseId)) then return "room", #drops end
+	local capacityRejected = false
 	-- Verifikasi dalam satu kunjungan, bukan bolak-balik menghitung rute untuk
 	-- UID yang sama. Maksimal 3 panggilan dengan jeda pendek, tidak ada worker baru.
 	for attempt = 1, 3 do
 		if not alive() then return "take", #drops end
 		local current = Bind.state()
-		local collected, _, status = collectDropsNearby(W, inv, current, 0.9, only)
+		local collected, needsRoom, status = collectDropsNearby(W, inv, current, 0.9, only)
+		capacityRejected = capacityRejected or needsRoom == true
 		if collected > 0 then
 			return "collected", collected + factoryCollectCluster(W, inv, drops, best.drop.uid, blocked, gen)
 		end
@@ -4855,9 +4889,13 @@ local function factoryCollectDrop(W, inv, state, blocked, gen)
 		if status then return status, #drops end
 		if factoryRoom(inv, Factory.baseId) <= 0 then return "room", #drops end
 		if not current or not current.grounded or standingFloor(current) ~= best.y + 1
-			or (best.drop.x - current.x)^2 + (best.drop.y - current.y)^2 > 0.81 then break end
+			or not dropInReach(best.drop, current) then break end
 		if attempt < 3 then task.wait(0.12) end
 	end
+	-- ACK nol ketika hanya tersisa 1-2 slot tidak membuktikan drop visual.
+	-- Setelah percobaan dekat yang terbatas, kosongkan inventory lewat PNB;
+	-- jangan mengabaikan needsRoom lalu bolak-balik ke tumpukan yang sama.
+	if capacityRejected then return "room", #drops end
 	blocked["drop:" .. best.drop.uid] = os.clock() + 0.5
 	return "take", #drops
 end

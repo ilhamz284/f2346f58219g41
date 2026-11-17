@@ -110,6 +110,14 @@ for i=1,4 do
 end
 inv.blocks=190
 assert(collectDropsNearby(W,inv,state,0.9)==5 and requests[5]==5)
+inv.blocks=199
+partial={uid=50,id=954,n=5,x=10.5,y=4.5}; drops={partial}
+assert(factoryCollectDrop(W,inv,state,{},1)=="room" and requests[50]==3,
+    "confirmed partial-capacity rejection exits collect instead of looping at 199 blocks")
+assert(not dropIgnored(W,partial),"capacity rejection never classifies a real drop as visual")
+inv.blocks=190
+assert(factoryCollectDrop(W,inv,state,{},1)=="collected" and inv.blocks==195,
+    "the same full-stack request succeeds after inventory has space")
 local full={uid=6,id=954,n=1,x=10.5,y=4.5}
 drops={full}; inv.blocks=200
 collectDropsNearby(W,inv,state,0.9)

@@ -71,6 +71,14 @@ end
 checks = r'''
 local first=drop(1,5)
 W.drops={first}; serverGot=2
+state.x=9.8 -- dx=.7, dy=.5: inside the old radius but outside native overlap.
+local rangeRequests=rpcCount
+for i=1,4 do collectDropsNearby(W,inv,state,0.9); clock+=0.2 end
+assert(rpcCount==rangeRequests and not dropIgnored(W,first),
+    "outside native overlap sends no packet and cannot classify a real drop as visual")
+assert(not dropInReach({x=0.6,y=4.5},{x=0,y=5}),
+    "native horizontal boundary is excluded")
+state.x=10.5
 assert(collectDropsNearby(W,inv,state,0.9)==2 and inv.n==2)
 assert(first.n==3 and not first.frame.destroyed and first.count.value=="3",
     "partial server ACK updates the drop count without destroying the remainder")
@@ -80,6 +88,16 @@ assert(#W.drops==0 and first.frame.destroyed and first.n==0,
     "full server ACK removes the live record and sprite, just like manual collect")
 assert(setterCalls==2 and gcCalls==1,"game setter is cached by exact live-list identity")
 print("PASS server-confirmed partial/full local cleanup, cached game setter")
+
+local shifted=drop(100,2)
+W.drops={shifted}; syncDropMemory(W,W.drops)
+local stale={x=10.5,y=5,grounded=true}
+state.x=12; rangeRequests=rpcCount
+local _,_,rangeStatus=requestDropTake(W,inv,shifted,stale,200)
+assert(rangeStatus=="position" and rpcCount==rangeRequests,
+    "request rechecks the live position instead of trusting a stale batch position")
+state.x=10.5
+print("PASS native pickup geometry, no false ghost, live-position guard")
 
 local second=drop(2,4)
 W.drops={second}; second.readyAt=clock+1
