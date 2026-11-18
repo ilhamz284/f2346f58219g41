@@ -156,6 +156,27 @@ inv.blocks=190; rejectCapacity=false; rpcDelay=0.12
 assert(factoryCollectDrop(W,inv,state,{},1)=="collected" and inv.blocks==195,
     "capacity evidence expires when room changes; full-stack pickup resumes")
 print("PASS delayed capacity rejection exits collect and retries after room changes")
+
+reset(1); inv.blocks=200; W.drops[1].id=955; Factory.dropFilter={[999]=true}
+local function seedTake(uid,n)
+ table.insert(requests,{uid=uid,n=n,t=clock});return n
+end
+local blockTake=W.takeDrop; W.takeDrop=seedTake
+result=factoryCollectDrop(W,inv,state,{},1,955)
+assert(result=="collected" and inv.seeds==2 and inv.blocks==200,
+    "seed pickup uses seed capacity and ignores the old block filter even when blocks are full")
+assert(Factory.dropFilter[999],"seed collection must preserve the separate block filter")
+reset(1); W.drops[1].id=955;W.drops[1].x=15.5
+assert(factoryCollectDrop(W,inv,state,{},1,955)=="collected" and walks>0,
+    "selected seeds can be collected from another tile")
+reset(1); W.drops[1].id=955;W.drops[1].y=7.5
+assert(factoryCollectDrop(W,inv,state,{},1,955)=="collected" and paths==1,
+    "selected seed pickup retains cross-floor routing")
+reset(3);W.drops[1].id=955;W.drops[1].display=true;W.drops[2].id=957
+assert(factoryCollectDrop(W,inv,state,{},1,955)=="done" and #requests==0,
+    "display seeds, another seed type and block drops must not become seed-refill targets")
+W.takeDrop=blockTake
+print("PASS seed capacity, exact seed ID, block filter independence, floor routes and Display Box exclusion")
 '''
 
 benchmark = r'''

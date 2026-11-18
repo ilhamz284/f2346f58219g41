@@ -44,6 +44,7 @@ local function factoryHasTrees() return true end
 local function factoryHasRipeTree() return false end
 local function factoryGrowDesc() return "growing" end
 local function collectDropsNearby() return 0 end
+local function factoryRefillSeeds() return false end
 local function factoryTarget(_,_,_,_,kind) if kind=="plant" then return {kind="plant"} end end
 local function factoryWorkSpot() return 10,10,4 end
 local function factoryWork()

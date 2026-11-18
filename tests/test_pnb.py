@@ -126,6 +126,7 @@ print("PASS stationary PNB, solid station, gap fallback, Stop, empty inventory, 
 '''
 
 phase_helpers = r'''
+local function factoryRefillSeeds() return false end
 local function selectedItemDefinition() return {grow=1} end
 local function factoryRoom() return 200 end
 local baseDrops={}

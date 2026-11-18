@@ -46,6 +46,7 @@ local function factoryHasTrees() return true end
 local function factoryGrowDesc() return "growing" end
 local function factoryAlive() return true end
 local function collectDropsNearby() return 0,false end
+local function factoryRefillSeeds() return false end
 local function setFactoryStatus(s) Factory.status=s end
 local function beginPNB(_,_,drain) pnbCalls+=1; lastDrain=drain; Factory.phase="pnb" end
 local Move={release=function() end}

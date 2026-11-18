@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.130",
+	version = "0.4.131",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -4732,7 +4732,7 @@ local function factoryRoom(inv, itemId)
 	return ok and (tonumber(room) or 0) or 0
 end
 
-local function factoryBaseDrops(W, baseId)
+local function factoryBaseDrops(W, baseId, ignoreFilter)
 	if not baseId or type(W.dropList) ~= "function" then return {} end
 	local ok, drops = pcall(W.dropList)
 	if not ok or type(drops) ~= "table" then return {} end
@@ -4744,7 +4744,7 @@ local function factoryBaseDrops(W, baseId)
 			and type(drop.n) == "number" and drop.n > 0
 			and type(drop.x) == "number" and type(drop.y) == "number"
 			and not dropIgnored(W, drop)
-			and (not Factory.dropFilter or Factory.dropFilter[drop.uid]) then
+			and (ignoreFilter or not Factory.dropFilter or Factory.dropFilter[drop.uid]) then
 			table.insert(result, drop)
 		end
 	end
@@ -4754,13 +4754,14 @@ end
 -- Sesudah target utama berhasil, ambil beberapa UID lain yang sudah dalam
 -- jangkauan tanpa pilih rute/rapikan posisi ulang. Tetap serial, minimal
 -- 80 ms antar-request dan dibatasi 12 UID / 1,25 dtk per kunjungan.
-local function factoryCollectCluster(W, inv, candidates, firstUID, blocked, gen)
+local function factoryCollectCluster(W, inv, candidates, firstUID, blocked, gen, pickupId)
+	pickupId = pickupId or Factory.baseId
 	local added, attempts = 0, 1
 	local deadline = os.clock() + 1.25
 	local alive = function() return factoryAlive(gen) and W.name == Bind.name end
 	for _, drop in ipairs(candidates) do
 		if not alive() or DropMemory.inFlight or attempts >= 12 or os.clock() >= deadline
-			or factoryRoom(inv, Factory.baseId) <= 0 or factoryCount(inv, Factory.seedId) >= 200 then break end
+			or factoryRoom(inv, pickupId) <= 0 or factoryCount(inv, Factory.seedId) >= 200 then break end
 		local now = os.clock()
 		if drop.uid ~= firstUID and drop.n > 0 and not drop.taking and not dropIgnored(W, drop)
 			and now >= (tonumber(drop.readyAt) or 0) and now >= (DropMemory.retryAt[drop.uid] or 0)
@@ -4777,7 +4778,7 @@ local function factoryCollectCluster(W, inv, candidates, firstUID, blocked, gen)
 					or standingFloor(pos) ~= math.floor(drop.y) + 1
 					or not dropInReach(drop, pos)
 					or factoryCount(inv, Factory.seedId) >= 200 then break end
-				local room = factoryRoom(inv, Factory.baseId)
+				local room = factoryRoom(inv, pickupId)
 				if room <= 0 then break end
 				local ok, taken, status = requestDropTake(W, inv, drop, pos, room, alive)
 				attempts += 1
@@ -4794,14 +4795,15 @@ local function factoryCollectCluster(W, inv, candidates, firstUID, blocked, gen)
 	return added
 end
 
-local function factoryCollectDrop(W, inv, state, blocked, gen)
-	local drops = factoryBaseDrops(W, Factory.baseId)
+local function factoryCollectDrop(W, inv, state, blocked, gen, itemId)
+	local pickupId = itemId or Factory.baseId
+	local drops = factoryBaseDrops(W, pickupId, itemId ~= nil)
 	if #drops == 0 then
 		-- Selesai (atau filter drop lama sudah habis): buka lagi semua drop.
-		Factory.dropFilter = nil
+		if not itemId then Factory.dropFilter = nil end
 		return "done", 0
 	end
-	local room = factoryRoom(inv, Factory.baseId)
+	local room = factoryRoom(inv, pickupId)
 	if room <= 0 then return "room", #drops end
 	if DropMemory.inFlight then return "pending", #drops end
 	local ready, now = {}, os.clock()
@@ -4908,7 +4910,7 @@ local function factoryCollectDrop(W, inv, state, blocked, gen)
 	-- Nilai hasil harus milik target ini; drop lain yang berhasil tidak boleh
 	-- menyembunyikan kegagalan target visual yang tetap ada.
 	local only = { [best.drop.uid] = true }
-	if dropNeedsRoom(best.drop, factoryRoom(inv, Factory.baseId)) then return "room", #drops end
+	if dropNeedsRoom(best.drop, factoryRoom(inv, pickupId)) then return "room", #drops end
 	local capacityRejected = false
 	-- Verifikasi dalam satu kunjungan, bukan bolak-balik menghitung rute untuk
 	-- UID yang sama. Maksimal 3 panggilan dengan jeda pendek, tidak ada worker baru.
@@ -4918,11 +4920,11 @@ local function factoryCollectDrop(W, inv, state, blocked, gen)
 		local collected, needsRoom, status = collectDropsNearby(W, inv, current, 0.9, only)
 		capacityRejected = capacityRejected or needsRoom == true
 		if collected > 0 then
-			return "collected", collected + factoryCollectCluster(W, inv, drops, best.drop.uid, blocked, gen)
+			return "collected", collected + factoryCollectCluster(W, inv, drops, best.drop.uid, blocked, gen, pickupId)
 		end
 		if dropIgnored(W, best.drop) then return "ignored", #drops end
 		if status then return status, #drops end
-		if factoryRoom(inv, Factory.baseId) <= 0 then return "room", #drops end
+		if factoryRoom(inv, pickupId) <= 0 then return "room", #drops end
 		if not current or not current.grounded or standingFloor(current) ~= best.y + 1
 			or not dropInReach(best.drop, current) then break end
 		if attempt < 3 then task.wait(0.12) end
@@ -4951,6 +4953,27 @@ local function factoryHasPlantTile(W)
 end
 
 local factoryStoreSeeds
+
+-- Seed habis: pakai kolektor/rute yang sama dengan drop blok, tanpa worker
+-- baru. Hanya seed pilihan, dan tidak mengambil isi Display Box.
+local function factoryRefillSeeds(W, inv, state, blocked, gen)
+	if factoryCount(inv, Factory.seedId) > 0 then Factory.seedRefilling = false; return false end
+	local now = os.clock()
+	if now < (Factory.seedRefillAt or 0) then return Factory.seedRefilling == true end
+	Factory.seedRefillAt = now + 3
+	Factory.seedRefilling = false
+	-- Jangan jemput kembali seed yang baru disimpan ketika seluruh farm penuh.
+	if not factoryHasPlantTile(W) then return false end
+	local result, amount = factoryCollectDrop(W, inv, state, blocked, gen, Factory.seedId)
+	if result == "done" or result == "room" then return false end
+	Factory.seedRefilling = true
+	Factory.seedRefillAt = os.clock() + (result == "path" and 2 or 0.2)
+	setFactoryStatus(result == "collected"
+		and string.format("Factory: mengambil seed pilihan +%d; lanjut tanam", amount)
+		or (result == "path" and "Factory: mencari jalur ke seed pilihan di world"
+		or "Factory: menunggu pickup seed pilihan; lanjut tanam setelah masuk"))
+	return true
+end
 
 -- Kosongkan seluruh blok sebelum fase tanam.
 local PNB_DRAIN_BATCH = 8
@@ -5361,6 +5384,7 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 
 	if Factory.phase == "plant" then
 		if seeds <= 0 then
+			if factoryRefillSeeds(W, inv, state, blocked, gen) then return 0.2 end
 			if Factory.resumePNB and blocks > 0 then
 				Factory.resumePNB = false
 				beginPNB(W, blocks)
@@ -5449,6 +5473,10 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 		Factory.phase = "collect"
 		setFactoryStatus("Factory: lanjut ambil drop setelah tanam")
 		return 0.1
+	end
+	if seeds <= 0 and factoryRefillSeeds(W, inv, state, blocked, gen) then
+		Factory.phase = "plant"
+		return 0.2
 	end
 	local ripe = factoryTarget(W, state, seedId, blocked, "harvest")
 	if not blockFull and (ripe or factoryHasRipeTree(W, seedId)) then
@@ -5574,6 +5602,8 @@ local function startFactory()
 	Factory.blockedDropId = nil
 	Factory.resumePNB = false
 	Factory.resumeCollect = false
+	Factory.seedRefillAt = 0
+	Factory.seedRefilling = false
 	if Factory.cycle and factoryCount(inv, seedId) >= 200 then
 		Factory.phase = "plant"
 		Factory.resumePNB = baseId ~= nil and factoryCount(inv, baseId) > 0
@@ -5687,6 +5717,16 @@ local function startFactory()
 									setFactoryStatus(msg)
 								end
 								task.wait(1)
+								paused = true
+							end
+						end
+						if not paused and Factory.plant and factoryCount(inv, currentSeed) <= 0 then
+							local refilling = factoryRefillSeeds(W, inv, s, blocked, gen)
+							if refilling or not Factory.harvest then
+								if not refilling then
+									setFactoryStatus("Auto Plant: menunggu seed pilihan di world atau backpack")
+								end
+								task.wait(refilling and 0.2 or 1)
 								paused = true
 							end
 						end
@@ -6474,7 +6514,7 @@ harvestToggle = factorySec:Toggle({
 })
 plantToggle = factorySec:Toggle({
 	Title = "Auto Plant",
-	Desc = "Tanam seed yang dipilih di tile kosong dengan lantai solid di bawahnya.",
+	Desc = "Tanam seed pilihan di tile kosong berlantaikan solid. Jika seed habis, ambil seed yang sama dari drop di world lalu lanjut tanam.",
 	Value = false,
 	Callback = function(on)
 		if not Factory.syncingUI then
