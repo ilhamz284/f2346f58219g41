@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.131",
+	version = "0.4.132",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -304,6 +304,91 @@ end
 
 local function log(msg)
 	print("[HumanHub] " .. tostring(msg))
+end
+
+-- The lobby is a different Roblox place. Lua globals and the in-world
+-- controller are gone after teleport, so the next run needs a checkpoint.
+do
+	local lobbyPlace = 113448687145837
+	local player = Players.LocalPlayer
+	local http = game:GetService("HttpService")
+	local file = player and ("HumanHub_FactoryResume_" .. player.UserId .. ".json")
+	local recovery = { queued = false, lobby = game.PlaceId == lobbyPlace }
+	Hub.recovery = recovery
+	local phases = { harvest = true, pnb = true, plant = true, collect = true, grow = true }
+
+	function recovery.read()
+		if not file or type(readfile) ~= "function" then return nil end
+		local ok, value = pcall(function() return http:JSONDecode(readfile(file)) end)
+		if not ok or type(value) ~= "table" or type(value.world) ~= "string"
+			or not value.world:match("^[A-Z0-9]+$") or #value.world > 24
+			or type(value.seedId) ~= "number" or value.seedId < 1 or value.seedId % 1 ~= 0
+			or not phases[value.phase] or type(value.expires) ~= "number" or value.expires <= os.time()
+			or type(value.attempts) ~= "number" or value.attempts < 0 or value.attempts % 1 ~= 0 then return nil end
+		return value
+	end
+
+	function recovery.write(value)
+		if not file or type(writefile) ~= "function" then return false end
+		return (pcall(function() writefile(file, http:JSONEncode(value)) end))
+	end
+
+	function recovery.arm()
+		if recovery.queued or game.GameId ~= 10773501077 or not file then return end
+		local queue = queue_on_teleport or queueonteleport or queue_on_tp
+		if type(queue) ~= "function" then return end
+		local source = string.format([[
+if not game:IsLoaded() then game.Loaded:Wait() end
+if game.GameId ~= 10773501077 then return end
+local ok, state = pcall(function()
+	return game:GetService("HttpService"):JSONDecode(readfile(%q))
+end)
+if not ok or type(state) ~= "table" or type(state.expires) ~= "number" or state.expires <= os.time() then return end
+local url = "https://raw.githubusercontent.com/ilhamz284/f2346f58219g41/codex/auto-factory/hub.luau"
+local run = loadstring(game:HttpGet(url .. "?refresh=" .. tostring(DateTime.now().UnixTimestampMillis)))
+if run then run() end
+]], file)
+		recovery.queued = pcall(queue, source)
+	end
+
+	if recovery.lobby then
+		local saved = recovery.read()
+		if not saved then return end
+		local remotes = game:GetService("ReplicatedStorage"):WaitForChild("MenuRemotes", 15)
+		local enter = remotes and remotes:WaitForChild("Enter", 10)
+		if Hub.dead or not enter or not enter:IsA("RemoteFunction") then return end
+		local refused = false
+		local failed = remotes:FindFirstChild("Failed")
+		local function logFailure(reason)
+			local message = tostring(reason or "teleport gagal")
+			local lower = message:lower()
+			if lower:find("ban", 1, true) or lower:find("permission", 1, true)
+				or lower:find("access", 1, true) or lower:find("private", 1, true) then
+				refused = true
+				recovery.write({})
+			end
+			log("Factory: " .. message)
+		end
+		if failed and failed:IsA("RemoteEvent") then
+			Hub.keep(failed.OnClientEvent:Connect(logFailure))
+		end
+		recovery.arm()
+		task.spawn(function()
+			while not Hub.dead and not refused do
+				local state = recovery.read()
+				if not state or state.attempts >= 3 then break end
+				state.attempts += 1
+				if not recovery.write(state) then break end
+				log(string.format("Factory: masuk kembali ke %s (%d/3)", state.world, state.attempts))
+				-- Same request as the lobby's Enter World button.
+				local ok, accepted, reason = pcall(enter.InvokeServer, enter, state.world)
+				if ok and not accepted then logFailure(reason) end
+				task.wait(ok and accepted and 25 or 8)
+			end
+			if not Hub.dead and not refused then log("Factory: percobaan kembali ke world selesai; cek lobby") end
+		end)
+		return
+	end
 end
 
 --// ===== 1b. ANTI-AFK =====
@@ -2900,6 +2985,7 @@ function Factory.stop(reason)
 	if not Factory.running then
 		return
 	end
+	if Factory.cycle then Hub.recovery.write({}) end
 	Factory.running = false
 	Factory.gen += 1
 	Factory.harvest = false
@@ -5505,7 +5591,7 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 	return 1
 end
 
-local function startFactory()
+local function startFactory(resume)
 	if Factory.running then
 		return true
 	end
@@ -5604,6 +5690,14 @@ local function startFactory()
 	Factory.resumeCollect = false
 	Factory.seedRefillAt = 0
 	Factory.seedRefilling = false
+	if resume and resume.world == W.name and resume.seedId == seedId then
+		Factory.phase = resume.phase
+		Factory.resumePNB = resume.resumePNB == true
+		Factory.resumeCollect = resume.resumeCollect == true
+		if resume.phase == "pnb" and baseId then
+			beginPNB(W, factoryCount(inv, baseId), true)
+		end
+	end
 	if Factory.cycle and factoryCount(inv, seedId) >= 200 then
 		Factory.phase = "plant"
 		Factory.resumePNB = baseId ~= nil and factoryCount(inv, baseId) > 0
@@ -5620,6 +5714,21 @@ local function startFactory()
 	local gen, worldName = Factory.gen, W.name
 	local blocked = {}
 	local missingSince = nil
+	local nextCheckpoint, lastPhase, lastResumePNB, lastResumeCollect = 0, nil, nil, nil
+	local function checkpoint()
+		if not Factory.cycle then return end
+		local now = os.clock()
+		if now < nextCheckpoint and lastPhase == Factory.phase and lastResumePNB == Factory.resumePNB
+			and lastResumeCollect == Factory.resumeCollect then return end
+		nextCheckpoint = now + 30
+		lastPhase, lastResumePNB, lastResumeCollect = Factory.phase, Factory.resumePNB, Factory.resumeCollect
+		if Hub.recovery.write({
+			world = worldName, seedId = seedId, phase = Factory.phase,
+			resumePNB = Factory.resumePNB, resumeCollect = Factory.resumeCollect,
+			attempts = 0, expires = os.time() + 600,
+		}) then Hub.recovery.arm() end
+	end
+	checkpoint()
 	setFactoryStatus(string.format("berjalan: %s, lantai Y=%d", Factory.seedName, floorY))
 	-- Klaim quest harian ikut hidup bersama Auto Factory, tanpa toggle sendiri.
 	-- Mengecek tiap 3 jam (cek pertama langsung) supaya server tidak dibebani.
@@ -5632,6 +5741,7 @@ local function startFactory()
 		-- tanpa petunjuk fungsi mana yang gagal.
 		local ok, err = xpcall(function()
 			while factoryAlive(gen) do
+				checkpoint()
 				local s = Bind.state()
 				local currentW = Bind.getW()
 				local inLobby, picker = worldPickerVisible()
@@ -5773,6 +5883,7 @@ function Factory.setMode(mode, on)
 		or (mode ~= "cycle" and Factory.cycle)) then
 		Factory.stop("beralih mode Auto Farming")
 	end
+	if mode == "cycle" and not on then Hub.recovery.write({}) end
 	Factory[mode] = on
 	if on then
 		if startFactory() then
@@ -7543,3 +7654,37 @@ Hub.onUnload(function()
 	Factory.gen += 1
 	Move.stop()
 end)
+
+do
+	local saved = Hub.recovery.read()
+	if saved then
+		task.spawn(function()
+			for _ = 1, 15 do
+				if Hub.dead or Factory.running then return end
+				local current = Hub.recovery.read()
+				if not current or current.world ~= saved.world or current.seedId ~= saved.seedId then return end
+				if Bind.resolve() then
+					local world = Bind.W
+					if world and world.name ~= saved.world then
+						Hub.recovery.write({})
+						log("Factory: world aktif berbeda dari checkpoint; pemulihan dibatalkan")
+						return
+					end
+					local state = Bind.state()
+					if world and state and state.grounded and not state.dead and not worldPickerVisible() then
+						Factory.seedId = saved.seedId
+						Factory.cycle = true
+						if startFactory(saved) then
+							log("Factory: dilanjutkan di " .. saved.world .. " (" .. Factory.phase .. ") setelah reload")
+							if Factory.onMode then pcall(Factory.onMode) end
+							return
+						end
+						Factory.cycle = false
+					end
+				end
+				task.wait(2)
+			end
+			if not Hub.dead then log("Factory: checkpoint belum bisa dilanjutkan; cek status di hub") end
+		end)
+	end
+end
