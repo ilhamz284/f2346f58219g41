@@ -5,6 +5,7 @@ return function(make, makeGuard)
 		options = options or {}
 		local now, starts, refreshes = 0, 0, 0
 		local checkpoint = {
+			mode = options.mode, guardCheck = options.guardCheck,
 			world = "TEST", seedId = 4585, phase = "plant", attempts = 1,
 			resumePNB = true, resumeCollect = true, expires = 1600,
 		}
@@ -42,6 +43,7 @@ return function(make, makeGuard)
 					if options.cancelAt and now >= options.cancelAt then checkpoint = nil end
 					if options.unloadAt and now >= options.unloadAt then Hub.dead = true end
 					if options.manualAt and now >= options.manualAt then Farm.running = true end
+					if options.safeAt and now >= options.safeAt then checkpoint.guardCheck = nil end
 				end,
 			},
 			worldPickerVisible = function() return now < (options.pickerUntil or 0) end,
@@ -54,6 +56,7 @@ return function(make, makeGuard)
 				Factory.running, Factory.phase = true, saved.phase
 				return true
 			end,
+			startFarm = function() starts += 1; Farm.running = true end,
 			setFactoryStatus = function(message) Factory.status = message end,
 			log = function() end,
 		})
@@ -94,6 +97,14 @@ return function(make, makeGuard)
 	case("transient startup rejection and error both retry", function()
 		assert(run({ startFails = true }).starts == 2)
 		assert(run({ startError = true }).starts == 2)
+	end)
+	case("guard checkpoint waits for a safe player list before resuming", function()
+		local r = run({ guardCheck = true, safeAt = 180 })
+		assert(r.starts == 1 and r.now >= 180)
+	end)
+	case("Dirt Farm checkpoint restores farm and clears the completed checkpoint", function()
+		local r = run({ mode = "dirt", guardCheck = true, safeAt = 180 })
+		assert(r.starts == 1 and r.now >= 180 and r.checkpoint.world == nil)
 	end)
 	local function preloadSetup()
 		local env, tasks, delayed = {}, {}, {}

@@ -9,7 +9,7 @@ import tempfile
 
 root = Path(__file__).resolve().parents[1]
 source = (root / "hub.luau").read_text(encoding="utf-8-sig")
-resume = source[source.rindex("do\n\tlocal saved = Hub.recovery.read()") :]
+resume = source[source.rindex("function Hub.recovery.resume()") :]
 guard = source.split("local preloadGuardSource = [=[\n", 1)[1].split("\n]=]", 1)[0]
 suite = (root / "tests/factory_resume_spec.luau").read_text(encoding="utf-8")
 
@@ -21,7 +21,7 @@ def factory(body, names):
 
 make_resume = factory(resume, [
     "Hub", "Factory", "Farm", "PNB", "Bind", "os", "task",
-    "worldPickerVisible", "startFactory", "setFactoryStatus", "log", "_G", "getgenv",
+    "worldPickerVisible", "startFactory", "startFarm", "setFactoryStatus", "log", "_G", "getgenv",
 ])
 make_guard = factory(guard, [
     "game", "workspace", "getgenv", "_G", "hookfunction", "restorefunction",

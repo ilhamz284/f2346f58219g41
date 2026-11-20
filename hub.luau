@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.135",
+	version = "0.4.136",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -367,8 +367,12 @@ return guard
 		local ok, value = pcall(function() return http:JSONDecode(readfile(file)) end)
 		if not ok or type(value) ~= "table" or type(value.world) ~= "string"
 			or not value.world:match("^[A-Z0-9]+$") or #value.world > 24
-			or type(value.seedId) ~= "number" or value.seedId < 1 or value.seedId % 1 ~= 0
-			or not phases[value.phase] or type(value.expires) ~= "number" or value.expires <= os.time()
+			or (value.mode ~= nil and value.mode ~= "factory" and value.mode ~= "dirt")
+			or (value.mode ~= "dirt" and (type(value.seedId) ~= "number" or value.seedId < 1
+				or value.seedId % 1 ~= 0 or not phases[value.phase]))
+			or (value.rejoinAt ~= nil and (type(value.rejoinAt) ~= "number" or value.rejoinAt ~= value.rejoinAt))
+			or (value.guardRetryAt ~= nil and type(value.guardRetryAt) ~= "number")
+			or type(value.expires) ~= "number" or value.expires <= os.time()
 			or type(value.attempts) ~= "number" or value.attempts < 0 or value.attempts % 1 ~= 0 then return nil end
 		return value
 	end
@@ -426,14 +430,23 @@ if run then run() end
 		task.spawn(function()
 			while not Hub.dead and not refused do
 				local state = recovery.read()
-				if not state or state.attempts >= 3 then break end
+				if not state or (not state.guardCheck and state.attempts >= 3) then break end
+				local retryAt = math.max(state.rejoinAt or 0, state.guardRetryAt or 0)
+				if state.guardCheck and retryAt > os.time() then
+					task.wait(math.min(2, retryAt - os.time()))
+					continue
+				end
 				state.attempts += 1
+				if state.guardCheck then
+					state.guardRetryAt = os.time() + 180
+					state.expires = os.time() + 600
+				end
 				if not recovery.write(state) then break end
 				log(string.format("Factory: masuk kembali ke %s (%d/3)", state.world, state.attempts))
 				-- Same request as the lobby's Enter World button.
 				local ok, accepted, reason = pcall(enter.InvokeServer, enter, state.world)
 				if ok and not accepted then logFailure(reason) end
-				task.wait(ok and accepted and 25 or 8)
+				task.wait(state.guardCheck and 2 or (ok and accepted and 25 or 8))
 			end
 			if not Hub.dead and not refused then log("Factory: percobaan kembali ke world selesai; cek lobby") end
 		end)
@@ -2250,6 +2263,8 @@ local function startFarm()
 end
 
 function Farm.stop(reason)
+	local saved = Hub.recovery.read()
+	if saved and saved.mode == "dirt" then Hub.recovery.write({}) end
 	if not Farm.running then
 		Move.release()
 		return
@@ -7296,7 +7311,7 @@ moveSec:Paragraph({
 
 -- ---- Penjaga world ----
 local guardSec = guardTab:Section({ Title = "Penjaga World", Opened = true })
-local Guard = { enabled = false, world = nil, seen = {}, baseline = false, busy = false }
+local Guard = { enabled = false, saved = nil, retryExitAt = 0 }
 local guardStatus = guardSec:Paragraph({ Title = "Status penjaga", Desc = "nonaktif" })
 
 local function guardMessage(message)
@@ -7343,21 +7358,6 @@ local function worldPlayers()
 	return nil
 end
 
-local function staffRole(player)
-	if game.CreatorType ~= Enum.CreatorType.Group or not game.CreatorId then
-		return nil
-	end
-	local okRole, role = pcall(player.GetRoleInGroup, player, game.CreatorId)
-	local okRank, rank = pcall(player.GetRankInGroup, player, game.CreatorId)
-	if not okRole or not okRank then
-		return nil
-	end
-	local name = string.lower(tostring(role))
-	return tonumber(rank) >= 200 or name:find("mod", 1, true) ~= nil
-		or name:find("dev", 1, true) ~= nil or name:find("admin", 1, true) ~= nil
-		or name:find("owner", 1, true) ~= nil or name:find("staff", 1, true) ~= nil
-end
-
 local function worldAuthority(W, userId)
 	local lock = W.lock
 	if type(lock) ~= "table" then
@@ -7376,105 +7376,108 @@ local function worldAuthority(W, userId)
 	return false
 end
 
-local function canBanInWorld(W)
-	local myId = Players.LocalPlayer and Players.LocalPlayer.UserId
-	return myId ~= nil and worldAuthority(W, myId)
-end
-
-local function banWorldPlayer(name)
-	local ok, matches = pcall(function() return filtergc("table", { Keys = { "setShown", "setWorld", "isTyping", "add", "onCommand" } }) end)
-	if not ok or type(matches) ~= "table" or not name:match("^[%w_]+$") then
-		return false
-	end
-	if type(matches[1]) ~= "table" then
-		matches = { matches }
-	end
-	for _, chat in ipairs(matches) do
-		if type(chat) == "table" and type(chat.onCommand) == "function" then
-			local sent, handled = pcall(chat.onCommand, "/ban " .. name)
-			return sent and handled ~= false
-		end
-	end
-	return false
-end
-
-local function randomWorldName()
-	local letters = {}
-	for i = 1, 7 do
-		letters[i] = string.char(math.random(65, 90))
-	end
-	return table.concat(letters)
-end
-
 guardSec:Paragraph({
 	Title = "Mengikuti Auto Factory dan Dirt Farm",
-	Desc = "Aktif otomatis selama Auto Factory atau Auto Dirt Farm berjalan. Staf grup: keluar ke world acak; pemain biasa baru: /ban bila punya akses world.",
+	Desc = "Jika pemain selain owner/admin world hadir, farm dijeda dan keluar ke lobby. Masuk kembali setiap 3 menit dan lanjut hanya setelah world aman.",
 })
 
 local function syncGuardState()
-	local on = Farm.running or (Factory.running and Factory.cycle)
+	local on = Farm.running or (Factory.running and Factory.cycle) or Guard.saved ~= nil
 	if Guard.enabled == on then return end
 	Guard.enabled = on
-	Guard.world, Guard.seen, Guard.baseline, Guard.busy = nil, {}, false, false
-	guardMessage(on and "memantau pemain selama Auto Factory atau Auto Dirt Farm berjalan" or "nonaktif")
+	guardMessage(on and "memantau pemain selain owner/admin world" or "nonaktif")
 end
 Factory.onCycleChanged = syncGuardState
-syncGuardState()
 
+function Guard.leaveAndWait(W)
+	local context = Bind.context
+	if not context or context.world ~= W or type(context.exitWorld) ~= "function" then
+		local ok, value = pcall(debug.getupvalue, W.enter, 1)
+		context = ok and value or nil
+	end
+	if type(context) ~= "table" or context.world ~= W or type(context.exitWorld) ~= "function" then
+		Move.stop()
+		guardMessage("fungsi keluar world belum tersedia; mencoba lagi")
+		return
+	end
+	local saved = Guard.saved or {
+		mode = Farm.running and "dirt" or "factory", world = W.name,
+		seedId = Factory.seedId, phase = Factory.phase,
+		resumePNB = Factory.resumePNB, resumeCollect = Factory.resumeCollect,
+		spacing = Farm.spacing, breakBg = Farm.breakBg, patchLava = Farm.patchLava,
+	}
+	Guard.saved = saved
+	if Farm.running then Farm.stop("penjaga: menunggu world aman") end
+	if Factory.running then Factory.stop("penjaga: menunggu world aman") end
+	saved.guardCheck, saved.rejoinAt = true, os.time() + 180
+	saved.guardRetryAt, saved.attempts, saved.expires = nil, 0, os.time() + 600
+	if not Hub.recovery.write(saved) then
+		guardMessage("gagal menyimpan penantian; farm dijeda")
+		return
+	end
+	Hub.recovery.arm()
+	if Hub.recovery.resume then Hub.recovery.resume() end
+	Guard.retryExitAt = os.clock() + 5
+	local ok, err = pcall(context.exitWorld)
+	guardMessage(ok and "keluar world; masuk kembali dalam 3 menit"
+		or ("gagal keluar world; mencoba lagi: " .. tostring(err)))
+end
+
+function Guard.tick()
+	local saved = Hub.recovery.read()
+	Guard.saved = saved and saved.guardCheck and saved or nil
+	syncGuardState()
+	if not Guard.enabled then return end
+	local W = Bind.W
+	local pickerVisible, picker = worldPickerVisible()
+	if pickerVisible then
+		local pending = Guard.saved
+		if pending and W and type(W.enter) == "function"
+			and os.time() >= math.max(pending.rejoinAt or 0, pending.guardRetryAt or 0) then
+			pending.guardRetryAt, pending.expires = os.time() + 180, os.time() + 600
+			if Hub.recovery.write(pending) then
+				Hub.recovery.arm()
+				local ok, joined, _, teleporting = pcall(W.enter, pending.world)
+				if ok and joined == true and not teleporting then closeWorldPicker(picker) end
+			end
+		end
+		return
+	end
+	local state = Bind.state()
+	if not W or type(W.name) ~= "string" or W.name == ""
+		or not state or not state.active or state.dead then return end
+	if Guard.saved and Guard.saved.world ~= W.name then
+		Hub.recovery.write({})
+		Guard.saved = nil
+		syncGuardState()
+		return
+	end
+	if Guard.saved and os.time() < (Guard.saved.rejoinAt or 0) then return end
+	local others = worldPlayers()
+	if not others then
+		guardMessage("menunggu daftar pemain world")
+		return
+	end
+	for uid, data in pairs(others) do
+		local id = tonumber(type(data) == "table" and data.userId or uid)
+		if id and id ~= Players.LocalPlayer.UserId and not worldAuthority(W, id) then
+			if os.clock() >= (Guard.retryExitAt or 0) then Guard.leaveAndWait(W) end
+			return
+		end
+	end
+	if Guard.saved then
+		Guard.saved.guardCheck, Guard.saved.rejoinAt, Guard.saved.guardRetryAt = nil, nil, nil
+		Hub.recovery.write(Guard.saved)
+		Guard.saved = nil
+		guardMessage("world aman; melanjutkan farm")
+	end
+end
+
+syncGuardState()
 task.spawn(function()
 	while _G.__HumanHub == Hub do
 		task.wait(1)
-		syncGuardState()
-		if Guard.enabled and not Guard.busy and not worldPickerVisible() then
-			local W = Bind.W
-			local others = W and worldPlayers()
-			if W and type(W.name) == "string" and others then
-				if Guard.world ~= W.name then
-					Guard.world, Guard.seen, Guard.baseline = W.name, {}, false
-				end
-				local present = {}
-				for uid, data in pairs(others) do
-					local id = tonumber(type(data) == "table" and data.userId or uid)
-					if id and id ~= Players.LocalPlayer.UserId then
-						present[id] = true
-						local player = Players:GetPlayerByUserId(id)
-						local isStaff = player and staffRole(player)
-						if worldAuthority(W, id) then
-							Guard.seen[id] = true
-						elseif isStaff == true then
-							Guard.busy = true
-							if Farm.running then Farm.stop("staf masuk world") end
-							if PNB.running then PNB.stop("staf masuk world") end
-							if Factory.running then Factory.stop("staf masuk world") end
-							local destination = randomWorldName()
-							guardMessage("staf terdeteksi; pindah ke " .. destination)
-						local called = false
-							if type(W.enter) == "function" then
-							called = pcall(W.enter, destination)
-							end
-						if not called then
-								guardMessage("gagal pindah world; bot dihentikan")
-								Guard.enabled = false
-							end
-							break
-						elseif isStaff == false and Guard.baseline and not Guard.seen[id] then
-							if canBanInWorld(W) then
-								local name = type(data) == "table" and data.name or nil
-								name = type(name) == "string" and name ~= "" and name or player.Name
-								guardMessage(banWorldPlayer(name) and ("perintah ban dikirim: " .. name) or ("gagal mengirim ban: " .. name))
-							else
-								guardMessage("pemain masuk, tetapi tidak punya akses ban di world")
-							end
-						end
-						if isStaff ~= nil or not Guard.baseline then Guard.seen[id] = true end
-					end
-				end
-				for id in pairs(Guard.seen) do
-					if not present[id] then Guard.seen[id] = nil end
-				end
-				Guard.baseline = true
-			end
-		end
+		Guard.tick()
 	end
 end)
 
@@ -7680,6 +7683,7 @@ Hub.debug = {
 	Farm = Farm,
 	PNB = PNB,
 	Factory = Factory,
+	Guard = Guard,
 	Dig = Dig,
 	Place = Place,
 	Path = Path,
@@ -7749,58 +7753,82 @@ Hub.onUnload(function()
 	Move.stop()
 end)
 
-do
+function Hub.recovery.resume()
+	if Hub.recovery.resumeRunning then return end
 	local saved = Hub.recovery.read()
 	if saved then
+		Hub.recovery.resumeRunning = true
 		task.spawn(function()
-			local nextRefresh, nextNotice = 0, 0
-			-- Teleport sambil minimized bisa memuat world jauh lebih lambat.
-			-- Tunggu kesiapan world selama checkpoint ini masih dipilih.
-			while not Hub.dead and not Factory.running do
-				local current = Hub.recovery.read()
-				if not current or current.world ~= saved.world or current.seedId ~= saved.seedId then return end
-				if Farm.running or PNB.running or Factory.harvest or Factory.plant then return end
-				local now = os.clock()
-				if now >= nextRefresh then
-					nextRefresh = now + 30
-					current.expires = os.time() + 600
-					Hub.recovery.write(current)
-				end
-				-- Binding awal bisa mengacu ke world kosong saat bootstrap.
-				-- Perbarui juga ketika binding sebelumnya terlihat lengkap.
-				if Bind.resolve(true) then
-					local world = Bind.W
-					local state = Bind.state()
-					-- Bind can succeed before the teleport destination publishes its name.
-					if world and type(world.name) == "string" and world.name ~= ""
-						and state and state.active and state.grounded and not state.dead and not worldPickerVisible() then
-						if world.name ~= saved.world then
-							Hub.recovery.write({})
-							log("Factory: world aktif berbeda dari checkpoint; pemulihan dibatalkan")
-							return
-						end
-						Factory.seedId = current.seedId
-						Factory.cycle = true
-						local env = getgenv and getgenv() or _G
-						local guard = env.__HumanHubPreloadGuard
-						if guard then pcall(guard.restore) end
-						local ok, started = pcall(startFactory, current)
-						if Hub.dead then return end
-						if ok and started then
-							log("Factory: dilanjutkan di " .. saved.world .. " (" .. Factory.phase .. ") setelah reload")
-							if Factory.onMode then pcall(Factory.onMode) end
-							return
-						end
-						Factory.cycle = false
-						if not ok then log("Factory: pemulihan belum siap: " .. tostring(started)) end
+			local ok, err = pcall(function()
+				local nextRefresh, nextNotice = 0, 0
+				-- Teleport sambil minimized bisa memuat world jauh lebih lambat.
+				-- Tunggu kesiapan world selama checkpoint ini masih dipilih.
+				while not Hub.dead and not Factory.running do
+					local current = Hub.recovery.read()
+					if not current or current.world ~= saved.world or current.seedId ~= saved.seedId then return end
+					if Farm.running or PNB.running or Factory.harvest or Factory.plant then return end
+					local now = os.clock()
+					if now >= nextRefresh then
+						nextRefresh = now + 30
+						current.expires = os.time() + 600
+						Hub.recovery.write(current)
 					end
+					-- Binding awal bisa mengacu ke world kosong saat bootstrap.
+					-- Perbarui juga ketika binding sebelumnya terlihat lengkap.
+					if Bind.resolve(true) then
+						local world = Bind.W
+						local state = Bind.state()
+						-- Bind can succeed before the teleport destination publishes its name.
+						if world and type(world.name) == "string" and world.name ~= ""
+							and state and state.active and state.grounded and not state.dead and not worldPickerVisible() then
+							if world.name ~= saved.world then
+								Hub.recovery.write({})
+								log("Factory: world aktif berbeda dari checkpoint; pemulihan dibatalkan")
+								return
+							end
+							if current.guardCheck then
+								task.wait(2)
+								continue
+							end
+							local env = getgenv and getgenv() or _G
+							local guard = env.__HumanHubPreloadGuard
+							if guard then pcall(guard.restore) end
+							if current.mode == "dirt" then
+								Farm.spacing = tonumber(current.spacing) or Farm.spacing
+								Farm.breakBg = current.breakBg ~= false
+								Farm.patchLava = current.patchLava ~= false
+								startFarm()
+								if Farm.running then
+									Hub.recovery.write({})
+									log("Dirt Farm: dilanjutkan setelah world aman")
+									return
+								end
+								task.wait(2)
+								continue
+							end
+							Factory.seedId = current.seedId
+							Factory.cycle = true
+							local ok, started = pcall(startFactory, current)
+							if Hub.dead then return end
+							if ok and started then
+								log("Factory: dilanjutkan di " .. saved.world .. " (" .. Factory.phase .. ") setelah reload")
+								if Factory.onMode then pcall(Factory.onMode) end
+								return
+							end
+							Factory.cycle = false
+							if not ok then log("Factory: pemulihan belum siap: " .. tostring(started)) end
+						end
+					end
+					if now >= nextNotice then
+						nextNotice = now + 30
+						setFactoryStatus("Factory: menunggu world " .. saved.world .. " siap; lanjut " .. tostring(current.phase or "Dirt Farm"))
+					end
+					task.wait(2)
 				end
-				if now >= nextNotice then
-					nextNotice = now + 30
-					setFactoryStatus("Factory: menunggu world " .. saved.world .. " siap; lanjut " .. current.phase)
-				end
-				task.wait(2)
-			end
+			end)
+			Hub.recovery.resumeRunning = false
+			if not ok then log("Pemulihan farm gagal: " .. tostring(err)) end
 		end)
 	end
 end
+Hub.recovery.resume()
