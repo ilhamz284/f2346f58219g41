@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.132",
+	version = "0.4.133",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -7665,13 +7665,15 @@ do
 				if not current or current.world ~= saved.world or current.seedId ~= saved.seedId then return end
 				if Bind.resolve() then
 					local world = Bind.W
-					if world and world.name ~= saved.world then
-						Hub.recovery.write({})
-						log("Factory: world aktif berbeda dari checkpoint; pemulihan dibatalkan")
-						return
-					end
 					local state = Bind.state()
-					if world and state and state.grounded and not state.dead and not worldPickerVisible() then
+					-- Bind can succeed before the teleport destination publishes its name.
+					if world and type(world.name) == "string" and world.name ~= ""
+						and state and state.active and state.grounded and not state.dead and not worldPickerVisible() then
+						if world.name ~= saved.world then
+							Hub.recovery.write({})
+							log("Factory: world aktif berbeda dari checkpoint; pemulihan dibatalkan")
+							return
+						end
 						Factory.seedId = saved.seedId
 						Factory.cycle = true
 						if startFactory(saved) then
