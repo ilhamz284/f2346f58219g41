@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.133",
+	version = "0.4.134",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -316,6 +316,51 @@ do
 	local recovery = { queued = false, lobby = game.PlaceId == lobbyPlace }
 	Hub.recovery = recovery
 	local phases = { harvest = true, pnb = true, plant = true, collect = true, grow = true }
+	-- PreloadAsync dapat menunggu render selamanya ketika kamera baru masih
+	-- 1x1 saat teleport dalam keadaan minimized. Pasang sebelum bootstrap game.
+	-- Aset tetap dimuat, tetapi penantian dipindah ke thread background.
+	local preloadGuardSource = [=[
+local env = getgenv and getgenv() or _G
+if env.__HumanHubPreloadGuard then return env.__HumanHubPreloadGuard end
+if type(hookfunction) ~= "function" or type(restorefunction) ~= "function"
+ or type(hookmetamethod) ~= "function" or type(getnamecallmethod) ~= "function"
+ or type(newcclosure) ~= "function" then return nil end
+local provider = game:GetService("ContentProvider")
+local target = provider.PreloadAsync
+local guard = { active = true, deferred = 0 }
+local original, originalNamecall
+local function preload(self, assets, callback)
+ local camera = workspace.CurrentCamera
+ local viewport = camera and camera.ViewportSize
+ if not guard.active or not viewport or viewport.X > 1 or viewport.Y > 1 then
+  return original(self, assets, callback)
+ end
+ guard.deferred += 1
+ task.defer(function() pcall(original, self, assets, callback) end)
+ return
+end
+function guard.restore()
+ if not guard.active then return end
+ guard.active = false
+ pcall(restorefunction, target)
+ if originalNamecall then pcall(hookmetamethod, game, "__namecall", originalNamecall) end
+ if env.__HumanHubPreloadGuard == guard then env.__HumanHubPreloadGuard = nil end
+end
+local ok, value = pcall(hookfunction, target, preload)
+if not ok then return nil end
+original = value
+local installed, previous = pcall(hookmetamethod, game, "__namecall", newcclosure(function(self, ...)
+ if self == provider and getnamecallmethod() == "PreloadAsync" then return preload(self, ...) end
+ return originalNamecall(self, ...)
+end))
+if not installed then guard.restore(); return nil end
+originalNamecall = previous
+env.__HumanHubPreloadGuard = guard
+task.delay(180, guard.restore)
+return guard
+]=]
+	-- Guard bertahan jika beberapa loader mengganti instance hub saat boot.
+	-- Pulihkan setelah world siap, atau otomatis setelah 180 detik.
 
 	function recovery.read()
 		if not file or type(readfile) ~= "function" then return nil end
@@ -338,16 +383,21 @@ do
 		local queue = queue_on_teleport or queueonteleport or queue_on_tp
 		if type(queue) ~= "function" then return end
 		local source = string.format([[
-if not game:IsLoaded() then game.Loaded:Wait() end
-if game.GameId ~= 10773501077 then return end
 local ok, state = pcall(function()
 	return game:GetService("HttpService"):JSONDecode(readfile(%q))
 end)
 if not ok or type(state) ~= "table" or type(state.expires) ~= "number" or state.expires <= os.time() then return end
+if game.GameId == 10773501077 then
+	pcall(function()
+%s
+	end)
+end
+if not game:IsLoaded() then game.Loaded:Wait() end
+if game.GameId ~= 10773501077 then return end
 local url = "https://raw.githubusercontent.com/ilhamz284/f2346f58219g41/codex/auto-factory/hub.luau"
 local run = loadstring(game:HttpGet(url .. "?refresh=" .. tostring(DateTime.now().UnixTimestampMillis)))
 if run then run() end
-]], file)
+]], file, preloadGuardSource)
 		recovery.queued = pcall(queue, source)
 	end
 
@@ -3011,12 +3061,13 @@ function Factory.stop(reason)
 	end
 end
 
-function Factory.seedOptions()
+function Factory.seedOptions(loading)
 	Bind.resolve(true)
 	local inv = Bind.inv
 	local items = findItemDB()
 	local rows, seen = {}, {}
-	if inv and items and type(inv.slots) == "table" then
+	local inventoryReady = inv ~= nil and type(inv.slots) == "table"
+	if inventoryReady and items then
 		for _, slot in ipairs(inv.slots) do
 			local def = type(slot) == "table" and items[slot.id] or nil
 			if type(def) == "table" and def.kind == "seed" and (tonumber(slot.n) or 0) > 0 then
@@ -3040,10 +3091,21 @@ function Factory.seedOptions()
 		table.insert(values, label)
 		byLabel[label] = row.id
 	end
+	local ready = inventoryReady and items ~= nil
 	if #values == 1 then
-		table.insert(values, inv and items and "Tidak ada seed di inventory" or "Memuat daftar seed...")
+		local message = "Tidak ada seed di inventory"
+		if not ready then
+			if loading then
+				message = "Memuat daftar seed..."
+			elseif not inventoryReady then
+				message = "Inventory belum terbaca. Tekan Refresh daftar seed."
+			else
+				message = "Data jenis item belum terbaca. Tekan Refresh daftar seed."
+			end
+		end
+		table.insert(values, message)
 	end
-	return values, byLabel
+	return values, byLabel, ready
 end
 
 local function factoryAlive(gen)
@@ -6372,11 +6434,45 @@ local Window = WindUI:CreateWindow({
 	Author = "Dirt Farm + PNB + Auto Factory",
 	Icon = "person-standing",
 	Size = UDim2.fromOffset(560, 460),
+	AutoScale = false,
 	Theme = "Dark",
 	ToggleKey = Enum.KeyCode.RightShift,
 })
 Hub.Window = Window
 Hub.claimGui()
+
+-- The viewport can be temporarily tiny while the Roblox window is reopening.
+do
+	local viewportConnection
+	local lastViewport
+	local function fitWindow()
+		local camera = workspace.CurrentCamera
+		if not camera or Hub.dead or Window.IsFullscreen then return end
+		local viewport = camera.ViewportSize
+		if viewport.X < 320 or viewport.Y < 240 or viewport == lastViewport then return end
+		lastViewport = viewport
+		-- WindUI sections remember the scale that was active when their tabs were created.
+		-- Resize the window itself so their header and content use the same units.
+		local bounds = UDim2.fromOffset(math.min(560, viewport.X - 16), math.min(460, viewport.Y - 16))
+		if Window.Size ~= bounds then
+			Window:SetSize(bounds)
+		end
+	end
+	local function watchCamera()
+		if viewportConnection then viewportConnection:Disconnect() end
+		local camera = workspace.CurrentCamera
+		if camera then
+			viewportConnection = camera:GetPropertyChangedSignal("ViewportSize"):Connect(fitWindow)
+			fitWindow()
+		end
+	end
+	Hub.keep(workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(watchCamera))
+	Hub.keep(game:GetService("UserInputService").WindowFocused:Connect(fitWindow))
+	Hub.onUnload(function()
+		if viewportConnection then viewportConnection:Disconnect() end
+	end)
+	watchCamera()
+end
 
 local pnbTab = Window:Tab({ Title = "Auto Farming", Icon = "blocks" })
 local guardTab = Window:Tab({ Title = "Penjaga World", Icon = "shield" })
@@ -6444,7 +6540,7 @@ factorySec:Paragraph({
 local mobileSeedInput = game:GetService("UserInputService").TouchEnabled
 local seedValues, seedByLabel = { "Pilih seed..." }, {}
 if not mobileSeedInput then
-	seedValues, seedByLabel = Factory.seedOptions()
+	seedValues, seedByLabel = Factory.seedOptions(true)
 end
 local seedPlaceholder = "Pilih seed..."
 Factory.seedId = nil
@@ -6458,6 +6554,7 @@ if not mobileSeedInput then
 		Value = seedPlaceholder,
 		Callback = function(label)
 			local id = seedByLabel[label]
+			if not id then return end
 			if Factory.cycle and Factory.running and id ~= Factory.seedId then
 				Factory.stop("seed berubah; nyalakan Auto Factory lagi")
 			end
@@ -6585,12 +6682,6 @@ local function refreshSeedDropdown(values, byLabel)
 	end
 	seedDropdown:Refresh(values)
 	seedDropdown:Select(selected)
-	if Factory.cycle and Factory.running and byLabel[selected] ~= Factory.seedId then
-		Factory.stop("seed berubah; nyalakan Auto Factory lagi")
-	end
-	Factory.seedId = byLabel[selected]
-	local def = Factory.seedId and selectedItemDefinition(Factory.seedId)
-	Factory.seedName = def and def.name or nil
 end
 
 if seedDropdown then
@@ -6600,11 +6691,11 @@ if seedDropdown then
 		Callback = function() refreshSeedDropdown() end,
 	})
 	task.spawn(function()
-		for _ = 1, 15 do
+		for attempt = 1, 15 do
 			task.wait(2)
 			if _G.__HumanHub ~= Hub then return end
-			local values, byLabel = Factory.seedOptions()
-			if next(byLabel) then
+			local values, byLabel, ready = Factory.seedOptions()
+			if ready or attempt == 15 then
 				refreshSeedDropdown(values, byLabel)
 				return
 			end
@@ -7659,11 +7750,22 @@ do
 	local saved = Hub.recovery.read()
 	if saved then
 		task.spawn(function()
-			for _ = 1, 15 do
-				if Hub.dead or Factory.running then return end
+			local nextRefresh, nextNotice = 0, 0
+			-- Teleport sambil minimized bisa memuat world jauh lebih lambat.
+			-- Tunggu kesiapan world selama checkpoint ini masih dipilih.
+			while not Hub.dead and not Factory.running do
 				local current = Hub.recovery.read()
 				if not current or current.world ~= saved.world or current.seedId ~= saved.seedId then return end
-				if Bind.resolve() then
+				if Farm.running or PNB.running or Factory.harvest or Factory.plant then return end
+				local now = os.clock()
+				if now >= nextRefresh then
+					nextRefresh = now + 30
+					current.expires = os.time() + 600
+					Hub.recovery.write(current)
+				end
+				-- Binding awal bisa mengacu ke world kosong saat bootstrap.
+				-- Perbarui juga ketika binding sebelumnya terlihat lengkap.
+				if Bind.resolve(true) then
 					local world = Bind.W
 					local state = Bind.state()
 					-- Bind can succeed before the teleport destination publishes its name.
@@ -7674,19 +7776,28 @@ do
 							log("Factory: world aktif berbeda dari checkpoint; pemulihan dibatalkan")
 							return
 						end
-						Factory.seedId = saved.seedId
+						Factory.seedId = current.seedId
 						Factory.cycle = true
-						if startFactory(saved) then
+						local env = getgenv and getgenv() or _G
+						local guard = env.__HumanHubPreloadGuard
+						if guard then pcall(guard.restore) end
+						local ok, started = pcall(startFactory, current)
+						if Hub.dead then return end
+						if ok and started then
 							log("Factory: dilanjutkan di " .. saved.world .. " (" .. Factory.phase .. ") setelah reload")
 							if Factory.onMode then pcall(Factory.onMode) end
 							return
 						end
 						Factory.cycle = false
+						if not ok then log("Factory: pemulihan belum siap: " .. tostring(started)) end
 					end
+				end
+				if now >= nextNotice then
+					nextNotice = now + 30
+					setFactoryStatus("Factory: menunggu world " .. saved.world .. " siap; lanjut " .. current.phase)
 				end
 				task.wait(2)
 			end
-			if not Hub.dead then log("Factory: checkpoint belum bisa dilanjutkan; cek status di hub") end
 		end)
 	end
 end
