@@ -30,7 +30,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.134",
+	version = "0.4.135",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -7407,21 +7407,24 @@ local function randomWorldName()
 end
 
 guardSec:Paragraph({
-	Title = "Mengikuti Auto Factory",
-	Desc = "Aktif selama Auto Factory berjalan. Staf grup: keluar ke world acak; pemain biasa baru: /ban bila punya akses world.",
+	Title = "Mengikuti Auto Factory dan Dirt Farm",
+	Desc = "Aktif otomatis selama Auto Factory atau Auto Dirt Farm berjalan. Staf grup: keluar ke world acak; pemain biasa baru: /ban bila punya akses world.",
 })
 
-Factory.onCycleChanged = function(on)
+local function syncGuardState()
+	local on = Farm.running or (Factory.running and Factory.cycle)
 	if Guard.enabled == on then return end
 	Guard.enabled = on
 	Guard.world, Guard.seen, Guard.baseline, Guard.busy = nil, {}, false, false
-	guardMessage(on and "memantau pemain selama Auto Factory berjalan" or "nonaktif")
+	guardMessage(on and "memantau pemain selama Auto Factory atau Auto Dirt Farm berjalan" or "nonaktif")
 end
-Factory.onCycleChanged(Factory.running and Factory.cycle)
+Factory.onCycleChanged = syncGuardState
+syncGuardState()
 
 task.spawn(function()
 	while _G.__HumanHub == Hub do
 		task.wait(1)
+		syncGuardState()
 		if Guard.enabled and not Guard.busy and not worldPickerVisible() then
 			local W = Bind.W
 			local others = W and worldPlayers()
