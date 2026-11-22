@@ -31,7 +31,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.137",
+	version = "0.4.138",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -316,7 +316,7 @@ do
 	local file = player and ("HumanHub_FactoryResume_" .. player.UserId .. ".json")
 	local recovery = { queued = false, lobby = game.PlaceId == lobbyPlace }
 	Hub.recovery = recovery
-	local phases = { harvest = true, pnb = true, plant = true, collect = true, grow = true }
+	local phases = { harvest = true, pnb = true, plant = true, store = true, collect = true, grow = true }
 	-- PreloadAsync dapat menunggu render selamanya ketika kamera baru masih
 	-- 1x1 saat teleport dalam keadaan minimized. Pasang sebelum bootstrap game.
 	-- Aset tetap dimuat, tetapi penantian dipindah ke thread background.
@@ -1618,6 +1618,7 @@ local Factory = {
 	harvest = false,
 	plant = false,
 	cycle = false,
+	clearTree = false,
 	seedId = nil,
 	seedName = nil,
 	seedGrow = nil,
@@ -4544,6 +4545,7 @@ local function factoryWork(W, inv, target, seedId, gen)
 		if not factoryAlive(gen) or W.name ~= Bind.name then
 			return false
 		end
+		if target.kind == "plant" and Factory.cycle and Factory.clearTree then return false end
 		if target.kind == "harvest" then
 			local current = Bind.state()
 			local floor = current and math.floor(current.y - 0.0001)
@@ -5293,21 +5295,26 @@ local factoryStoreSeeds
 -- Seed habis: pakai kolektor/rute yang sama dengan drop blok, tanpa worker
 -- baru. Hanya seed pilihan, dan tidak mengambil isi Display Box.
 local function factoryRefillSeeds(W, inv, state, blocked, gen)
+	local clearingTrees = Factory.cycle and Factory.clearTree
 	if factoryCount(inv, Factory.seedId) > 0 then Factory.seedRefilling = false; return false end
 	local now = os.clock()
-	if now < (Factory.seedRefillAt or 0) then return Factory.seedRefilling == true end
+	if now < (Factory.seedRefillAt or 0) then
+		return Factory.seedRefilling == true
+			or (clearingTrees and #factoryBaseDrops(W, Factory.seedId, true) > 0)
+	end
 	Factory.seedRefillAt = now + 3
 	Factory.seedRefilling = false
 	-- Jangan jemput kembali seed yang baru disimpan ketika seluruh farm penuh.
-	if not factoryHasPlantTile(W) then return false end
+	if not clearingTrees and not factoryHasPlantTile(W) then return false end
 	local result, amount = factoryCollectDrop(W, inv, state, blocked, gen, Factory.seedId)
 	if result == "done" or result == "room" then return false end
 	Factory.seedRefilling = true
 	Factory.seedRefillAt = os.clock() + (result == "path" and 2 or 0.2)
+	local nextAction = clearingTrees and "simpan ke Display Box" or "tanam"
 	setFactoryStatus(result == "collected"
-		and string.format("Factory: mengambil seed pilihan +%d; lanjut tanam", amount)
+		and string.format("Factory: mengambil seed pilihan +%d; lanjut %s", amount, nextAction)
 		or (result == "path" and "Factory: mencari jalur ke seed pilihan di world"
-		or "Factory: menunggu pickup seed pilihan; lanjut tanam setelah masuk"))
+		or ("Factory: menunggu pickup seed pilihan; lanjut " .. nextAction .. " setelah masuk")))
 	return true
 end
 
@@ -5369,9 +5376,11 @@ local function finishPNBDrain(inv)
 	Factory.resumePNB = left > 0
 	Factory.resumeCollect = anyOld
 	Factory.pnbLowWater = nil
-	Factory.phase = "plant"
-	setFactoryStatus(string.format("Factory: PNB %d blok selesai (sisa %d); tanam %d seed dulu%s",
-		count, left, seeds, anyOld and "; cek sisa drop setelah tanam" or ""))
+	Factory.phase = Factory.clearTree and "store" or "plant"
+	setFactoryStatus(Factory.clearTree
+		and string.format("Auto Clear Tree: PNB %d blok selesai (sisa %d); simpan %d seed ke Display Box", count, left, seeds)
+		or string.format("Factory: PNB %d blok selesai (sisa %d); tanam %d seed dulu%s",
+			count, left, seeds, anyOld and "; cek sisa drop setelah tanam" or ""))
 end
 
 local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
@@ -5401,6 +5410,11 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 	-- Mode panen saja tidak mempunyai PNB; saat penuh tahan pukulan sampai
 	-- pengguna menyediakan ruang, tanpa memulai fase Factory lain.
 	local harvestOnly = not Factory.cycle
+	local clearingTrees = Factory.cycle and Factory.clearTree
+	local seedPhase = clearingTrees and "store" or "plant"
+	local seedAction = clearingTrees and "simpan seed ke Display Box" or "tanam"
+	if clearingTrees and Factory.phase == "plant" then Factory.phase = "store" end
+	if not clearingTrees and Factory.phase == "store" then Factory.phase = seedPhase end
 
 	if Factory.phase == "harvest" then
 		local cy = math.floor(state.y - 0.0001)
@@ -5408,9 +5422,9 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 		if limit then
 			Move.release()
 			if not harvestOnly and limit == "seed" and seeds > 0 then
-				Factory.phase = "plant"
+				Factory.phase = seedPhase
 				Factory.resumePNB = blockFull and blocks > 0
-				setFactoryStatus(string.format("Factory: seed penuh (%d); tanam sebelum lanjut panen", seeds))
+				setFactoryStatus(string.format("Factory: seed penuh (%d); %s sebelum lanjut panen", seeds, seedAction))
 			elseif not harvestOnly and Factory.baseId and blocks > 0 and limit ~= "unknown" then
 				Factory.collectNeedsRoom = false
 				beginPNB(W, blocks, true)
@@ -5540,8 +5554,8 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 		-- Tree matang sudah habis: kerjakan blok/seed yang tersedia sebelum
 		-- menunggu pohon berikutnya matang.
 		if blocks <= 0 and seeds > 0 and factoryTarget(W, state, seedId, blocked, "plant") then
-			Factory.phase = "plant"
-			setFactoryStatus(string.format("Factory: target panen tertunda; lanjut tanam (%d seed)", seeds))
+			Factory.phase = seedPhase
+			setFactoryStatus(string.format("Factory: target panen tertunda; %s (%d seed)", seedAction, seeds))
 			return 0.1
 		end
 		if blocks <= 0 then
@@ -5559,14 +5573,14 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 		if not Factory.baseId then
 			-- Seed ini tidak punya blok pasangan untuk PNB; lompati fase PNB.
 			Factory.pnbDraining, Factory.pnbDrainCount, Factory.pnbDrainTarget, Factory.pnbOldDrops, Factory.dropFilter = false, 0, nil, nil, nil
-			Factory.phase = "plant"
+			Factory.phase = seedPhase
 			return 0.2
 		end
 		if seeds >= 200 then
 			Factory.resumePNB = blocks > 0
 			Factory.pnbDraining, Factory.pnbDrainCount, Factory.pnbDrainTarget, Factory.pnbOldDrops, Factory.dropFilter = false, 0, nil, nil, nil
-			Factory.phase = "plant"
-			setFactoryStatus(string.format("Factory: seed penuh %d/200; tanam dulu, sisa %d blok untuk PNB", seeds, blocks))
+			Factory.phase = seedPhase
+			setFactoryStatus(string.format("Factory: seed penuh %d/200; %s dulu, sisa %d blok untuk PNB", seeds, seedAction, blocks))
 			return 0.1
 		end
 		-- Inventory sudah habis: tanam seed sebelum fase collect berikutnya.
@@ -5579,10 +5593,10 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 			local hasDrops = #factoryBaseDrops(W, Factory.baseId) > 0
 			Factory.resumePNB = false
 			Factory.resumeCollect = hasDrops and seeds > 0
-			Factory.phase = seeds > 0 and "plant" or (hasDrops and "collect" or "plant")
+			Factory.phase = seeds > 0 and seedPhase or (hasDrops and "collect" or "plant")
 			Factory.pnbLowWater = nil
 			setFactoryStatus(string.format("Factory: PNB selesai | blok %d, seed %d; %s", blocks, seeds,
-				(seeds > 0 or not hasDrops) and "mulai tanam" or "ambil drop tertinggal"))
+				(seeds > 0 or not hasDrops) and seedAction or "ambil drop tertinggal"))
 			return 0.1
 		end
 		if Factory.pnbSkipUntil and Factory.pnbSkipUntil > os.clock() then
@@ -5598,7 +5612,7 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 				setFactoryStatus("Factory: jeda PNB; panen pohon matang dulu")
 				return 0.2
 			end
-			if seeds > 0 then
+			if seeds > 0 and not clearingTrees then
 				local spot = factoryTarget(W, state, seedId, blocked, "plant")
 				if spot and factoryWork(W, inv, spot, seedId, gen) then
 					setFactoryStatus("Factory: jeda PNB; tanam seed dulu")
@@ -5653,8 +5667,8 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 					return 0.2
 				end
 				Factory.pnbDraining, Factory.pnbDrainCount, Factory.pnbDrainTarget, Factory.pnbOldDrops, Factory.dropFilter = false, 0, nil, nil, nil
-				Factory.phase = "plant"
-				setFactoryStatus("Factory: blok PNB habis; lanjut tanam")
+				Factory.phase = seedPhase
+				setFactoryStatus("Factory: blok PNB habis; lanjut " .. seedAction)
 				return 0.2
 			else
 				-- Blok yang dipasang tidak hancur walau sudah dipukul berkali-kali.
@@ -5684,14 +5698,14 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 	if Factory.phase == "collect" then
 		if seeds >= 200 then
 			Factory.resumeCollect = true
-			Factory.phase = "plant"
-			setFactoryStatus("Factory: seed penuh 200/200; tanam sebelum lanjut ambil drop")
+			Factory.phase = seedPhase
+			setFactoryStatus("Factory: seed penuh 200/200; " .. seedAction .. " sebelum lanjut ambil drop")
 			return 0.1
 		end
 		local result, amount = factoryCollectDrop(W, inv, state, blocked, gen)
 		if result == "done" then
-			Factory.phase = "plant"
-			setFactoryStatus("Factory: drop blok selesai diambil; mulai tanam")
+			Factory.phase = seedPhase
+			setFactoryStatus("Factory: drop blok selesai diambil; " .. seedAction)
 		elseif result == "room" then
 			if blocks > 0 then
 				beginPNB(W, blocks, true)
@@ -5718,7 +5732,7 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 			or ((result == "pending" or result == "cooldown") and 0.2 or 1)
 	end
 
-	if Factory.phase == "plant" then
+	if Factory.phase == "plant" or Factory.phase == "store" then
 		if seeds <= 0 then
 			if factoryRefillSeeds(W, inv, state, blocked, gen) then return 0.2 end
 			if Factory.resumePNB and blocks > 0 then
@@ -5735,6 +5749,25 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 				setFactoryStatus("Factory: seed habis; cek drop, tree, dan sisa blok")
 			end
 			return 0.1
+		end
+		if clearingTrees then
+			Move.release()
+			if os.clock() < (Factory.storeRetryAt or 0) then
+				setFactoryStatus("Auto Clear Tree: menunggu penyimpanan Display Box; " .. tostring(Factory.storeFail or "mencoba lagi"))
+				return 2
+			end
+			local stored, reason = factoryStoreSeeds(W, inv, state, seedId, gen, function()
+				return Factory.clearTree == true
+			end)
+			if not factoryAlive(gen) or not Factory.clearTree then return 0.1 end
+			if stored then
+				Factory.storeFail, Factory.storeRetryAt = nil, nil
+				setFactoryStatus("Auto Clear Tree: seed tersimpan di Display Box; lanjut cek blok dan pohon")
+			else
+				Factory.storeFail, Factory.storeRetryAt = reason, os.clock() + 20
+				setFactoryStatus("Auto Clear Tree: seed belum tersimpan (" .. tostring(reason) .. "); coba lagi 20 detik")
+			end
+			return stored and 0.1 or 2
 		end
 		-- Sebelum memenuhi seluruh farm, cadangkan satu lokasi PNB, termasuk
 		-- setelah reload atau setelah station sebelumnya dilepas akibat gagal.
@@ -5801,17 +5834,17 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 	if Factory.resumePNB and blocks > 0 then
 		Factory.resumePNB = false
 		beginPNB(W, blocks)
-		setFactoryStatus(string.format("Factory: lanjut PNB %d blok setelah tanam", blocks))
+		setFactoryStatus(string.format("Factory: lanjut PNB %d blok setelah seed diproses", blocks))
 		return 0.1
 	end
 	if Factory.resumeCollect then
 		Factory.resumeCollect = false
 		Factory.phase = "collect"
-		setFactoryStatus("Factory: lanjut ambil drop setelah tanam")
+		setFactoryStatus("Factory: lanjut ambil drop setelah seed diproses")
 		return 0.1
 	end
 	if seeds <= 0 and factoryRefillSeeds(W, inv, state, blocked, gen) then
-		Factory.phase = "plant"
+		Factory.phase = clearingTrees and "store" or "plant"
 		return 0.2
 	end
 	local ripe = factoryTarget(W, state, seedId, blocked, "harvest")
@@ -5823,8 +5856,8 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 		beginPNB(W, blocks)
 		setFactoryStatus(string.format("Factory: lanjut PNB %d blok sambil menunggu tree", blocks))
 	elseif seeds > 0 then
-		Factory.phase = "plant"
-		setFactoryStatus(string.format("Factory: tanam %d seed yang tersedia", seeds))
+		Factory.phase = seedPhase
+		setFactoryStatus(string.format("Factory: %s (%d seed tersedia)", seedAction, seeds))
 	elseif not factoryHasTrees(W, seedId) and blocks <= 0 then
 		Factory.stop("berhenti: seed, blok, dan pohon pilihan sudah habis")
 	else
@@ -5941,6 +5974,7 @@ local function startFactory(resume)
 	Factory.seedRefillAt = 0
 	Factory.seedRefilling = false
 	if resume and resume.world == W.name and resume.seedId == seedId then
+		Factory.clearTree = resume.clearTree == true
 		Factory.phase = resume.phase
 		Factory.resumePNB = resume.resumePNB == true
 		Factory.resumeCollect = resume.resumeCollect == true
@@ -5949,7 +5983,7 @@ local function startFactory(resume)
 		end
 	end
 	if Factory.cycle and factoryCount(inv, seedId) >= 200 then
-		Factory.phase = "plant"
+		Factory.phase = Factory.clearTree and "store" or "plant"
 		Factory.resumePNB = baseId ~= nil and factoryCount(inv, baseId) > 0
 		Factory.resumeCollect = not Factory.resumePNB and #factoryBaseDrops(W, baseId) > 0
 	end
@@ -5964,17 +5998,19 @@ local function startFactory(resume)
 	local gen, worldName = Factory.gen, W.name
 	local blocked = {}
 	local missingSince = nil
-	local nextCheckpoint, lastPhase, lastResumePNB, lastResumeCollect = 0, nil, nil, nil
+	local nextCheckpoint, lastPhase, lastResumePNB, lastResumeCollect, lastClearTree = 0, nil, nil, nil, nil
 	local function checkpoint()
 		if not Factory.cycle then return end
 		local now = os.clock()
 		if now < nextCheckpoint and lastPhase == Factory.phase and lastResumePNB == Factory.resumePNB
-			and lastResumeCollect == Factory.resumeCollect then return end
+			and lastResumeCollect == Factory.resumeCollect and lastClearTree == Factory.clearTree then return end
 		nextCheckpoint = now + 30
 		lastPhase, lastResumePNB, lastResumeCollect = Factory.phase, Factory.resumePNB, Factory.resumeCollect
+		lastClearTree = Factory.clearTree
 		if Hub.recovery.write({
 			world = worldName, seedId = seedId, phase = Factory.phase,
 			resumePNB = Factory.resumePNB, resumeCollect = Factory.resumeCollect,
+			clearTree = Factory.clearTree,
 			attempts = 0, expires = os.time() + 600,
 		}) then Hub.recovery.arm() end
 	end
@@ -6891,7 +6927,7 @@ if seedDropdown then
 	end)
 end
 
-local harvestToggle, plantToggle, cycleToggle
+local harvestToggle, plantToggle, cycleToggle, clearTreeToggle
 harvestToggle = factorySec:Toggle({
 	Title = "Auto Harvest",
 	Desc = "Panen pohon matang dari seed yang dipilih di seluruh world yang bisa dijangkau.",
@@ -6919,6 +6955,27 @@ cycleToggle = factorySec:Toggle({
 	Callback = function(on)
 		if not Factory.syncingUI then
 			Factory.setMode("cycle", on)
+		end
+	end,
+})
+clearTreeToggle = factorySec:Toggle({
+	Title = "Auto Clear Tree",
+	Desc = "Opsi Auto Factory: panen, PNB, lalu simpan seed pilihan ke Display Box tanpa menanam ulang. Seed penuh disimpan lebih awal. Perlu Display Box yang bisa dijangkau.",
+	Value = Factory.clearTree,
+	Callback = function(on)
+		if Factory.syncingUI then return end
+		Factory.clearTree = on == true
+		Factory.storeFail, Factory.storeRetryAt = nil, nil
+		if Factory.running and Factory.cycle then
+			if on and Factory.phase == "plant" then Factory.phase = "store" end
+			if not on and Factory.phase == "store" then Factory.phase = "plant" end
+		end
+		local saved = Hub.recovery.read()
+		if saved and saved.mode ~= "dirt" then
+			saved.clearTree = Factory.clearTree
+			if on and saved.phase == "plant" then saved.phase = "store" end
+			if not on and saved.phase == "store" then saved.phase = "plant" end
+			Hub.recovery.write(saved)
 		end
 	end,
 })
@@ -7005,14 +7062,17 @@ do
 end
 Factory.onMode = function()
 	Factory.syncingUI = true
-	if harvestToggle and harvestToggle.Set then
-		pcall(harvestToggle.Set, harvestToggle, Factory.harvest)
+	if harvestToggle and harvestToggle.Set and harvestToggle.Value ~= Factory.harvest then
+		pcall(harvestToggle.Set, harvestToggle, Factory.harvest, false)
 	end
-	if plantToggle and plantToggle.Set then
-		pcall(plantToggle.Set, plantToggle, Factory.plant)
+	if plantToggle and plantToggle.Set and plantToggle.Value ~= Factory.plant then
+		pcall(plantToggle.Set, plantToggle, Factory.plant, false)
 	end
-	if cycleToggle and cycleToggle.Set then
-		pcall(cycleToggle.Set, cycleToggle, Factory.cycle)
+	if cycleToggle and cycleToggle.Set and cycleToggle.Value ~= Factory.cycle then
+		pcall(cycleToggle.Set, cycleToggle, Factory.cycle, false)
+	end
+	if clearTreeToggle and clearTreeToggle.Set and clearTreeToggle.Value ~= Factory.clearTree then
+		pcall(clearTreeToggle.Set, clearTreeToggle, Factory.clearTree, false)
 	end
 	Factory.syncingUI = false
 	if Factory.onCycleChanged then
@@ -7149,9 +7209,9 @@ local function factoryDisplaySpots(W, state)
 	return list
 end
 
-factoryStoreSeeds = function(W, inv, state, seedId, gen)
+factoryStoreSeeds = function(W, inv, state, seedId, gen, canStore)
 	local alive = function()
-		return factoryAlive(gen) and W.name == Bind.name
+		return factoryAlive(gen) and W.name == Bind.name and (not canStore or canStore())
 	end
 	if type(W.displayPut) ~= "function" then return false, "fungsi Display Box tidak tersedia" end
 	local spots = factoryDisplaySpots(W, state)
@@ -7203,7 +7263,8 @@ factoryStoreSeeds = function(W, inv, state, seedId, gen)
 		if not called then return false, "gagal mengirim seed: " .. tostring(err) end
 		local deadline = os.clock() + 8
 		local confirmed = false
-		while alive() and os.clock() < deadline do
+		-- Selesaikan ACK request yang sudah dikirim sebelum berganti ke tanam.
+		while factoryAlive(gen) and W.name == Bind.name and os.clock() < deadline do
 			local afterBox = seedCountInDisplay(W, box.x, box.y, seedId)
 			if afterBox and afterBox > beforeBox then
 				confirmed = true
@@ -7612,6 +7673,7 @@ function Guard.leaveAndWait(W)
 		mode = Farm.running and "dirt" or "factory", world = W.name,
 		seedId = Factory.seedId, phase = Factory.phase,
 		resumePNB = Factory.resumePNB, resumeCollect = Factory.resumeCollect,
+		clearTree = Factory.clearTree,
 		spacing = Farm.spacing, breakBg = Farm.breakBg, patchLava = Farm.patchLava,
 		clearWorld = Farm.clearWorld,
 	}
@@ -8018,6 +8080,7 @@ function Hub.recovery.resume()
 								continue
 							end
 							Factory.seedId = current.seedId
+							Factory.clearTree = current.clearTree == true
 							Factory.cycle = true
 							local ok, started = pcall(startFactory, current)
 							if Hub.dead then return end

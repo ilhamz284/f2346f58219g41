@@ -78,6 +78,7 @@ local function setFactoryStatus() end
 local function reset(seeds)
     clock=0; active=true; onWait=nil; inv.seeds=seeds; lastPlace=-100
     Factory.planted=0; Factory.seedId=955; Factory.workX=10; Factory.workY=4
+    Factory.clearTree=false;Factory.cycle=true
     state={x=10.5,y=5,grounded=true,facing=1}
     rejected=0; placedAt={}; paths=0; plans=0; walks=0
     W.fg={}
@@ -119,7 +120,20 @@ assert(Factory.planted==1 and rejected==0, "floor change interrupts the batch")
 reset(1)
 target=factoryTarget(W,state,955,{},"plant")
 assert(factoryWork(W,inv,target,955,1) and inv.seeds==0 and Factory.planted==1, "last seed planted once")
+reset(200);Factory.clearTree=true
+target=factoryTarget(W,state,955,{},"plant")
+factoryWork(W,inv,target,955,1)
+assert(Factory.planted==0 and inv.seeds==200,"Clear Tree blocks an already-selected plant target")
+reset(200)
+onWait=function() if Factory.planted>0 then Factory.clearTree=true end end
+target=factoryTarget(W,state,955,{},"plant")
+factoryWork(W,inv,target,955,1)
+assert(Factory.planted==1 and inv.seeds==199,"enabling Clear Tree cancels later placements in the active batch")
+reset(200);Factory.clearTree=true;Factory.cycle=false
+target=factoryTarget(W,state,955,{},"plant")
+assert(factoryWork(W,inv,target,955,1) and Factory.planted>0,"standalone Auto Plant retains its behavior")
 print("PASS row sweep, batch limit, range, pacing, PNB reservation, Stop, seed change, gap, floor change, last seed")
+print("PASS Clear Tree blocks planting, interrupts active batches, and applies only to Auto Factory")
 '''
 
 world_tests = r'''

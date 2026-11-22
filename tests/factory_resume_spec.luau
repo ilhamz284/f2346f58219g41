@@ -7,7 +7,8 @@ return function(make, makeGuard)
 		local checkpoint = {
 			mode = options.mode, guardCheck = options.guardCheck,
 			clearWorld = options.clearWorld,
-			world = "TEST", seedId = 4585, phase = "plant", attempts = 1,
+			clearTree = options.clearTree,
+			world = "TEST", seedId = 4585, phase = options.phase or "plant", attempts = 1,
 			resumePNB = true, resumeCollect = true, expires = 1600,
 		}
 		local Hub, Factory = { dead = false }, { running = false }
@@ -51,6 +52,7 @@ return function(make, makeGuard)
 			startFactory = function(saved)
 				starts += 1
 				assert(Factory.seedId == 4585 and Factory.cycle)
+				assert(Factory.clearTree == (saved.clearTree == true), "restore Clear Tree before starting Factory")
 				if options.startError and starts == 1 then error("world still loading") end
 				if options.startFails and starts == 1 then return false end
 				resumed = table.clone(saved)
@@ -111,6 +113,10 @@ return function(make, makeGuard)
 	case("Clear World resumes its own mode after the guard declares the world safe", function()
 		local r = run({ mode = "dirt", clearWorld = true, guardCheck = true, safeAt = 180 })
 		assert(r.starts == 1 and r.clearStarts == 1 and r.now >= 180 and r.checkpoint.world == nil)
+	end)
+	case("Clear Tree option and storage phase survive guarded teleport recovery", function()
+		local r = run({ clearTree = true, phase = "store", guardCheck = true, safeAt = 180 })
+		assert(r.starts == 1 and r.now >= 180 and r.resumed.clearTree and r.resumed.phase == "store")
 	end)
 	local function preloadSetup()
 		local env, tasks, delayed = {}, {}, {}

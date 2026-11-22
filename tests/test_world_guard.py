@@ -25,7 +25,7 @@ local context = {world=W, exitWorld=function() exits+=1; picker=true; state.acti
 function W.enter(name) assert(name=="TEST"); enters+=1; picker=false; state.active=true; return true end
 local Bind = {W=W, context=context, state=function() return state end}
 local Players = {LocalPlayer={UserId=1}}
-local Factory = {running=false, cycle=false, seedId=4585, phase="plant", resumePNB=true}
+local Factory = {running=false, cycle=false, seedId=4585, phase="plant", resumePNB=true,clearTree=true}
 local Farm = {running=false, spacing=3, breakBg=false, patchLava=true}
 local Hub = {recovery={}}
 function Hub.recovery.read() return stored and table.clone(stored) end
@@ -62,6 +62,7 @@ others={[4]={userId=4}}
 Guard.tick()
 assert(exits==3 and stored.mode=="factory" and stored.phase=="plant" and stored.resumePNB)
 assert(stored.seedId==4585 and not Factory.running)
+assert(stored.clearTree,"preserve Clear Tree configuration across the guard's lobby wait")
 stored={}; Guard.tick(); clock=1000; Guard.tick()
 assert(not Guard.enabled and enters==2, "manual cancellation prevents another join")
 stored=nil;Farm.running=true;Farm.clearWorld=true;Factory.running=false;picker=false;state.active=true
