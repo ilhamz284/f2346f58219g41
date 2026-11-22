@@ -3,9 +3,10 @@ return function(make, makeGuard)
 	local cases = {}
 	local function run(options)
 		options = options or {}
-		local now, starts, refreshes = 0, 0, 0
+		local now, starts, refreshes, clearStarts = 0, 0, 0, 0
 		local checkpoint = {
 			mode = options.mode, guardCheck = options.guardCheck,
+			clearWorld = options.clearWorld,
 			world = "TEST", seedId = 4585, phase = "plant", attempts = 1,
 			resumePNB = true, resumeCollect = true, expires = 1600,
 		}
@@ -57,12 +58,13 @@ return function(make, makeGuard)
 				return true
 			end,
 			startFarm = function() starts += 1; Farm.running = true end,
+			startClearWorld = function() starts += 1; clearStarts += 1; Farm.running = true end,
 			setFactoryStatus = function(message) Factory.status = message end,
 			log = function() end,
 		})
 		assert(worker)
 		worker()
-		return { starts = starts, resumed = resumed, now = now, refreshes = refreshes,
+		return { starts = starts, clearStarts = clearStarts, resumed = resumed, now = now, refreshes = refreshes,
 			checkpoint = checkpoint, Factory = Factory }
 	end
 	local function case(name, body) body(); table.insert(cases, name) end
@@ -105,6 +107,10 @@ return function(make, makeGuard)
 	case("Dirt Farm checkpoint restores farm and clears the completed checkpoint", function()
 		local r = run({ mode = "dirt", guardCheck = true, safeAt = 180 })
 		assert(r.starts == 1 and r.now >= 180 and r.checkpoint.world == nil)
+	end)
+	case("Clear World resumes its own mode after the guard declares the world safe", function()
+		local r = run({ mode = "dirt", clearWorld = true, guardCheck = true, safeAt = 180 })
+		assert(r.starts == 1 and r.clearStarts == 1 and r.now >= 180 and r.checkpoint.world == nil)
 	end)
 	local function preloadSetup()
 		local env, tasks, delayed = {}, {}, {}

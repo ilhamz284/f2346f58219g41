@@ -21,7 +21,7 @@ def factory(body, names):
 
 make_resume = factory(resume, [
     "Hub", "Factory", "Farm", "PNB", "Bind", "os", "task",
-    "worldPickerVisible", "startFactory", "startFarm", "setFactoryStatus", "log", "_G", "getgenv",
+    "worldPickerVisible", "startFactory", "startFarm", "startClearWorld", "setFactoryStatus", "log", "_G", "getgenv",
 ])
 make_guard = factory(guard, [
     "game", "workspace", "getgenv", "_G", "hookfunction", "restorefunction",

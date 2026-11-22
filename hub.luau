@@ -10,6 +10,7 @@
 --// Fitur #3 : Auto Harvest / Auto Plant dengan seed pilihan dari inventory.
 --// Fitur #4 : Auto Factory: panen sampai blok penuh / tree habis,
 --//            PNB sampai blok habis, tanam sampai seed habis.
+--// Fitur #5 : Auto Clear World: bersihkan foreground/background yang terjangkau.
 --//
 --// Prinsip gerak:
 --//   - PC: keypress A/D + Space (VirtualInputManager)
@@ -30,7 +31,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.136",
+	version = "0.4.137",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -1586,6 +1587,8 @@ end
 -- Tabel Farm dideklarasikan lebih dulu karena Dig memakai Farm.breakBg.
 local Farm = {
 	running = false,
+	clearWorld = false,
+	syncingUI = false,
 	gen = 0,
 	spacing = 2, -- 1 baris lantai + 1 baris lorong (1 block)
 	digDelay = 0.14,
@@ -2186,6 +2189,7 @@ local function startFarm()
 	end
 
 	Farm.running = true
+	Farm.clearWorld = false
 	Farm.gen += 1
 	local gen = Farm.gen
 
@@ -4055,6 +4059,175 @@ function Path.moveTo(tx, ty, aliveFn)
 	end
 	Move.release()
 	return false, "timeout"
+end
+
+-- Auto Clear memakai state Farm agar Stop, Penjaga World, dan reload saling mengikuti.
+local Clear = { cleared = 0 }
+
+function Clear.layer(W, x, y)
+	local fg = W.fg and W.fg[y] and W.fg[y][x] or 0
+	if fg ~= 0 then
+		return not Dig.isProtected(fg, x, y) and "fg" or nil
+	end
+	local bg = W.bg and W.bg[y] and W.bg[y][x] or 0
+	return bg ~= 0 and not Dig.isProtected(bg, x, y) and "bg" or nil
+end
+
+function Clear.target(W, state, blocked, canAct)
+	local distances = Path.explore(math.floor(state.x), math.floor(state.y - 0.0001), 6000)
+	local best, remaining, retryAt = nil, 0, nil
+	local now = os.clock()
+	local width, height = tonumber(W.w) or 100, tonumber(W.h) or 60
+	for y = 0, height - 1 do
+		for x = 0, width - 1 do
+			if Clear.layer(W, x, y) then
+				remaining += 1
+				if distances and (not best or y <= best.y) then
+					for standY = math.max(0, y - 2), math.min(height - 2, y + 2) do
+						for standX = math.max(0, x - 2), math.min(width - 1, x + 2) do
+							local cost = distances[keyOf(standX, standY)]
+							local dx, dy = x - standX, y - standY
+							if cost ~= nil and dx * dx + dy * dy <= 2.5 * 2.5 and Path.standable(standX, standY) then
+								local untilAt = blocked[keyOf(x, y)] or 0
+								if untilAt > now then
+									retryAt = math.min(retryAt or untilAt, untilAt)
+								elseif not best or y < best.y or cost < best.cost then
+									best = { x = x, y = y, standX = standX, standY = standY, cost = cost }
+								end
+							end
+						end
+					end
+				end
+			end
+		end
+		if y % 8 == 0 then
+			task.wait()
+			if not canAct() then return nil, remaining end
+		end
+	end
+	return best, remaining, retryAt
+end
+
+function Clear.work(W, target, canAct)
+	for _ = 1, 24 do
+		if not canAct() then return false, "stopped" end
+		if not Clear.layer(W, target.x, target.y) then return true end
+		local state = Bind.state()
+		if not state or not state.grounded then return false, "position" end
+		local dx = target.x + 0.5 - state.x
+		local dy = target.y + 0.5 - (state.y - 0.5)
+		if dx * dx + dy * dy > 2.5 * 2.5 then return false, "position" end
+		local fg = W.fg[target.y] and W.fg[target.y][target.x] or 0
+		local bg = W.bg and W.bg[target.y] and W.bg[target.y][target.x] or 0
+		local def = fg ~= 0 and selectedItemDefinition(fg)
+		local isTree = def and def.kind == "seed" or false
+		if isTree and Bind.inv and Bind.inv.selected ~= 18 and Bind.inv.select then
+			pcall(Bind.inv.select, Bind.inv, 18)
+		end
+		if not Dig.punch(target.x, target.y, isTree, true, true, true, canAct) then
+			return false, "hit"
+		end
+		task.wait(math.max(0.03, Farm.digDelay * 0.35))
+		if not canAct() then return false, "stopped" end
+		local afterFg = W.fg[target.y] and W.fg[target.y][target.x] or 0
+		local afterBg = W.bg and W.bg[target.y] and W.bg[target.y][target.x] or 0
+		if fg ~= 0 and afterFg == 0 then Clear.cleared += 1 end
+		if bg ~= 0 and afterBg == 0 then Clear.cleared += 1 end
+	end
+	return Clear.layer(W, target.x, target.y) == nil, "hit"
+end
+
+local function startClearWorld()
+	if Farm.running then return Farm.clearWorld, "Matikan Auto Dirt Farm terlebih dahulu." end
+	if PNB.running or Factory.running then
+		return false, "Matikan PNB atau Auto Harvest/Plant terlebih dahulu."
+	end
+	if not Bind.resolve(true) or not Bind.W or not Bind.CT or not Bind.hit then
+		return false, "Binding game belum lengkap."
+	end
+	local state = Bind.state()
+	if not state or not state.active or not state.grounded or state.dead or worldPickerVisible() then
+		return false, "Karakter harus siap dan berdiri di dalam world."
+	end
+	local W, worldName, grid = Bind.W, Bind.W.name, Bind.W.fg
+	Farm.running, Farm.clearWorld = true, true
+	Farm.gen += 1
+	local gen = Farm.gen
+	Clear.cleared = 0
+	Path.clearEdges()
+	setStatus("Auto Clear: mulai membersihkan foreground dan background")
+	task.spawn(function()
+		local function canAct()
+			return not Hub.dead and Farm.running and Farm.gen == gen and Bind.W == W
+				and W.name == worldName and W.fg == grid and not worldPickerVisible()
+		end
+		local ok, err = pcall(function()
+			local blocked, failures = {}, {}
+			local lastGroundAt = os.clock()
+			local retriedRoutes = false
+			while canAct() do
+				local current = Bind.state()
+				if not current or current.dead or not current.grounded then
+					Move.release()
+					if os.clock() - lastGroundAt > 15 then
+						Farm.stop("Auto Clear berhenti: karakter belum siap atau belum mendarat")
+						return
+					end
+					task.wait(0.2)
+					continue
+				end
+				lastGroundAt = os.clock()
+				local target, remaining, retryAt = Clear.target(W, current, blocked, canAct)
+				if not canAct() then return end
+				if remaining == 0 then
+					Farm.stop(string.format("Auto Clear selesai: %d layer dibersihkan; tile terlindungi dipertahankan", Clear.cleared))
+					return
+				end
+				if not target then
+					if retryAt then
+						Move.release()
+						setStatus(string.format("Auto Clear: mencoba ulang jalur | sisa %d tile", remaining))
+						task.wait(math.min(1, math.max(0.05, retryAt - os.clock())))
+					elseif not retriedRoutes then
+						Path.clearEdges()
+						retriedRoutes = true
+						task.wait(0.2)
+					else
+						Farm.stop(string.format("Auto Clear berhenti: %d tile tersisa tidak terjangkau dari posisi ini", remaining))
+						return
+					end
+					continue
+				end
+				setStatus(string.format("Auto Clear: %d layer bersih | sisa %d tile | X=%d Y=%d",
+					Clear.cleared, remaining, target.x, target.y))
+				local reached, why = Path.moveTo(target.standX, target.standY, canAct)
+				if not canAct() then return end
+				Move.release()
+				local worked = false
+				if reached then worked, why = Clear.work(W, target, canAct) end
+				if not canAct() then return end
+				local key = keyOf(target.x, target.y)
+				if worked then
+					failures[key], blocked[key] = nil, nil
+					retriedRoutes = false
+				elseif why ~= "position" and why ~= "airborne" then
+					failures[key] = (failures[key] or 0) + 1
+					if failures[key] >= 2 then
+						Farm.stop(string.format("Auto Clear berhenti: tile X=%d Y=%d terhalang atau tidak bisa dihancurkan",
+							target.x, target.y))
+						return
+					end
+					blocked[key] = os.clock() + 3
+				end
+				task.wait(0.05)
+			end
+		end)
+		if Farm.running and Farm.gen == gen then
+			if not ok then log("Auto Clear error: " .. tostring(err)) end
+			Farm.stop(ok and "Auto Clear berhenti: world berubah" or "Auto Clear berhenti: terjadi error (lihat console)")
+		end
+	end)
+	return true
 end
 
 -- Jemput drop hasil PNB. Game mengambil drop saat pemain berdiri di tile drop,
@@ -7055,6 +7228,24 @@ end
 Factory.storeSeeds = factoryStoreSeeds
 
 -- ---- Tab Dirt Farm ----
+local clearSec = farmTab:Section({ Title = "Auto Clear World", Opened = true })
+local clearToggle
+local clearStatusPara = clearSec:Paragraph({ Title = "Status Clear World", Desc = "idle" })
+clearToggle = clearSec:Toggle({
+	Title = "Auto Clear World",
+	Desc = "Bersihkan foreground dan background dari atas ke bawah dengan jalan/lompat. Bedrock, pintu, lock, dan tile terlindungi dipertahankan. Matikan untuk berhenti.",
+	Value = false,
+	Callback = function(on)
+		if Farm.syncingUI then return end
+		if on then
+			local ok, reason = startClearWorld()
+			if not ok then WindUI:Notify({ Title = "Auto Clear World", Content = reason, Duration = 4 }) end
+		elseif Farm.clearWorld then
+			Farm.stop("Auto Clear dihentikan manual")
+		end
+		if Farm.onStatus then Farm.onStatus(Farm.status) end
+	end,
+})
 local farmSec = farmTab:Section({ Title = "Auto Dirt Farm", Opened = true })
 local statusPara
 local farmToggle
@@ -7064,14 +7255,20 @@ farmToggle = farmSec:Toggle({
 	Desc = "Menggali lorong 1 block di atas lantai (termasuk cave background), menyisir bolak-balik, lalu turun lewat poros tepi.",
 	Value = false,
 	Callback = function(on)
+		if Farm.syncingUI then return end
+		if on and Farm.running and Farm.clearWorld then
+			WindUI:Notify({ Title = "Dirt Farm", Content = "Matikan Auto Clear World terlebih dahulu.", Duration = 4 })
+			if Farm.onStatus then Farm.onStatus(Farm.status) end
+			return
+		end
 		if on then
 			startFarm()
 			if not Farm.running then
 				if farmToggle and farmToggle.Set then
-					pcall(farmToggle.Set, farmToggle, false)
+					pcall(farmToggle.Set, farmToggle, false, false)
 				end
 			end
-		else
+		elseif not Farm.clearWorld then
 			Farm.stop("dimatikan dari toggle")
 		end
 	end,
@@ -7133,18 +7330,29 @@ farmSec:Button({
 		PNB.stop("dihentikan manual")
 		Factory.stop("dihentikan manual")
 		if farmToggle and farmToggle.Set then
-			pcall(farmToggle.Set, farmToggle, false)
+			pcall(farmToggle.Set, farmToggle, false, false)
 		end
 		WindUI:Notify({ Title = "Human Hub", Content = "Bot dihentikan, tombol dilepas.", Duration = 3 })
 	end,
 })
 
 Farm.onStatus = function(text)
-	if statusPara then
-		if statusPara.SetDesc then
-			pcall(statusPara.SetDesc, statusPara, text)
-		elseif statusPara.SetTitle then
-			pcall(statusPara.SetTitle, statusPara, "Status: " .. text)
+	Farm.syncingUI = true
+	local clearing = Farm.running and Farm.clearWorld
+	local digging = Farm.running and not Farm.clearWorld
+	if clearToggle and clearToggle.Set and clearToggle.Value ~= clearing then
+		pcall(clearToggle.Set, clearToggle, clearing, false)
+	end
+	if farmToggle and farmToggle.Set and farmToggle.Value ~= digging then
+		pcall(farmToggle.Set, farmToggle, digging, false)
+	end
+	Farm.syncingUI = false
+	local paragraph = Farm.clearWorld and clearStatusPara or statusPara
+	if paragraph then
+		if paragraph.SetDesc then
+			pcall(paragraph.SetDesc, paragraph, text)
+		elseif paragraph.SetTitle then
+			pcall(paragraph.SetTitle, paragraph, "Status: " .. text)
 		end
 	end
 end
@@ -7377,7 +7585,7 @@ local function worldAuthority(W, userId)
 end
 
 guardSec:Paragraph({
-	Title = "Mengikuti Auto Factory dan Dirt Farm",
+	Title = "Mengikuti Auto Factory, Dirt Farm, dan Clear World",
 	Desc = "Jika pemain selain owner/admin world hadir, farm dijeda dan keluar ke lobby. Masuk kembali setiap 3 menit dan lanjut hanya setelah world aman.",
 })
 
@@ -7405,6 +7613,7 @@ function Guard.leaveAndWait(W)
 		seedId = Factory.seedId, phase = Factory.phase,
 		resumePNB = Factory.resumePNB, resumeCollect = Factory.resumeCollect,
 		spacing = Farm.spacing, breakBg = Farm.breakBg, patchLava = Farm.patchLava,
+		clearWorld = Farm.clearWorld,
 	}
 	Guard.saved = saved
 	if Farm.running then Farm.stop("penjaga: menunggu world aman") end
@@ -7484,7 +7693,7 @@ end)
 -- ---- Tab Info ----
 infoTab:Section({ Title = "Fitur", Opened = true }):Paragraph({
 	Title = "Sudah ada",
-	Desc = "1) Auto Factory: harvest hingga blok penuh/tak ada tree, PNB hingga blok habis/seed penuh, plant hingga seed habis, lalu ulangi. 2) Auto Harvest/Plant terpisah. 3) PNB. 4) Dirt Farm.",
+	Desc = "1) Auto Factory: harvest hingga blok penuh/tak ada tree, PNB hingga blok habis/seed penuh, plant hingga seed habis, lalu ulangi. 2) Auto Harvest/Plant terpisah. 3) PNB. 4) Dirt Farm. 5) Auto Clear World.",
 })
 
 infoTab:Section({ Title = "Keamanan", Opened = true }):Paragraph({
@@ -7684,10 +7893,12 @@ Hub.debug = {
 	PNB = PNB,
 	Factory = Factory,
 	Guard = Guard,
+	Clear = Clear,
 	Dig = Dig,
 	Place = Place,
 	Path = Path,
 	startFarm = startFarm,
+	startClearWorld = startClearWorld,
 	startPNB = startPNB,
 	startFactory = startFactory,
 	sweepFloor = sweepFloor,
@@ -7797,10 +8008,10 @@ function Hub.recovery.resume()
 								Farm.spacing = tonumber(current.spacing) or Farm.spacing
 								Farm.breakBg = current.breakBg ~= false
 								Farm.patchLava = current.patchLava ~= false
-								startFarm()
+								if current.clearWorld then startClearWorld() else startFarm() end
 								if Farm.running then
 									Hub.recovery.write({})
-									log("Dirt Farm: dilanjutkan setelah world aman")
+										log((current.clearWorld and "Auto Clear" or "Dirt Farm") .. ": dilanjutkan setelah world aman")
 									return
 								end
 								task.wait(2)

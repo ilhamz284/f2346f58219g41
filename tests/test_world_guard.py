@@ -64,6 +64,8 @@ assert(exits==3 and stored.mode=="factory" and stored.phase=="plant" and stored.
 assert(stored.seedId==4585 and not Factory.running)
 stored={}; Guard.tick(); clock=1000; Guard.tick()
 assert(not Guard.enabled and enters==2, "manual cancellation prevents another join")
+stored=nil;Farm.running=true;Farm.clearWorld=true;Factory.running=false;picker=false;state.active=true
+Guard.tick();assert(stored.clearWorld==true and stored.mode=="dirt", "preserve Clear World mode while outside")
 print("PASS owner/admin exemption, ordinary/staff presence, repeated 180-second waits, safe resume, cancellation")
 '''
 retry = extract("\t\t\twhile not Hub.dead and not refused do", '\n\t\t\tif not Hub.dead and not refused then log("Factory: percobaan')
