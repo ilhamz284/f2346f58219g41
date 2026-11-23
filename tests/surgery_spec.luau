@@ -87,13 +87,27 @@ end
 task.spawn(function()
 	reset()
 	chosen({status = "Heart stopped", usable = {defib = true, sponge = true}, pool = 5}, 4312)
+	chosen({status = "Heart stopped", usable = {sponge = true}, pool = 4.5}, 1258)
+	chosen({status = "Heart stopped", pulse = "Extremely weak", pool = 1,
+		usable = {transfusion = true, defib = true}}, 4310)
 	chosen({pool = 4, usable = {sponge = true, transfusion = true}, pulse = "Weak"}, 1258)
 	chosen({woozy = true, pool = 2, usable = {sponge = true}}, 1258)
 	chosen({pulse = "Weak", usable = {transfusion = true, scalpel = true}}, 4310)
+	chosen({pulse = "Extremely weak", usable = {transfusion = true, splint = true}}, 4310)
 	chosen({bleed = 2, usable = {clamp = true}}, 4314)
 	chosen({woozy = true, pool = 0, usable = {sponge = true}}, 1258)
 	chosen({status = "Coming to", incisions = 1, dirt = 3, bleed = 0.5,
 		usable = {anesthetic = true, antiseptic = true, clamp = true}}, 1262)
+	chosen({status = "Coming to", incisions = 1, pulse = "Weak",
+		usable = {anesthetic = true, transfusion = true}}, 1262)
+	chosen({status = "Coming to", incisions = 1, pulse = "Extremely weak",
+		usable = {anesthetic = true, transfusion = true}}, 4310)
+	chosen({diagnosis = "Broken Leg", bones = {0,1}, fixed = true, incisions = 1,
+		bleed = 3.5, dirt = 3, fever = 1, usable = {antiseptic = true, clamp = true}}, 4314)
+	chosen({diagnosis = "Broken Leg", bones = {1,0}, fixed = true, dirt = 3, fever = 1,
+		temp = 103.6, usable = {antibiotics = true, antiseptic = true, splint = true}}, 1264)
+	chosen({diagnosis = "Broken Leg", bones = {1,0}, fixed = true, dirt = 3, fever = 3,
+		temp = 108, usable = {antibiotics = true, antiseptic = true, splint = true}}, 1266)
 	chosen({incisions = 1, dirt = 1, bleed = 0.5, canFix = true,
 		usable = {anesthetic = true, antiseptic = true, clamp = true}}, 1264)
 	chosen({incisions = 1, need = 2, bleed = 0.5,
@@ -103,7 +117,9 @@ task.spawn(function()
 		bleed = 1, dirt = 3, fever = 2, temp = 100, status = "Awake",
 		usable = {stitches = true, antiseptic = true, antibiotics = true, anesthetic = true}}, 1270)
 	chosen({diagnosis = "Broken Arm", bones = {1,0}, fixed = true, bleed = 1,
-		usable = {stitches = true, splint = true}}, 1268)
+		usable = {stitches = true, splint = true}}, 1270)
+	chosen({diagnosis = false, fixed = true, bleed = 1, status = "Awake",
+		usable = {stitches = true, antiseptic = true, ultrasound = true}}, 1270)
 	chosen({diagnosis = "Broken Arm", bones = {0,0}, fixed = true, bleed = 1,
 		temp = 109, fever = 3, usable = {stitches = true, antibiotics = true}}, 1266)
 	local fix = Surgery.choose(patient({incisions = 1, bleed = 0.5, canFix = true,
@@ -116,6 +132,19 @@ task.spawn(function()
 	chosen({diagnosis = false, usable = {labkit = true}}, 4318)
 	chosen({bones = {1,0}, usable = {splint = true}}, 1268)
 	chosen({bones = {0,1}, usable = {pins = true}}, 4308)
+	chosen({diagnosis = "Broken Leg", bones = {0,1}, fixed = true, need = false,
+		status = "Awake", usable = {anesthetic = true, scalpel = true, stitches = true}}, 1262)
+	chosen({diagnosis = "Broken Leg", bones = {0,1}, fixed = true, need = false,
+		usable = {anesthetic = true, scalpel = true, stitches = true}}, 1260)
+	chosen({diagnosis = "Broken Leg", bones = {0,1}, fixed = true, need = false, incisions = 1,
+		usable = {anesthetic = true, scalpel = true, stitches = true}}, 1260)
+	chosen({diagnosis = "Broken Leg", bones = {0,1}, fixed = true, need = false,
+		status = "Near coma", incisions = 1, usable = {anesthetic = true, pins = true, stitches = true}}, 4308)
+	chosen({status = "Near coma", fixed = false, incisions = 0, need = 1,
+		usable = {anesthetic = true, scalpel = true}}, 1260)
+	local noStitch = Surgery.choose(patient({fixed = true, need = false, incisions = 0,
+		bleed = 0, usable = {stitches = true}}), inv)
+	assert(not noStitch, "do not stitch a patient without incisions or bleeding")
 	chosen({need = 2, incisions = 1, usable = {scalpel = true}}, 1260)
 	chosen({fixed = true, incisions = 1, usable = {stitches = true}}, 1270)
 	chosen({fixed = true, incisions = 1, usable = {stitches = true, labkit = true, ultrasound = true}}, 1270)
@@ -178,6 +207,29 @@ task.spawn(function()
 	assert(Surgery.won == 1 and #calls == 3 and #queue == 0)
 	Surgery.stop()
 	print("PASS observed incision bleeding, failed Fix It retry and stitch completion without Clamp starvation")
+
+	-- Train-E nyata mengubah tulang hancur -> patah setelah Pins. Near coma
+	-- tetap menawarkan anesthetic, tetapi tidak boleh diberi dosis lagi.
+	binding, gen = reset()
+	local function fractured(status, incisions, bones, pins)
+		return patient({diagnosis = "Broken Leg", fixed = true, need = false,
+			status = status, incisions = incisions, bones = bones, bleed = incisions * 0.5,
+			usable = {anesthetic = true, scalpel = true, pins = pins, splint = true,
+				stitches = true, sponge = true, labkit = true}})
+	end
+	Surgery.state = fractured("Awake", 0, {0,1}, false)
+	queue = {
+		{action = "use", arg = 1262, payload = {state = fractured("Unconscious", 0, {0,1}, false)}},
+		{action = "use", arg = 1260, payload = {state = fractured("Coming to", 1, {0,1}, true)}},
+		{action = "use", arg = 1262, payload = {state = fractured("Near coma", 1, {0,1}, true)}},
+		{action = "use", arg = 4308, payload = {state = fractured("Near coma", 1, {1,0}, true)}},
+		{action = "use", arg = 1270, payload = {state = fractured("Near coma", 0, {1,0}, true)}},
+		{action = "use", arg = 1268, payload = {state = patient({done = "won"})}},
+	}
+	for _=1,7 do Surgery.step(binding, gen) end
+	assert(Surgery.won == 1 and #calls == 6 and #queue == 0)
+	Surgery.stop()
+	print("PASS shattered-bone incision, Pins, closure before external Splint and no extra anesthetic in Near coma")
 
 	binding, gen = reset()
 	Surgery.stop()

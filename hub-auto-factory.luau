@@ -31,7 +31,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.140",
+	version = "0.4.141",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -6232,6 +6232,10 @@ do
 		if type(state) ~= "table" or type(state.usable) ~= "table" then return nil, nil, "kondisi pasien belum terbaca" end
 		local usable = state.usable
 		local bones = type(state.bones) == "table" and state.bones or {}
+		local shattered = (tonumber(bones[2]) or 0) > 0
+		-- Near coma masih membolehkan tombol anesthetic, tetapi dosis tambahan
+		-- membunuh pasien. Hanya beri obat saat sadar atau mulai bangun.
+		local needsAnesthetic = state.status == "Awake" or state.status == "Coming to"
 		local function use(key)
 			local tool = byKey[key]
 			if inv:count(tool[2]) <= 0 then return nil, nil, "alat habis: " .. tool[3] end
@@ -6239,36 +6243,60 @@ do
 		end
 		local function number(key) return tonumber(state[key]) or 0 end
 		if state.status == "Heart stopped" then
+			-- Pada darah yang sangat rendah, Defibrillator saja membuat jantung
+			-- langsung berhenti lagi pada aksi yang sama. Isi darah lebih dulu.
+			if state.pulse == "Extremely weak" and usable.transfusion then return use("transfusion") end
 			if usable.defib then return use("defib") end
+			-- Darah/woozy dapat membatasi seluruh panel ke Sponge, termasuk
+			-- ketika jantung berhenti. Buka akses dulu, lalu pilih Defibrillator.
+			if usable.sponge then return use("sponge") end
 			return nil, nil, "Defibrillator belum bisa dipakai; periksa pasien secara manual"
 		end
 		if (number("pool") >= 4 or state.woozy) and usable.sponge then return use("sponge") end
-		if state.pulse == "Weak" and usable.transfusion then return use("transfusion") end
+		if state.pulse == "Extremely weak" and usable.transfusion then return use("transfusion") end
+		if number("temp") > 107 and usable.antibiotics then return use("antibiotics") end
+		-- Perdarahan luar tanpa sayatan bisa dijahit sebelum diagnosis/bius.
+		-- Menghentikan sumber darah lebih awal mencegah rangkaian transfusi.
+		if number("incisions") == 0 and number("bleed") > 0 and usable.stitches then return use("stitches") end
 		-- Pasien yang mulai sadar saat luka terbuka perlu dibius sebelum aksi lain.
-		if number("incisions") > 0 and usable.anesthetic and state.status ~= "Unconscious" then return use("anesthetic") end
-		-- Setelah masalah utama dan tulang selesai, tutup sumber perdarahan.
+		if (number("incisions") > 0 or shattered) and usable.anesthetic
+			and needsAnesthetic then return use("anesthetic") end
+		if state.pulse == "Weak" and usable.transfusion then return use("transfusion") end
+		-- Setelah masalah organ dan tulang hancur selesai, tutup sumber darah.
+		-- Tulang yang tinggal patah bisa ditangani Splint dari luar setelah jahit.
 		-- Menunda jahit demi kebersihan/diagnostik bisa memicu siklus darah,
 		-- infeksi, dan transfusi meski tulangnya sudah berhasil diperbaiki.
 		if state.fixed and state.diagnosis and usable.stitches and number("temp") <= 107
-			and (tonumber(bones[1]) or 0) == 0 and (tonumber(bones[2]) or 0) == 0
+			and not shattered
 			and (number("incisions") > 0 or number("bleed") > 0) then return use("stitches") end
-		if (number("temp") > 100 or number("fever") > 0) and usable.antibiotics then return use("antibiotics") end
-		if number("dirt") > 0 and usable.antiseptic then return use("antiseptic") end
 		-- Luka terbuka tetap menghasilkan perdarahan ringan setelah Clamp.
 		-- Mengejar nol membuat bot mengulang Clamp dan tidak pernah Fix It / jahit.
+		-- Perdarahan berat didahulukan dari kebersihan agar transfusi tidak
+		-- dihabiskan untuk mengganti darah yang terus hilang setiap aksi.
 		if number("bleed") > math.max(1, number("incisions") * 0.5) and usable.clamp then return use("clamp") end
+		-- Lokasi kotor dapat langsung menimbulkan infeksi lagi pada aksi yang
+		-- sama setelah antibiotik berhasil. Bersihkan dulu jika suhu belum kritis.
+		if number("dirt") > 0 and usable.antiseptic then return use("antiseptic") end
+		if (number("temp") > 100 or number("fever") > 0) and usable.antibiotics then return use("antibiotics") end
 		if number("fever") > 0 and not usable.antibiotics and usable.labkit then return use("labkit") end
-		if not state.fixed and usable.anesthetic and state.status ~= "Unconscious" then return use("anesthetic") end
+		if not state.fixed and usable.anesthetic and needsAnesthetic then return use("anesthetic") end
 		if not state.diagnosis then
 			if usable.ultrasound then return use("ultrasound") end
 			if usable.labkit then return use("labkit") end
 		end
 		if (tonumber(bones[1]) or 0) > 0 and usable.splint then return use("splint") end
-		if (tonumber(bones[2]) or 0) > 0 and usable.pins then return use("pins") end
+		if shattered then
+			if usable.pins then return use("pins") end
+			-- fixed hanya menandai masalah organ; tulang hancur tetap perlu
+			-- dibuka sampai server menyediakan Pins, walau need tidak ada.
+			if usable.scalpel then return use("scalpel") end
+			return nil, nil, "Pins belum tersedia; periksa akses ke tulang hancur"
+		end
 		-- Ikuti syarat tombol Fix It milik UI game, termasuk hambatan visibilitas.
 		if state.canFix and not (usable.sponge and not usable.anesthetic) then return "fix", nil, "Fix It!" end
 		if not state.fixed and number("incisions") < number("need") and usable.scalpel then return use("scalpel") end
-		if usable.stitches and (state.fixed or not state.need or number("need") == 0) then return use("stitches") end
+		if usable.stitches and (number("incisions") > 0 or number("bleed") > 0)
+			and (state.fixed or not state.need or number("need") == 0) then return use("stitches") end
 		if number("pool") > 0 and usable.sponge then return use("sponge") end
 		if not state.fixed and usable.labkit then return use("labkit") end
 		if not state.fixed and usable.ultrasound then return use("ultrasound") end
