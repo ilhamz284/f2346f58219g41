@@ -143,6 +143,8 @@ ui_prelude = r'''
 do
 local Farm={running=false,clearWorld=false,status="idle"}
 local PNB,Factory={running=false,stop=function() end},{running=false,stop=function() end}
+local surgeryStops=0
+local Surgery={stop=function() surgeryStops+=1 end}
 local clearStarts,dirtStarts,stops=0,0,0
 local suppressed=0
 local controls={}
@@ -189,6 +191,7 @@ clear:Set(true);assert(dirt.value and not clear.value and stops==1)
 dirt:Set(false);assert(not clear.value and not dirt.value and stops==2)
 clear:Set(true);controls["Stop & lepas semua tombol"].Callback()
 assert(not Farm.running and not clear.value and not dirt.value and stops==3)
+assert(surgeryStops==1,"shared Stop also pauses Auto Surgery")
 assert(suppressed>0,"programmatic status updates suppress deferred WindUI callbacks")
 print("PASS actual UI callbacks, mutual toggle synchronization and shared Stop button")
 end

@@ -31,7 +31,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.138",
+	version = "0.4.139",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -2143,6 +2143,10 @@ local function descendTo(fromFloorY, toFloorY, corner, gen)
 end
 
 local function startFarm()
+	if Hub.surgery and Hub.surgery.running then
+		setStatus("gagal: matikan Auto Surgery terlebih dahulu")
+		return
+	end
 	if Farm.running then
 		return
 	end
@@ -2870,6 +2874,10 @@ end
 local dropSweepTile
 
 local function startPNB()
+	if Hub.surgery and Hub.surgery.running then
+		setPNBStatus("gagal: matikan Auto Surgery terlebih dahulu")
+		return
+	end
 	if PNB.running then
 		return
 	end
@@ -4139,6 +4147,7 @@ function Clear.work(W, target, canAct)
 end
 
 local function startClearWorld()
+	if Hub.surgery and Hub.surgery.running then return false, "Matikan Auto Surgery terlebih dahulu." end
 	if Farm.running then return Farm.clearWorld, "Matikan Auto Dirt Farm terlebih dahulu." end
 	if PNB.running or Factory.running then
 		return false, "Matikan PNB atau Auto Harvest/Plant terlebih dahulu."
@@ -5875,6 +5884,10 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 end
 
 local function startFactory(resume)
+	if Hub.surgery and Hub.surgery.running then
+		setFactoryStatus("gagal: matikan Auto Surgery terlebih dahulu")
+		return false
+	end
 	if Factory.running then
 		return true
 	end
@@ -6185,6 +6198,269 @@ function Factory.setMode(mode, on)
 	elseif Factory.running and not Factory.harvest and not Factory.plant and not Factory.cycle then
 		Factory.stop("dimatikan dari toggle")
 	end
+end
+
+--// ===== 7a. AUTO SURGERY =====
+local Surgery = {
+	running = false, gen = 0, status = "idle", won = 0, lost = 0, steps = 0,
+	onStatus = nil :: any, binding = nil :: any, pending = nil :: any, state = nil :: any,
+}
+Hub.surgery = Surgery
+do
+	-- Nama aksi dan ID mengikuti SurgeryUI game; hanya gunakan opsi dari server.
+	local tools = {
+		{ "sponge", 1258, "Sponge" }, { "anesthetic", 1262, "Anesthetic" },
+		{ "stitches", 1270, "Stitches" }, { "scalpel", 1260, "Scalpel" },
+		{ "ultrasound", 4316, "Ultrasound" }, { "antiseptic", 1264, "Antiseptic" },
+		{ "labkit", 4318, "Lab Kit" }, { "antibiotics", 1266, "Antibiotics" },
+		{ "transfusion", 4310, "Transfusion" }, { "splint", 1268, "Splint" },
+		{ "pins", 4308, "Pins" }, { "clamp", 4314, "Clamp" }, { "defib", 4312, "Defibrillator" },
+	}
+	local byKey = {}
+	for _, tool in ipairs(tools) do byKey[tool[1]] = tool end
+	function Surgery.say(message)
+		Surgery.status = message
+		if Surgery.onStatus then pcall(Surgery.onStatus, message) end
+	end
+	function Surgery.stop(reason)
+		Surgery.running = false
+		Surgery.gen += 1
+		-- Tidak mengirim quit: operasi yang dijeda tetap bisa dilanjutkan manual.
+		Surgery.say(reason or "Auto Surgery dimatikan")
+	end
+	function Surgery.choose(state, inv)
+		if type(state) ~= "table" or type(state.usable) ~= "table" then return nil, nil, "kondisi pasien belum terbaca" end
+		local usable = state.usable
+		local function use(key)
+			local tool = byKey[key]
+			if inv:count(tool[2]) <= 0 then return nil, nil, "alat habis: " .. tool[3] end
+			return "use", tool[2], tool[3]
+		end
+		local function number(key) return tonumber(state[key]) or 0 end
+		if state.status == "Heart stopped" then
+			if usable.defib then return use("defib") end
+			return nil, nil, "Defibrillator belum bisa dipakai; periksa pasien secara manual"
+		end
+		if (number("pool") >= 4 or (state.woozy and number("pool") >= 2)) and usable.sponge then return use("sponge") end
+		if state.pulse == "Weak" and usable.transfusion then return use("transfusion") end
+		if number("bleed") > 0 and usable.clamp then return use("clamp") end
+		if (number("temp") > 100 or number("fever") > 0) and usable.antibiotics then return use("antibiotics") end
+		if number("dirt") > 0 and usable.antiseptic then return use("antiseptic") end
+		if usable.anesthetic and state.status ~= "Unconscious" then return use("anesthetic") end
+		if not state.diagnosis then
+			if usable.ultrasound then return use("ultrasound") end
+			if usable.labkit then return use("labkit") end
+		end
+		local bones = type(state.bones) == "table" and state.bones or {}
+		if (tonumber(bones[1]) or 0) > 0 and usable.splint then return use("splint") end
+		if (tonumber(bones[2]) or 0) > 0 and usable.pins then return use("pins") end
+		-- Ikuti syarat tombol Fix It milik UI game, termasuk hambatan visibilitas.
+		if state.canFix and not (usable.sponge and not usable.anesthetic) then return "fix", nil, "Fix It!" end
+		if not state.fixed and number("incisions") < number("need") and usable.scalpel then return use("scalpel") end
+		if usable.stitches and (state.fixed or not state.need or number("need") == 0) then return use("stitches") end
+		if number("pool") > 0 and usable.sponge then return use("sponge") end
+		if not state.fixed and usable.labkit then return use("labkit") end
+		if not state.fixed and usable.ultrasound then return use("ultrasound") end
+		return nil, nil, "tidak ada langkah surgery yang sesuai; lanjutkan manual"
+	end
+	function Surgery.detach()
+		local binding = Surgery.binding
+		if binding and binding.original then pcall(hookfunction, binding.render, binding.original) end
+		Surgery.binding, Surgery.state = nil, nil
+	end
+	function Surgery.attach()
+		local W, inv = Bind.W, Bind.inv
+		local open = W and W.surgery and W.surgery.open
+		if Surgery.binding and Surgery.binding.open == open and Surgery.binding.inv == inv
+			and Surgery.binding.W == W and Surgery.binding.grid == W.fg
+			and Surgery.binding.world == W.name then return Surgery.binding end
+		Surgery.detach()
+		if type(open) ~= "function" or type(hookfunction) ~= "function" or type(debug.setupvalue) ~= "function" then
+			return nil, "executor atau modul Surgery belum siap"
+		end
+		local binding = { W = W, grid = W.fg, world = W.name, inv = inv, open = open, context = Bind.context }
+		local ok, info = pcall(debug.getinfo, open)
+		if not ok then return nil, "fungsi Surgery tidak terbaca" end
+		for i = 1, info.nups or 0 do
+			local read, value = pcall(debug.getupvalue, open, i)
+			if read and type(value) == "function" then
+				local inspected, data = pcall(debug.getinfo, value)
+				if inspected and (data.name == "call" or data.name == "render") then binding[data.name] = value end
+			elseif read and type(value) == "boolean" then binding.busyIndex = i
+			elseif read and (value == 4296 or value == 8558) then binding.kindIndex = i end
+		end
+		if not binding.call or not binding.render or not binding.busyIndex then return nil, "binding Surgery tidak lengkap" end
+		local original
+		local hooked, err = pcall(function()
+			original = hookfunction(binding.render, function(state, ...)
+				if Surgery.binding == binding and not Hub.dead and Bind.W == W
+					and W.fg == binding.grid and W.name == binding.world then
+					Surgery.state = state
+				end
+				return original(state, ...)
+			end)
+		end)
+		if not hooked then return nil, "gagal membaca pembaruan Surgery: " .. tostring(err) end
+		binding.original = original
+		Surgery.binding = binding
+		return binding
+	end
+	function Surgery.alive(gen, binding)
+		local s = Bind.state()
+		return not Hub.dead and Surgery.running and Surgery.gen == gen and Bind.W == binding.W
+			and Bind.inv == binding.inv and binding.W.fg == binding.grid
+			and Bind.name == binding.world and binding.W.name == binding.world
+			and s and s.active and not s.dead and not worldPickerVisible()
+	end
+	function Surgery.request(binding, gen, action, ...)
+		if not Surgery.alive(gen, binding) then return nil, "karakter keluar atau operasi dihentikan" end
+		if Surgery.pending or debug.getupvalue(binding.open, binding.busyIndex) then return nil, "request Surgery lain masih berjalan" end
+		local args = table.pack(...)
+		local pending = { done = false }
+		Surgery.pending = pending
+		debug.setupvalue(binding.open, binding.busyIndex, true)
+		task.spawn(function()
+			local result = table.pack(pcall(binding.call, "Surgery", action, table.unpack(args, 1, args.n)))
+			local payload = result[1] and result[2]
+			-- Saat dijeda, ACK tetap diterapkan sekali. Snapshot world baru tidak
+			-- boleh dikurangi lagi oleh jawaban operasi dari world sebelumnya.
+			local sameWorld = Bind.W == binding.W and Bind.inv == binding.inv
+				and binding.W.fg == binding.grid and binding.W.name == binding.world and Bind.name == binding.world
+			if type(payload) == "table" and sameWorld then
+				local applied, err = pcall(function()
+					if payload.removed then binding.inv:remove(payload.removed, 1) end
+					for _, item in ipairs(payload.add or {}) do binding.inv:add(item[1], item[2]) end
+					if not Hub.dead and Surgery.binding == binding then
+						if action == "peek" and binding.kindIndex then
+							debug.setupvalue(binding.open, binding.kindIndex, payload.train and 8558 or 4296)
+						end
+						if type(payload.state) == "table" then binding.render(payload.state) end
+					end
+				end)
+				if not applied then pending.error = "gagal memperbarui operasi: " .. tostring(err) end
+			end
+			pcall(debug.setupvalue, binding.open, binding.busyIndex, false)
+			pending.result, pending.done = result, true
+			if Surgery.pending == pending then Surgery.pending = nil end
+		end)
+		local deadline = os.clock() + 12
+		while not pending.done and Surgery.alive(gen, binding) and os.clock() < deadline do task.wait(0.1) end
+		if not pending.done then return nil, "jawaban Surgery belum diterima; tunggu sebelum mencoba lagi" end
+		if pending.error then return nil, pending.error end
+		local result = pending.result
+		if not result[1] then return nil, "koneksi Surgery gagal: " .. tostring(result[2]) end
+		if type(result[2]) ~= "table" then return nil, tostring(result[3] or "server menolak langkah Surgery") end
+		if action ~= "peek" and type(result[2].state) ~= "table" then return nil, "server tidak mengirim kondisi pasien" end
+		return result[2]
+	end
+	function Surgery.nearest(binding)
+		local c, W = binding.context, binding.W
+		if not c or type(c.inReach) ~= "function" then return nil end
+		local s = Bind.state()
+		if not s then return nil end
+		local nearest, distance
+		for y, row in pairs(W.fg or {}) do
+			for x, id in pairs(row) do
+				local def = c.Items and c.Items[id]
+				if def and def.surgE and not (W.surgOn and W.surgOn[y * W.w + x]) then
+					local ok, reachable = pcall(c.inReach, x, y)
+					local d = (x + 0.5 - s.x)^2 + (y + 0.5 - s.y)^2
+					if ok and reachable and (not distance or d < distance) then
+						nearest, distance = { x = x, y = y }, d
+					end
+				end
+			end
+		end
+		return nearest
+	end
+	function Surgery.step(binding, gen)
+		if not Surgery.alive(gen, binding) then return 0.2 end
+		if debug.getupvalue(binding.open, binding.busyIndex) then return 0.2 end
+		local state = Surgery.state
+		if state and state.done then
+			Surgery.state = nil
+			Surgery.steps = 0
+			if state.done ~= "won" then
+				Surgery.lost += 1
+				Surgery.stop("operasi gagal: " .. tostring(state.why or "pasien tidak tertolong"))
+				return 1
+			end
+			Surgery.won += 1
+			Surgery.say(string.format("operasi selesai | berhasil %d | gagal %d; mencari robot berikutnya", Surgery.won, Surgery.lost))
+			return 1
+		end
+		if not state then
+			local target = Surgery.nearest(binding)
+			if not target then
+				Surgery.say("menunggu Surg-E / Train-E dalam jangkauan; operasi manual terbaca setelah langkah berikutnya")
+				return 1
+			end
+			for _, tool in ipairs(tools) do
+				if binding.inv:count(tool[2]) <= 0 then
+					Surgery.say("siapkan alat sebelum mulai: " .. tool[3])
+					return 2
+				end
+			end
+			local peek, reason = Surgery.request(binding, gen, "peek", target.x, target.y)
+			if not Surgery.alive(gen, binding) then return 1 end
+			if not peek then Surgery.stop(reason); return 1 end
+			Surgery.say(string.format("memulai %s (%d,%d)", peek.train and "Train-E" or "Surg-E", target.x, target.y))
+			local started, err = Surgery.request(binding, gen, "start", target.x, target.y)
+			if not Surgery.alive(gen, binding) then return 1 end
+			if not started then Surgery.stop(err) end
+			Surgery.steps = 0
+			return 0.7
+		end
+		local action, id, detail = Surgery.choose(state, binding.inv)
+		if not action then Surgery.stop(detail); return 1 end
+		if Surgery.steps >= 200 then Surgery.stop("batas langkah tercapai; periksa kondisi pasien secara manual"); return 1 end
+		Surgery.say(string.format("%s | %s | suhu %.1f | langkah %d | berhasil %d", detail,
+			tostring(state.diagnosis or "diagnosis belum diketahui"), tonumber(state.temp) or 0, Surgery.steps + 1, Surgery.won))
+		local result, reason = Surgery.request(binding, gen, action, id)
+		if not Surgery.alive(gen, binding) then return 1 end
+		if not result then Surgery.stop(reason) else Surgery.steps += 1 end
+		return 0.7
+	end
+	function Surgery.start()
+		if Surgery.running then return true end
+		if Surgery.pending then Surgery.say("request sebelumnya masih menunggu jawaban server"); return false end
+		local saved = Hub.recovery.read()
+		if Farm.running or PNB.running or Factory.running or (saved and saved.world) then
+			Surgery.say("matikan auto farming dan pemulihan world sebelum memakai Auto Surgery")
+			return false
+		end
+		Bind.resolve(true)
+		local s = Bind.state()
+		if not Bind.W or not Bind.inv or not s or not s.active or s.dead or worldPickerVisible() then
+			Surgery.say("karakter harus siap di dalam world")
+			return false
+		end
+		local binding, reason = Surgery.attach()
+		if not binding then Surgery.say(reason); return false end
+		Surgery.running = true
+		Surgery.gen += 1
+		local gen = Surgery.gen
+		Move.release()
+		Surgery.say("Auto Surgery aktif; mencari robot dalam jangkauan")
+		task.spawn(function()
+			local ok, err = pcall(function()
+				while Surgery.alive(gen, binding) do
+					if Farm.running or PNB.running or Factory.running then Surgery.stop("auto farming sedang aktif"); break end
+					task.wait(Surgery.step(binding, gen))
+				end
+			end)
+			if Surgery.running and Surgery.gen == gen then
+				Surgery.stop(ok and "berhenti: karakter keluar atau berpindah world" or ("Surgery error: " .. tostring(err)))
+			end
+		end)
+		return true
+	end
+	Hub.onUnload(function()
+		Surgery.stop("hub ditutup")
+		local binding = Surgery.binding
+		if binding then pcall(debug.setupvalue, binding.open, binding.busyIndex, false) end
+		Surgery.detach()
+	end)
 end
 
 --// ===== 8. UI (WindUI) =====
@@ -6699,10 +6975,37 @@ do
 end
 
 local pnbTab = Window:Tab({ Title = "Auto Farming", Icon = "blocks" })
+local surgeryTab = Window:Tab({ Title = "Surgery", Icon = "heart-pulse" })
 local guardTab = Window:Tab({ Title = "Penjaga World", Icon = "shield" })
 local farmTab = Window:Tab({ Title = "Dirt Farm", Icon = "pickaxe" })
 local moveTab = Window:Tab({ Title = "Gerak", Icon = "footprints" })
 local infoTab = Window:Tab({ Title = "Info", Icon = "info" })
+
+-- ---- Tab Surgery ----
+do
+	local section = surgeryTab:Section({ Title = "Auto Surgery", Opened = true })
+	section:Paragraph({
+		Title = "Cara pakai",
+		Desc = "Siapkan seluruh alat surgery, berdiri dekat Surg-E atau Train-E, lalu nyalakan Auto Surgery. Robot terdekat dalam jangkauan diproses otomatis, lalu lanjut robot berikutnya. Surg-E memakai alat dari inventory; Train-E mengikuti aturan latihan game.",
+	})
+	local toggle
+	local status = section:Paragraph({ Title = "Status Surgery", Desc = Surgery.status })
+	Surgery.onStatus = function(message)
+		if status and status.SetDesc then pcall(status.SetDesc, status, message) end
+		if toggle and toggle.Set and toggle.Value ~= Surgery.running then
+			pcall(toggle.Set, toggle, Surgery.running, false)
+		end
+	end
+	toggle = section:Toggle({
+		Title = "Auto Surgery",
+		Desc = "Pilih alat dari kondisi pasien. Matikan untuk jeda dan lanjut manual. Nyalakan sebelum memulai operasi manual agar kondisinya terbaca.",
+		Value = false,
+		Callback = function(on)
+			if on then Surgery.start() else Surgery.stop("Auto Surgery dimatikan") end
+			Surgery.onStatus(Surgery.status)
+		end,
+	})
+end
 
 -- ---- Tab Auto Farming ----
 local pnbSec = pnbTab:Section({ Title = "PNB (Place and Break)", Opened = true })
@@ -7390,6 +7693,7 @@ farmSec:Button({
 		Farm.stop("dihentikan manual")
 		PNB.stop("dihentikan manual")
 		Factory.stop("dihentikan manual")
+		Surgery.stop("dihentikan manual")
 		if farmToggle and farmToggle.Set then
 			pcall(farmToggle.Set, farmToggle, false, false)
 		end
@@ -7954,6 +8258,7 @@ Hub.debug = {
 	Farm = Farm,
 	PNB = PNB,
 	Factory = Factory,
+	Surgery = Surgery,
 	Guard = Guard,
 	Clear = Clear,
 	Dig = Dig,
