@@ -31,7 +31,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.139",
+	version = "0.4.140",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -6231,6 +6231,7 @@ do
 	function Surgery.choose(state, inv)
 		if type(state) ~= "table" or type(state.usable) ~= "table" then return nil, nil, "kondisi pasien belum terbaca" end
 		local usable = state.usable
+		local bones = type(state.bones) == "table" and state.bones or {}
 		local function use(key)
 			local tool = byKey[key]
 			if inv:count(tool[2]) <= 0 then return nil, nil, "alat habis: " .. tool[3] end
@@ -6241,17 +6242,27 @@ do
 			if usable.defib then return use("defib") end
 			return nil, nil, "Defibrillator belum bisa dipakai; periksa pasien secara manual"
 		end
-		if (number("pool") >= 4 or (state.woozy and number("pool") >= 2)) and usable.sponge then return use("sponge") end
+		if (number("pool") >= 4 or state.woozy) and usable.sponge then return use("sponge") end
 		if state.pulse == "Weak" and usable.transfusion then return use("transfusion") end
-		if number("bleed") > 0 and usable.clamp then return use("clamp") end
+		-- Pasien yang mulai sadar saat luka terbuka perlu dibius sebelum aksi lain.
+		if number("incisions") > 0 and usable.anesthetic and state.status ~= "Unconscious" then return use("anesthetic") end
+		-- Setelah masalah utama dan tulang selesai, tutup sumber perdarahan.
+		-- Menunda jahit demi kebersihan/diagnostik bisa memicu siklus darah,
+		-- infeksi, dan transfusi meski tulangnya sudah berhasil diperbaiki.
+		if state.fixed and state.diagnosis and usable.stitches and number("temp") <= 107
+			and (tonumber(bones[1]) or 0) == 0 and (tonumber(bones[2]) or 0) == 0
+			and (number("incisions") > 0 or number("bleed") > 0) then return use("stitches") end
 		if (number("temp") > 100 or number("fever") > 0) and usable.antibiotics then return use("antibiotics") end
 		if number("dirt") > 0 and usable.antiseptic then return use("antiseptic") end
-		if usable.anesthetic and state.status ~= "Unconscious" then return use("anesthetic") end
+		-- Luka terbuka tetap menghasilkan perdarahan ringan setelah Clamp.
+		-- Mengejar nol membuat bot mengulang Clamp dan tidak pernah Fix It / jahit.
+		if number("bleed") > math.max(1, number("incisions") * 0.5) and usable.clamp then return use("clamp") end
+		if number("fever") > 0 and not usable.antibiotics and usable.labkit then return use("labkit") end
+		if not state.fixed and usable.anesthetic and state.status ~= "Unconscious" then return use("anesthetic") end
 		if not state.diagnosis then
 			if usable.ultrasound then return use("ultrasound") end
 			if usable.labkit then return use("labkit") end
 		end
-		local bones = type(state.bones) == "table" and state.bones or {}
 		if (tonumber(bones[1]) or 0) > 0 and usable.splint then return use("splint") end
 		if (tonumber(bones[2]) or 0) > 0 and usable.pins then return use("pins") end
 		-- Ikuti syarat tombol Fix It milik UI game, termasuk hambatan visibilitas.

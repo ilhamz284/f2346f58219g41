@@ -90,7 +90,25 @@ task.spawn(function()
 	chosen({pool = 4, usable = {sponge = true, transfusion = true}, pulse = "Weak"}, 1258)
 	chosen({woozy = true, pool = 2, usable = {sponge = true}}, 1258)
 	chosen({pulse = "Weak", usable = {transfusion = true, scalpel = true}}, 4310)
-	chosen({bleed = 1, usable = {clamp = true}}, 4314)
+	chosen({bleed = 2, usable = {clamp = true}}, 4314)
+	chosen({woozy = true, pool = 0, usable = {sponge = true}}, 1258)
+	chosen({status = "Coming to", incisions = 1, dirt = 3, bleed = 0.5,
+		usable = {anesthetic = true, antiseptic = true, clamp = true}}, 1262)
+	chosen({incisions = 1, dirt = 1, bleed = 0.5, canFix = true,
+		usable = {anesthetic = true, antiseptic = true, clamp = true}}, 1264)
+	chosen({incisions = 1, need = 2, bleed = 0.5,
+		usable = {anesthetic = true, scalpel = true, clamp = true}}, 1260)
+	chosen({diagnosis = "Lung Tumor", fever = 1, usable = {labkit = true, scalpel = true}}, 4318)
+	chosen({diagnosis = "Broken Arm", bones = {0,0}, fixed = true, incisions = 0,
+		bleed = 1, dirt = 3, fever = 2, temp = 100, status = "Awake",
+		usable = {stitches = true, antiseptic = true, antibiotics = true, anesthetic = true}}, 1270)
+	chosen({diagnosis = "Broken Arm", bones = {1,0}, fixed = true, bleed = 1,
+		usable = {stitches = true, splint = true}}, 1268)
+	chosen({diagnosis = "Broken Arm", bones = {0,0}, fixed = true, bleed = 1,
+		temp = 109, fever = 3, usable = {stitches = true, antibiotics = true}}, 1266)
+	local fix = Surgery.choose(patient({incisions = 1, bleed = 0.5, canFix = true,
+		usable = {anesthetic = true, sponge = true, clamp = true}}), inv)
+	assert(fix == "fix", "live Lung Tumor: stable open incision must advance instead of looping Clamp")
 	chosen({fever = 1, usable = {antibiotics = true}}, 1266)
 	chosen({dirt = 2, usable = {antiseptic = true}}, 1264)
 	chosen({status = "Coming to", usable = {anesthetic = true}}, 1262)
@@ -142,6 +160,24 @@ task.spawn(function()
 	assert(calls[4].time - calls[3].time >= 0.6, "pace actions")
 	Surgery.stop()
 	print("PASS two robots through actual worker, native requests, training inventory and rewards")
+
+	-- Kondisi dari pengujian Train-E nyata: perdarahan 0.5 tetap ada setelah
+	-- sayatan, dan Fix It dapat gagal karena Surgeon Skill. Jangan loop Clamp.
+	binding, gen = reset()
+	local open = patient({diagnosis = "Nose Job", incisions = 1, bleed = 0.5, pool = 0.5, canFix = true,
+		usable = {anesthetic = true, clamp = true, labkit = true, ultrasound = true, sponge = true, stitches = true}})
+	Surgery.state = open
+	local retried = table.clone(open); retried.pool = 1
+	local repaired = table.clone(open); repaired.fixed = true; repaired.canFix = false; repaired.pool = 1.5
+	queue = {
+		{action = "fix", payload = {state = retried}},
+		{action = "fix", payload = {state = repaired}},
+		{action = "use", arg = 1270, payload = {state = patient({done = "won"})}},
+	}
+	for _=1,4 do Surgery.step(binding, gen) end
+	assert(Surgery.won == 1 and #calls == 3 and #queue == 0)
+	Surgery.stop()
+	print("PASS observed incision bleeding, failed Fix It retry and stitch completion without Clamp starvation")
 
 	binding, gen = reset()
 	Surgery.stop()
