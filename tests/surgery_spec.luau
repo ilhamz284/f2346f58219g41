@@ -108,8 +108,17 @@ task.spawn(function()
 		temp = 103.6, usable = {antibiotics = true, antiseptic = true, splint = true}}, 1264)
 	chosen({diagnosis = "Broken Leg", bones = {1,0}, fixed = true, dirt = 3, fever = 3,
 		temp = 108, usable = {antibiotics = true, antiseptic = true, splint = true}}, 1266)
-	chosen({incisions = 1, dirt = 1, bleed = 0.5, canFix = true,
-		usable = {anesthetic = true, antiseptic = true, clamp = true}}, 1264)
+	local readyFix = Surgery.choose(patient({incisions = 1, dirt = 1, bleed = 0.5, canFix = true,
+		usable = {anesthetic = true, antiseptic = true, clamp = true}}), inv)
+	assert(readyFix == "fix", "slightly dirty site must not starve the repair with Antiseptic")
+	chosen({diagnosis = false, status = "Awake", dirt = 1,
+		usable = {ultrasound = true, labkit = true, anesthetic = true, antiseptic = true}}, 4316)
+	chosen({diagnosis = "Nose Job", status = "Awake", dirt = 1,
+		usable = {ultrasound = true, anesthetic = true, antiseptic = true}}, 4316)
+	chosen({diagnosis = false, status = "Awake", dirt = 1, bones = {0,0},
+		usable = {labkit = true, anesthetic = true, antiseptic = true}}, 4318)
+	chosen({diagnosis = "Bird Flu", need = false, status = "Awake", dirt = 1, fever = 1,
+		usable = {antibiotics = true, anesthetic = true, antiseptic = true}}, 1266)
 	chosen({incisions = 1, need = 2, bleed = 0.5,
 		usable = {anesthetic = true, scalpel = true, clamp = true}}, 1260)
 	chosen({diagnosis = "Lung Tumor", fever = 1, usable = {labkit = true, scalpel = true}}, 4318)
@@ -189,6 +198,22 @@ task.spawn(function()
 	assert(calls[4].time - calls[3].time >= 0.6, "pace actions")
 	Surgery.stop()
 	print("PASS two robots through actual worker, native requests, training inventory and rewards")
+
+	binding, gen = reset()
+	Surgery.state = patient({status = "Awake", diagnosis = false, need = false, dirt = 1,
+		usable = {ultrasound = true, labkit = true, anesthetic = true, antiseptic = true}})
+	queue = {
+		{action = "use", arg = 4316, payload = {state = patient({status = "Awake", diagnosis = false,
+			need = false, dirt = 1, bones = {0,0}, usable = {labkit = true, anesthetic = true, antiseptic = true}})}},
+		{action = "use", arg = 4318, payload = {state = patient({status = "Awake", diagnosis = "Bird Flu",
+			need = false, dirt = 1, bones = {0,0}, fever = 2, temp = 103.5,
+			usable = {antibiotics = true, anesthetic = true, antiseptic = true}})}},
+		{action = "use", arg = 1266, payload = {state = patient({done = "won"})}},
+	}
+	for _=1,4 do Surgery.step(binding, gen) end
+	assert(Surgery.won == 1 and #calls == 3 and #queue == 0)
+	Surgery.stop()
+	print("PASS realistic awake patient: Ultrasound then Lab Kit then treatment, no unnecessary Antiseptic or Anesthetic")
 
 	-- Kondisi dari pengujian Train-E nyata: perdarahan 0.5 tetap ada setelah
 	-- sayatan, dan Fix It dapat gagal karena Surgeon Skill. Jangan loop Clamp.

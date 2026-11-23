@@ -31,7 +31,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.141",
+	version = "0.4.142",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -6259,9 +6259,17 @@ do
 		-- Menghentikan sumber darah lebih awal mencegah rangkaian transfusi.
 		if number("incisions") == 0 and number("bleed") > 0 and usable.stitches then return use("stitches") end
 		-- Pasien yang mulai sadar saat luka terbuka perlu dibius sebelum aksi lain.
-		if (number("incisions") > 0 or shattered) and usable.anesthetic
+		if number("incisions") > 0 and usable.anesthetic
 			and needsAnesthetic then return use("anesthetic") end
 		if state.pulse == "Weak" and usable.transfusion then return use("transfusion") end
+		-- Diagnosis dulu sebelum persiapan rutin. Nama penyakit bisa sudah
+		-- terlihat sebagai petunjuk walau Ultrasound belum dilakukan.
+		if number("incisions") == 0 and type(state.bones) ~= "table" and usable.ultrasound then return use("ultrasound") end
+		if not state.diagnosis then
+			if usable.ultrasound then return use("ultrasound") end
+			if usable.labkit then return use("labkit") end
+			return nil, nil, "diagnosis belum tersedia; periksa pasien secara manual"
+		end
 		-- Setelah masalah organ dan tulang hancur selesai, tutup sumber darah.
 		-- Tulang yang tinggal patah bisa ditangani Splint dari luar setelah jahit.
 		-- Menunda jahit demi kebersihan/diagnostik bisa memicu siklus darah,
@@ -6276,14 +6284,13 @@ do
 		if number("bleed") > math.max(1, number("incisions") * 0.5) and usable.clamp then return use("clamp") end
 		-- Lokasi kotor dapat langsung menimbulkan infeksi lagi pada aksi yang
 		-- sama setelah antibiotik berhasil. Bersihkan dulu jika suhu belum kritis.
-		if number("dirt") > 0 and usable.antiseptic then return use("antiseptic") end
+		-- 1 = Not sanitized, 2 = Unclean, 3 = Unsanitary. Jangan mengejar
+		-- Clean pada setiap aksi ketika lokasi baru sedikit kotor.
+		if number("dirt") >= 2 and usable.antiseptic then return use("antiseptic") end
 		if (number("temp") > 100 or number("fever") > 0) and usable.antibiotics then return use("antibiotics") end
 		if number("fever") > 0 and not usable.antibiotics and usable.labkit then return use("labkit") end
-		if not state.fixed and usable.anesthetic and needsAnesthetic then return use("anesthetic") end
-		if not state.diagnosis then
-			if usable.ultrasound then return use("ultrasound") end
-			if usable.labkit then return use("labkit") end
-		end
+		local needsIncision = shattered or (not state.fixed and number("incisions") < number("need"))
+		if needsIncision and usable.anesthetic and needsAnesthetic then return use("anesthetic") end
 		if (tonumber(bones[1]) or 0) > 0 and usable.splint then return use("splint") end
 		if shattered then
 			if usable.pins then return use("pins") end
