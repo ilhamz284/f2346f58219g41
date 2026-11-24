@@ -31,7 +31,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.145",
+	version = "0.4.146",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -2143,6 +2143,7 @@ local function descendTo(fromFloorY, toFloorY, corner, gen)
 end
 
 local function startFarm()
+	if Hub.ssp and Hub.ssp.running then setStatus("gagal: matikan Auto Open SSP terlebih dahulu"); return end
 	if Hub.surgery and Hub.surgery.running then
 		setStatus("gagal: matikan Auto Surgery terlebih dahulu")
 		return
@@ -2874,6 +2875,7 @@ end
 local dropSweepTile
 
 local function startPNB()
+	if Hub.ssp and Hub.ssp.running then setPNBStatus("gagal: matikan Auto Open SSP terlebih dahulu"); return end
 	if Hub.surgery and Hub.surgery.running then
 		setPNBStatus("gagal: matikan Auto Surgery terlebih dahulu")
 		return
@@ -4147,6 +4149,7 @@ function Clear.work(W, target, canAct)
 end
 
 local function startClearWorld()
+	if Hub.ssp and Hub.ssp.running then return false, "Matikan Auto Open SSP terlebih dahulu." end
 	if Hub.surgery and Hub.surgery.running then return false, "Matikan Auto Surgery terlebih dahulu." end
 	if Farm.running then return Farm.clearWorld, "Matikan Auto Dirt Farm terlebih dahulu." end
 	if PNB.running or Factory.running then
@@ -5884,6 +5887,7 @@ local function factoryCycleStep(W, inv, state, seedId, blocked, gen)
 end
 
 local function startFactory(resume)
+	if Hub.ssp and Hub.ssp.running then setFactoryStatus("gagal: matikan Auto Open SSP terlebih dahulu"); return false end
 	if Hub.surgery and Hub.surgery.running then
 		setFactoryStatus("gagal: matikan Auto Surgery terlebih dahulu")
 		return false
@@ -6468,6 +6472,7 @@ do
 		return 0.7
 	end
 	function Surgery.start()
+		if Hub.ssp and Hub.ssp.running then Surgery.say("matikan Auto Open SSP terlebih dahulu"); return false end
 		if Surgery.running then return true end
 		if Surgery.pending then Surgery.say("request sebelumnya masih menunggu jawaban server"); return false end
 		local saved = Hub.recovery.read()
@@ -6667,6 +6672,7 @@ Swiss Cheese Block Seed
 	]]):gmatch("[^\r\n]+") do
 		if name:find("%S") then sspSeedNames[name:lower()] = name end
 	end
+	Hub.sspSeedNames = sspSeedNames
 
 	local function vendNumber(value, integer)
 		if type(value) ~= "number" or value ~= value or value < 0 or value > 1e12 then
@@ -6790,6 +6796,239 @@ Swiss Cheese Block Seed
 		writefile(path, summary .. "\nSumber: " .. filename .. "\n\n" .. table.concat(changes, "\n") .. "\n")
 		return true, summary .. "\n" .. changes[1] .. "\nDaftar lengkap: " .. path, path
 	end
+end
+
+--// ===== 7d. AUTO OPEN SSP =====
+do
+	local SSP = { running = false, gen = 0, opened = 0, dropped = 0, status = "nonaktif" }
+	Hub.ssp = SSP
+
+	function SSP.say(message)
+		SSP.status = message
+		if SSP.onStatus then pcall(SSP.onStatus, message) end
+	end
+
+	function SSP.stop(reason)
+		SSP.running = false
+		SSP.gen += 1
+		SSP.say(reason or "Auto Open SSP dimatikan")
+	end
+
+	function SSP.guard(job)
+		if Hub.dead or not SSP.running or SSP.gen ~= job.gen then error("Auto Open SSP dihentikan", 0) end
+		local state = Bind.state()
+		if Bind.W ~= job.world or job.context.world ~= job.world or job.world.name ~= job.name
+			or job.world.entering ~= job.entering or job.context.inv ~= job.inv or worldPickerVisible()
+			or not state or not state.active or state.dead then
+			error("berhenti: karakter keluar atau berpindah world", 0)
+		end
+		if math.abs(state.x - job.x) > 0.8 or math.abs(state.y - job.y) > 0.8 then
+			error("berhenti: posisi pemain berubah; nyalakan lagi di tempat drop", 0)
+		end
+		if Farm.running or PNB.running or Factory.running or Surgery.running then
+			error("berhenti: fitur farm atau surgery sedang aktif", 0)
+		end
+	end
+
+	function SSP.request(job, remote, ...)
+		SSP.guard(job)
+		if SSP.pending or job.world.__HumanHubSSPPending then error("jawaban request sebelumnya masih ditunggu", 0) end
+		local pending = { done = false }
+		local args = table.pack(...)
+		SSP.pending = pending
+		job.world.__HumanHubSSPPending = pending
+		task.spawn(function()
+			pending.result = table.pack(pcall(job.world.call, remote, table.unpack(args, 1, args.n)))
+			pending.done = true
+			if SSP.pending == pending then SSP.pending = nil end
+			if job.world.__HumanHubSSPPending == pending then job.world.__HumanHubSSPPending = nil end
+		end)
+		local deadline = os.clock() + 15
+		while not pending.done and os.clock() < deadline do
+			task.wait(0.05)
+			SSP.guard(job)
+		end
+		if not pending.done then error("server belum membalas " .. remote .. "; proses dihentikan", 0) end
+		SSP.guard(job)
+		if not pending.result[1] then error("koneksi " .. remote .. " gagal", 0) end
+		return table.unpack(pending.result, 2, pending.result.n)
+	end
+
+	function SSP.isSeed(job, id)
+		local item = job.context.Items[id]
+		return item and item.kind == "seed" and type(item.name) == "string"
+			and Hub.sspSeedNames[item.name:lower()] ~= nil
+	end
+
+	function SSP.snapshot(job)
+		local bag = SSP.request(job, "GetInventory")
+		if type(bag) ~= "table" or type(bag.slots) ~= "table"
+			or type(bag.capacity) ~= "number" or bag.capacity < 1 then
+			error("inventory server belum siap", 0)
+		end
+		local counts, used = {}, 0
+		for _, slot in pairs(bag.slots) do
+			local id, count = slot[1], slot[2]
+			if type(id) ~= "number" or type(count) ~= "number" or count < 1 or count > 200
+				or id % 1 ~= 0 or count % 1 ~= 0 or counts[id] then error("isi inventory server tidak valid", 0) end
+			counts[id] = count
+			local item = job.context.Items[id]
+			if not item or item.kind ~= "tool" then used += 1 end
+		end
+		-- Pulihkan perubahan lokal onDrop hanya setelah membaca jumlah server.
+		local ids = {}
+		for id in pairs(counts) do ids[id] = true end
+		for _, slot in pairs(job.inv.slots) do ids[slot.id] = true end
+		job.inv.capacity = bag.capacity
+		for id in pairs(ids) do
+			local delta = (counts[id] or 0) - job.inv:count(id)
+			if delta < 0 then job.inv:remove(id, -delta) end
+		end
+		for id in pairs(ids) do
+			local delta = (counts[id] or 0) - job.inv:count(id)
+			if delta > 0 then job.inv:add(id, delta) end
+		end
+		for id in pairs(ids) do
+			if job.inv:count(id) ~= (counts[id] or 0) then error("inventory lokal belum sinkron dengan server", 0) end
+		end
+		return { counts = counts, free = bag.capacity - used }
+	end
+
+	function SSP.plan(job, snapshot)
+		local smallest, smallestCount
+		local full
+		for id, count in pairs(snapshot.counts) do
+			if SSP.isSeed(job, id) then
+				if count == 200 and (not full or id < full) then full = id end
+				if not smallestCount or count < smallestCount or (count == smallestCount and id < smallest) then
+					smallest, smallestCount = id, count
+				end
+			end
+		end
+		if full then return "drop", full, 200, "stack mencapai 200" end
+		if (snapshot.counts[5706] or 0) == 0 then return "done" end
+		-- Satu pack dapat menambah lima jenis seed. Bebaskan slot sedikit demi sedikit.
+		if snapshot.free < 5 then
+			if not smallest then error("slot backpack kurang dan tidak ada seed SSP yang bisa di-drop", 0) end
+			return "drop", smallest, smallestCount, "membuka ruang untuk hasil SSP"
+		end
+		return "open"
+	end
+
+	function SSP.dropAllowed(job)
+		SSP.guard(job)
+		if not job.ctrl.canDrop() then error("lokasi saat ini tidak mengizinkan drop seed", 0) end
+		local c = job.context
+		-- onDrop mengacak X antara 0.7 dan 0.8 tile dari pemain.
+		for _, offset in ipairs({0.7, 0.75, 0.8}) do
+			if job.world.displayHere(c.px + c.facing * offset) then
+				error("hadap ke tanah kosong di luar Display Box untuk drop seed", 0)
+			end
+		end
+	end
+
+	function SSP.drop(job, snapshot, id, count, reason)
+		SSP.dropAllowed(job)
+		SSP.say(string.format("drop %s ×%d: %s", job.context.Items[id].name, count, reason))
+		local last = math.max(job.world.lastDropAt or 0, SSP.lastDropAt or 0)
+		local delay = (tonumber(job.world.DROP_COOLDOWN) or 1) + 0.1 - (os.clock() - last)
+		if delay > 0 then task.wait(delay) end
+		SSP.dropAllowed(job)
+		SSP.lastDropAt = os.clock()
+		job.ctrl.onDrop(id, count)
+		for _ = 1, 5 do
+			task.wait(0.25)
+			local after = SSP.snapshot(job)
+			if (after.counts[id] or 0) == snapshot.counts[id] - count then
+				SSP.dropped += count
+				return
+			end
+		end
+		error("drop belum terkonfirmasi server; periksa seed di backpack", 0)
+	end
+
+	function SSP.step(job)
+		local before = SSP.snapshot(job)
+		local action, id, count, reason = SSP.plan(job, before)
+		if action == "done" then return false end
+		if action == "drop" then SSP.drop(job, before, id, count, reason); return true end
+		SSP.dropAllowed(job)
+		local accepted, rewards = SSP.request(job, "OpenPack", 5706)
+		if accepted ~= true then error("OpenPack ditolak: " .. tostring(rewards or "coba lagi nanti"), 0) end
+		if type(rewards) ~= "table" then error("SSP terbuka tetapi hasilnya tidak terbaca; periksa backpack", 0) end
+		local expected, total = {}, 0
+		for _, reward in pairs(rewards) do
+			local seedId, amount = reward[1], reward[2]
+			if not SSP.isSeed(job, seedId) or type(amount) ~= "number" or amount < 1 or amount % 1 ~= 0 then
+				error("hasil SSP tidak dikenal; periksa backpack sebelum lanjut", 0)
+			end
+			expected[seedId] = (expected[seedId] or 0) + amount
+			total += amount
+		end
+		local after = SSP.snapshot(job)
+		if total ~= 5 or (after.counts[5706] or 0) ~= before.counts[5706] - 1 then
+			error("jumlah SSP atau hasil pack berubah; proses dihentikan", 0)
+		end
+		for seedId, amount in pairs(expected) do
+			if (after.counts[seedId] or 0) ~= (before.counts[seedId] or 0) + amount then
+				error("hasil seed belum cocok dengan inventory server; proses dihentikan", 0)
+			end
+		end
+		SSP.opened += 1
+		SSP.say(string.format("terbuka %d SSP | sisa %d | seed di-drop %d | slot kosong %d",
+			SSP.opened, after.counts[5706] or 0, SSP.dropped, after.free))
+		return true
+	end
+
+	function SSP.attach()
+		Bind.resolve()
+		local world, state = Bind.W, Bind.state()
+		if not world or not state or not state.active or state.dead or worldPickerVisible() then
+			return nil, "masuk ke world dan berdiri di tempat drop terlebih dahulu"
+		end
+		local context = Bind.context
+		local ctrl = context and context.invUI
+		if context and context.world == world and context.inv == Bind.inv and type(context.Items) == "table"
+			and type(ctrl) == "table" and type(ctrl.onDrop) == "function" and type(ctrl.canDrop) == "function"
+			and type(world.displayHere) == "function" and type(world.call) == "function" then
+			return { world = world, name = world.name, entering = world.entering, inv = context.inv,
+				context = context, ctrl = ctrl, gen = SSP.gen, x = state.x, y = state.y }
+		end
+		return nil, "kontrol backpack belum siap"
+	end
+
+	function SSP.start()
+		if SSP.running then return true end
+		if SSP.pending then SSP.say("tunggu request server sebelumnya selesai"); return false end
+		local saved = Hub.recovery.read()
+		if Farm.running or PNB.running or Factory.running or Surgery.running or (saved and saved.world) then
+			SSP.say("matikan auto farming, surgery, dan pemulihan world terlebih dahulu"); return false
+		end
+		local job, reason = SSP.attach()
+		if not job then SSP.say(reason); return false end
+		if job.world.__HumanHubSSPPending then SSP.say("tunggu request Auto Open SSP sebelumnya selesai"); return false end
+		if job.inv:count(5706) < 1 then SSP.say("Small Seed Pack tidak ada di backpack"); return false end
+		SSP.gen += 1
+		job.gen = SSP.gen
+		SSP.running, SSP.opened, SSP.dropped = true, 0, 0
+		Move.release()
+		SSP.say("Auto Open SSP aktif")
+		task.spawn(function()
+			local ok, err = pcall(function()
+				SSP.dropAllowed(job)
+				while SSP.running and SSP.gen == job.gen do
+					if not SSP.step(job) then
+						SSP.stop(string.format("selesai: %d SSP terbuka, %d seed di-drop", SSP.opened, SSP.dropped))
+						return
+					end
+					task.wait(0.35)
+				end
+			end)
+			if not ok and SSP.running and SSP.gen == job.gen then SSP.stop(tostring(err)) end
+		end)
+		return true
+	end
+	Hub.onUnload(function() SSP.stop("hub ditutup") end)
 end
 
 --// ===== 8. UI (WindUI) =====
@@ -7337,6 +7576,45 @@ do
 end
 
 -- ---- Tab Auto Farming ----
+do
+	local SSP = Hub.ssp
+	local section = pnbTab:Section({ Title = "Auto Open SSP", Opened = true })
+	section:Paragraph({
+		Title = "Buka SSP dari backpack",
+		Desc = "Berdiri dan hadap ke tempat drop di tanah, lalu aktifkan. Seed SSP yang mencapai 200 di-drop lebih dulu. Jika slot jenis kurang untuk hasil pack, drop stack seed terkecil satu per satu sampai ada ruang. Selesai saat SSP habis.",
+	})
+	local status = section:Paragraph({ Title = "Status Open SSP", Desc = SSP.status })
+	local toggle
+	local statusLabel
+	SSP.onStatus = function(message)
+		if status.SetDesc then status:SetDesc(message) end
+		if statusLabel and statusLabel.Parent then statusLabel.Text = message end
+		if toggle and toggle.Set and toggle.Value ~= SSP.running then
+			SSP.syncingUI = true
+			pcall(toggle.Set, toggle, SSP.running, false)
+			SSP.syncingUI = false
+		end
+	end
+	toggle = section:Toggle({
+		Title = "Auto Open SSP + Drop",
+		Desc = "Pakai Small Seed Pack di backpack. Drop dilakukan mengikuti arah hadap pemain.",
+		Value = false,
+		Callback = function(on)
+			if SSP.syncingUI then return end
+			if on then SSP.start() else SSP.stop("Auto Open SSP dimatikan") end
+			SSP.onStatus(SSP.status)
+		end,
+	})
+	task.spawn(function()
+		task.wait(0.5)
+		local root = uiContainer()
+		if root and not Hub.dead and Hub.findParagraphLabel then
+			statusLabel = Hub.findParagraphLabel(root, "Status Open SSP")
+			if statusLabel then statusLabel.Text = SSP.status end
+		end
+	end)
+end
+
 local pnbSec = pnbTab:Section({ Title = "PNB (Place and Break)", Opened = true })
 local pnbStatusPara
 local pnbToggle
@@ -8023,6 +8301,7 @@ farmSec:Button({
 		PNB.stop("dihentikan manual")
 		Factory.stop("dihentikan manual")
 		Surgery.stop("dihentikan manual")
+		Hub.ssp.stop("dihentikan manual")
 		if farmToggle and farmToggle.Set then
 			pcall(farmToggle.Set, farmToggle, false, false)
 		end
@@ -8627,6 +8906,7 @@ Hub.debug = {
 	PNB = PNB,
 	Factory = Factory,
 	Surgery = Surgery,
+	SSP = Hub.ssp,
 	Guard = Guard,
 	Clear = Clear,
 	Dig = Dig,
