@@ -31,7 +31,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.147",
+	version = "0.4.148",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -6838,7 +6838,11 @@ do
 		SSP.pending = pending
 		job.world.__HumanHubSSPPending = pending
 		task.spawn(function()
-			pending.result = table.pack(pcall(job.world.call, remote, table.unpack(args, 1, args.n)))
+			if remote == "TakeDrop" then
+				pending.result = table.pack(pcall(job.world.takeDrop, table.unpack(args, 1, args.n)))
+			else
+				pending.result = table.pack(pcall(job.world.call, remote, table.unpack(args, 1, args.n)))
+			end
 			pending.done = true
 			if SSP.pending == pending then SSP.pending = nil end
 			if job.world.__HumanHubSSPPending == pending then job.world.__HumanHubSSPPending = nil end
@@ -6906,7 +6910,7 @@ do
 			end
 		end
 		if full then return "drop", full, 200, "stack mencapai 200" end
-		if (snapshot.counts[5706] or 0) == 0 then return "done" end
+		if (snapshot.counts[5706] or 0) == 0 then return "refill", smallest, smallestCount end
 		-- Satu pack dapat menambah lima jenis seed. Bebaskan slot sedikit demi sedikit.
 		if snapshot.free < 5 then
 			if not smallest then error("slot backpack kurang dan tidak ada seed SSP yang bisa di-drop", 0) end
@@ -6950,7 +6954,7 @@ do
 	function SSP.step(job)
 		local before = SSP.snapshot(job)
 		local action, id, count, reason = SSP.plan(job, before)
-		if action == "done" then return false end
+		if action == "refill" then SSP.refill(job, before, id, count); return true end
 		if action == "drop" then SSP.drop(job, before, id, count, reason); return true end
 		SSP.dropAllowed(job)
 		local accepted, rewards = SSP.request(job, "OpenPack", 5706)
@@ -6966,7 +6970,8 @@ do
 			total += amount
 		end
 		local after = SSP.snapshot(job)
-		if total ~= 5 or (after.counts[5706] or 0) ~= before.counts[5706] - 1 then
+		-- Pickup native boleh mengisi SSP kembali saat balasan OpenPack diproses.
+		if total ~= 5 or (after.counts[5706] or 0) < before.counts[5706] - 1 then
 			error("jumlah SSP atau hasil pack berubah; proses dihentikan", 0)
 		end
 		for seedId, amount in pairs(expected) do
@@ -6980,6 +6985,43 @@ do
 		return true
 	end
 
+	function SSP.refill(job, before, smallest, smallestCount)
+		SSP.guard(job)
+		local target
+		local state = Bind.state()
+		for _, drop in ipairs(job.world.dropList()) do
+			if drop.id == 5706 and type(drop.uid) == "number" and type(drop.n) == "number" and drop.n > 0
+				and type(drop.x) == "number" and type(drop.y) == "number" and not drop.display
+				and not drop.pending and not drop.taking and dropInReach(drop, state) then
+				target = drop
+				break
+			end
+		end
+		if not target then
+			SSP.say(string.format("menunggu refill SSP di dekat pemain | terbuka %d | seed di-drop %d", SSP.opened, SSP.dropped))
+			return
+		end
+		if before.free < 1 then
+			if not smallest then error("backpack penuh; tidak ada seed SSP untuk membuka slot refill", 0) end
+			SSP.drop(job, before, smallest, smallestCount, "membuka satu slot refill SSP")
+			return
+		end
+		if os.clock() < (job.refillRetryAt or 0) then return end
+		job.refillRetryAt = os.clock() + 1
+		SSP.say("mengambil refill SSP di dekat pemain")
+		local wanted = target.n
+		target.taking = true
+		local ok, taken = pcall(SSP.request, job, "TakeDrop", target.uid, wanted)
+		target.taking = false
+		if not ok then error(taken, 0) end
+		if type(taken) == "number" and taken > 0 then
+			-- Setter native membersihkan atau mengurangi sprite tumpukan setelah ACK.
+			job.context.setDropCount(target, math.max(0, wanted - taken))
+			local after = SSP.snapshot(job)
+			SSP.say(string.format("refill SSP berhasil | backpack %d | lanjut membuka pack", after.counts[5706] or 0))
+		end
+	end
+
 	function SSP.attach()
 		Bind.resolve()
 		local world, state = Bind.W, Bind.state()
@@ -6990,7 +7032,9 @@ do
 		local ctrl = context and context.invUI
 		if context and context.world == world and context.inv == Bind.inv and type(context.Items) == "table"
 			and type(ctrl) == "table" and type(ctrl.onDrop) == "function" and type(ctrl.canDrop) == "function"
-			and type(world.displayHere) == "function" and type(world.call) == "function" then
+			and type(world.displayHere) == "function" and type(world.call) == "function"
+			and type(world.dropList) == "function" and type(world.takeDrop) == "function"
+			and type(context.setDropCount) == "function" then
 			return { world = world, name = world.name, entering = world.entering, inv = context.inv,
 				context = context, ctrl = ctrl, gen = SSP.gen, x = state.x, y = state.y }
 		end
@@ -7007,7 +7051,6 @@ do
 		local job, reason = SSP.attach()
 		if not job then SSP.say(reason); return false end
 		if job.world.__HumanHubSSPPending then SSP.say("tunggu request Auto Open SSP sebelumnya selesai"); return false end
-		if job.inv:count(5706) < 1 then SSP.say("Small Seed Pack tidak ada di backpack"); return false end
 		SSP.gen += 1
 		job.gen = SSP.gen
 		SSP.running, SSP.opened, SSP.dropped = true, 0, 0
@@ -7017,11 +7060,8 @@ do
 			local ok, err = pcall(function()
 				SSP.dropAllowed(job)
 				while SSP.running and SSP.gen == job.gen do
-					if not SSP.step(job) then
-						SSP.stop(string.format("selesai: %d SSP terbuka, %d seed di-drop", SSP.opened, SSP.dropped))
-						return
-					end
-					task.wait(0.35)
+					SSP.step(job)
+					task.wait(job.inv:count(5706) > 0 and 0.35 or 1)
 				end
 			end)
 			if not ok and SSP.running and SSP.gen == job.gen then SSP.stop(tostring(err)) end
@@ -7582,7 +7622,7 @@ do
 	local section = sspTab:Section({ Title = "Auto Open SSP", Opened = true })
 	section:Paragraph({
 		Title = "Buka SSP dari backpack",
-		Desc = "Berdiri dan hadap ke tempat drop di tanah, lalu aktifkan. Seed SSP yang mencapai 200 di-drop lebih dulu. Jika slot jenis kurang untuk hasil pack, drop stack seed terkecil satu per satu sampai ada ruang. Selesai saat SSP habis.",
+		Desc = "Berdiri di tumpukan SSP dan hadap ke tempat drop seed di tanah. Pack diambil ulang otomatis dan dibuka terus. Seed SSP yang mencapai 200 di-drop lebih dulu; saat slot jenis kurang, drop stack seed terkecil seperlunya. Jika SSP habis, tetap aktif menunggu refill.",
 	})
 	local status = section:Paragraph({ Title = "Status Open SSP", Desc = SSP.status })
 	local toggle

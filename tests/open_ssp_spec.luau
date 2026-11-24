@@ -40,6 +40,25 @@ local function setup(options)
     local state={x=3,y=10,active=true,dead=false}
     local world={name='TEST',entering=1,DROP_COOLDOWN=1,lastDropAt=0}
     local context={world=world,inv=inv,Items=items,px=3,py=10,facing=1}
+    local ground=options.ground or {}
+    world.dropList=function()return ground end
+    world.takeDrop=function(uid,wanted)
+        calls[#calls+1]='TakeDrop'
+        if options.rejectTake then return 0 end
+        for _,drop in ipairs(ground) do
+            if drop.uid==uid then
+                assert(drop.id==5706,'refill must never collect seeds')
+                local taken=math.min(wanted,200-(server[5706] or 0))
+                server[5706]=(server[5706] or 0)+taken
+                return taken
+            end
+        end
+        return 0
+    end
+    context.setDropCount=function(drop,left)
+        drop.n=left
+        if left==0 then table.remove(ground,table.find(ground,drop)) end
+    end
     local ctrl={canDrop=function() return not options.blocked end}
     world.displayHere=function() return options.display and 5 or nil end
     world.call=function(remote,id)
@@ -55,6 +74,7 @@ local function setup(options)
         assert((server[5706] or 0)>0)
         server[5706]-=1
         if server[5706]==0 then server[5706]=nil end
+        if options.nativeRefill then server[5706]=200 end
         local rewards=options.rewards or {{13,4},{17,1}}
         for _,r in ipairs(rewards) do server[r[1]]=(server[r[1]] or 0)+r[2] end
         return true,rewards
@@ -70,19 +90,23 @@ local function setup(options)
     context.invUI=ctrl
     local Hub={dead=false,sspSeedNames={['door seed']='Door Seed',['glass pane seed']='Glass Pane Seed',['grass seed']='Grass Seed',['wood block seed']='Wood Block Seed',['lava rock seed']='Lava Rock Seed'},recovery={read=function()return nil end},onUnload=function()end}
     local Bind={W=world,inv=inv,context=context,state=function()return state end,resolve=function()end}
+    local ssp
     local env={Hub=Hub,Bind=Bind,Farm={},PNB={},Factory={},Surgery={},Move={release=function()end},
         task={spawn=function(fn) queue[#queue+1]=fn end,wait=function(delay)
             clock+=delay or 0.05
             if options.onWait then options.onWait(clock) end
+            if options.stopWhenEmpty and ssp and ssp.opened>=2 and not server[5706] then ssp.stop('uji selesai') end
             if options.deferRequests then return end
             local fn=table.remove(queue,1)
             if fn then fn() end
         end},os={clock=function()return clock end},
-        filtergc=function()return {ctrl} end,debug={getupvalues=function()return {context} end},worldPickerVisible=function()return options.lobby end}
-    local ssp=make(env)
+        dropInReach=function(drop,s)
+            return math.abs(drop.x-s.x)<0.6 and s.y-.95<drop.y+.3 and drop.y-.3<s.y
+        end,worldPickerVisible=function()return options.lobby end}
+    ssp=make(env)
     ssp.running=true
     local job={context=context,inv=inv,world=world,name='TEST',entering=1,gen=ssp.gen,ctrl=ctrl,x=3,y=10}
-    return {ssp=ssp,job=job,server=server,inv=inv,state=state,world=world,drops=drops,calls=calls,options=options,Hub=Hub,env=env,
+    return {ssp=ssp,job=job,server=server,inv=inv,state=state,world=world,drops=drops,calls=calls,options=options,Hub=Hub,env=env,ground=ground,
         drain=function()while #queue>0 do table.remove(queue,1)() end end}
 end
 local function test(name,fn)
@@ -114,7 +138,7 @@ test('last SSP still drops stack reaching 200 then preserves partials',function(
     local t=setup({counts={[5706]=1,[13]=196}})
     assert(step(t) and t.server[13]==200)
     assert(step(t) and t.server[13]==nil and #t.drops==1)
-    assert(not step(t) and t.server[17]==1)
+    assert(step(t) and t.ssp.running and t.ssp.status:find('menunggu refill',1,true) and t.server[17]==1)
 end)
 test('duplicate reward rows aggregate correctly',function()
     local t=setup({rewards={{13,2},{13,2},{17,1}}})
@@ -162,10 +186,10 @@ test('stopping during request prevents subsequent open or drop',function()
     t.options.onCall=function()t.ssp.stop()end
     assert(not pcall(step,t) and #t.calls==1 and t.server[5706]==2 and #t.drops==0)
 end)
-test('worker entry point consumes until empty and finishes',function()
-    local t=setup();t.ssp.running=false
+test('worker entry point keeps opening until explicitly stopped',function()
+    local t=setup({stopWhenEmpty=true});t.ssp.running=false
     assert(t.ssp.start());t.drain()
-    assert(not t.ssp.running and t.ssp.opened==2 and t.ssp.status:find('selesai',1,true))
+    assert(not t.ssp.running and t.ssp.opened==2 and t.ssp.status:find('uji selesai',1,true))
     assert(t.inv:count(13)==8 and t.inv:count(5706)==0)
 end)
 test('server rejection ends worker once',function()
@@ -184,7 +208,7 @@ test('reload cannot overlap an unfinished server request',function()
     assert(t.world.__HumanHubSSPPending==nil)
 end)
 test('actual toggle starts worker and silent status sync does not replay it',function()
-    local t=setup();t.ssp.running=false
+    local t=setup({stopWhenEmpty=true});t.ssp.running=false
     local config, paragraph, toggle
     local section={
         Paragraph=function(_,p)
@@ -204,7 +228,49 @@ test('actual toggle starts worker and silent status sync does not replay it',fun
     toggle:Set(true)
     t.drain()
     assert(not toggle.Value and not t.ssp.running and t.ssp.opened==2)
-    assert(paragraph:find('selesai',1,true))
+    assert(paragraph:find('uji selesai',1,true))
     assert(t.ssp.gen==2,'silent toggle sync must not call stop again')
+end)
+test('native ground refill during OpenPack may keep backpack at 200',function()
+    local t=setup({counts={[5706]=200},nativeRefill=true})
+    assert(step(t) and t.ssp.opened==1 and t.server[5706]==200)
+    assert(step(t) and t.ssp.opened==2 and t.server[5706]==200)
+end)
+test('empty backpack waits then collects nearby SSP and continues opening',function()
+    local t=setup({counts={}})
+    assert(step(t) and t.ssp.running and #t.drops==0)
+    assert(t.ssp.status:find('menunggu refill',1,true))
+    t.ground[1]={id=5706,uid=1,n=25,x=3,y=9.55}
+    assert(step(t) and t.inv:count(5706)==25 and #t.ground==0)
+    assert(step(t) and t.inv:count(5706)==24 and t.ssp.opened==1)
+end)
+test('partial pickup leaves remaining stack and empty can refill repeatedly',function()
+    local t=setup({counts={},ground={{id=5706,uid=1,n=250,x=3,y=9.55}}})
+    assert(step(t) and t.inv:count(5706)==200 and t.ground[1].n==50)
+    t.server[5706]=nil
+    t.env.task.wait(1)
+    assert(step(t) and t.inv:count(5706)==50 and #t.ground==0)
+end)
+test('refill never picks unrelated seeds, displays or distant SSP',function()
+    local t=setup({counts={},ground={
+        {id=13,uid=1,n=200,x=3,y=9.55},
+        {id=5706,uid=2,n=200,x=5,y=9.55},
+        {id=5706,uid=3,n=200,x=3,y=9.55,display=true},
+    }})
+    assert(step(t) and t.inv:count(5706)==0 and #t.drops==0)
+    for _,call in ipairs(t.calls) do assert(call~='TakeDrop') end
+end)
+test('empty full backpack drops one small seed stack for refill slot',function()
+    local t=setup({capacity=6,counts={[13]=2,[17]=6,[19]=8,[21]=5,[23]=4,[999]=200},
+        ground={{id=5706,uid=1,n=20,x=3,y=9.55}}})
+    assert(step(t) and #t.drops==1 and t.drops[1][1]==13)
+    assert(step(t) and t.inv:count(5706)==20)
+    assert(t.server[999]==200 and t.server[17]==6)
+end)
+test('rejected refill remains active and backs off before next request',function()
+    local t=setup({counts={},rejectTake=true,ground={{id=5706,uid=1,n=20,x=3,y=9.55}}})
+    assert(step(t) and step(t) and t.ssp.running)
+    local takes=0;for _,call in ipairs(t.calls)do if call=='TakeDrop'then takes+=1 end end
+    assert(takes==1 and t.inv:count(5706)==0)
 end)
 print(passed..' cases passed')
