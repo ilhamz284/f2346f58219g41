@@ -31,7 +31,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.143",
+	version = "0.4.144",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -6512,6 +6512,161 @@ end
 --// ===== 7c. EKSPOR HARGA VEND =====
 do
 	local http = game:GetService("HttpService")
+	-- Daftar Seed SSP pada dashboard (dist/seeds.js). Cocokkan nama, karena ID game berbeda.
+	local sspSeedNames = {}
+	for name in ([[
+Cave Column Seed
+Door Seed
+Glass Pane Seed
+Grass Seed
+Lava Rock Seed
+Martian Tree Seed
+Sign Seed
+Wood Block Seed
+Amber Glass Seed
+Bricks Seed
+Crappy Sign Seed
+Daisy Seed
+Happy Joy Plaque Seed
+Mushroom Seed
+Rock Background Seed
+Rose Seed
+Super Crate Box Seed
+Terracotta Pot Seed
+Torch Seed
+Wheat Seed
+Black Block Seed
+Brown Block Seed
+Cliffside Seed
+Grey Block Seed
+Mini Blocks Seed
+Mud Glob Seed
+Pointy Sign Seed
+Red Block Seed
+Wooden Background Seed
+Wooden Platform Seed
+Aqua Block Seed
+Danger Sign Seed
+Evil Bricks Seed
+Green Block Seed
+Rock Platform Seed
+Stone Wall Seed
+Poppy Seed
+White Block Seed
+Window Seed
+Wooden Table Seed
+Yellow Block Seed
+Barn Block Seed
+Brick Background Seed
+Cave Platform Seed
+Flowery Wallpaper Seed
+Glass Block Seed
+Grimstone Seed
+Red Bricks Seed
+Toilet Seed
+Death Spikes Seed
+Dungeon Door Seed
+Pencil Seed
+Red Wood Wall Seed
+Barn Door Seed
+Bush Seed
+Devil Horns Seed
+Exclamation Sign Seed
+Orange Block Seed
+Rune Carved Stone Pillar Seed
+Sheet Music: Blank Seed
+Stalactite Seed
+Stalagmite Seed
+Texas Limestone Seed
+Dwarven Column Seed
+House Entrance Seed
+Painting: Dink Duck Seed
+Painting: Yerfdog Seed
+Stripey Wallpaper Seed
+Wooden Window Seed
+Barrel Seed
+Checker Wallpaper Seed
+Dark Brown Block Seed
+Dark Grey Block Seed
+Dark Red Block Seed
+Red Glass Block Seed
+Sidewalk Seed
+Tenement Building Seed
+Tomato Seed
+Window Curtains Seed
+Wooden Chair Seed
+Blueberry Seed
+Dark Aqua Block Seed
+Dark Green Block Seed
+Romantic Bushes Seed
+Staircase Seed
+Water Bucket Seed
+Western Building Seed
+Bathtub Seed
+Big Old Down Arrow Seed
+Big Old Sideways Arrow Seed
+Dark Yellow Block Seed
+Sheet Music: Drums Seed
+Tiger Block Seed
+Twisted Spikes Seed
+Bed Seed
+Biohazard Sign Seed
+Bubble Wrap Seed
+Dresser Seed
+Saloon Doors Seed
+Sheet Music: Piano Note Seed
+Viney Block Seed
+Viney Wallpaper Seed
+Western Banner Seed
+Air Duct Seed
+Blue Block Seed
+Lattice Background Seed
+Olde Timey Radio Seed
+Orange Seed
+Polka Dot Block Seed
+Secret Passage Seed
+Sheet Music: Flat Piano Seed
+Sheet Music: Sax Note Seed
+Street Sign Seed
+Tangram Block Seed
+Dark Orange Block Seed
+Gargoyle Seed
+Portcullis Seed
+Sheet Music: Flat Sax Seed
+Ancient Stone Gate Seed
+Arrow Placard Seed
+Cactus Seed
+Picket Fence Seed
+Screen Door Seed
+Blue Star Wallpaper Seed
+Cuzco Wall Mount Seed
+Das Red Balloon Seed
+Foliage Seed
+Plumbing Seed
+Salt Block Seed
+Sandstone Seed
+Apple Seed
+Command - Move Seed
+For Sale Sign Seed
+Ice Crust Block Seed
+Purple Block Seed
+Sheet Music: Flat Electric Guitar Seed
+Sheet Music: Flat Flute Seed
+Sheet Music: Flat Lyre Seed
+Sheet Music: Flat Mexican Trumpet Seed
+Sheet Music: Flat Spanish Guitar Seed
+Sheet Music: Flat Violin Seed
+Outie Block Seed
+Rustic Fence Seed
+School Desk Seed
+Air Vent Seed
+Ancient Block Seed
+Gem Sign Seed
+Seaweed Seed
+Swiss Cheese Block Seed
+	]]):gmatch("[^\r\n]+") do
+		if name:find("%S") then sspSeedNames[name:lower()] = name end
+	end
 
 	local function vendNumber(value, integer)
 		if type(value) ~= "number" or value ~= value or value < 0 or value > 1e12 then
@@ -6539,7 +6694,6 @@ do
 
 		-- Getter lokal berisi harga yang terpasang pada mesin vend world ini.
 		local rows = {}
-		local unnamed = 0
 		for y, tiles in pairs(world.fg) do
 			if not vendNumber(y, true) or type(tiles) ~= "table" then continue end
 			for x, tile in pairs(tiles) do
@@ -6548,19 +6702,19 @@ do
 				if type(vend) ~= "table" then continue end
 				local itemId = vendNumber(vend.id, true)
 				local item = itemId and items[itemId]
-				if type(item) ~= "table" or type(item.name) ~= "string" or not item.name:find("%S") then
-					unnamed += 1
-					continue
-				end
+				if type(item) ~= "table" or type(item.name) ~= "string" then continue end
+				local name = item.name:lower():gsub("^%s+", ""):gsub("%s+$", ""):gsub("%s+", " ")
+				local seedName = sspSeedNames[name]
+				if not seedName then continue end
 				local cost, per = vendNumber(vend.cost), vendNumber(vend.per)
 				if not cost or not per then cost, per = nil, nil end
 				table.insert(rows, {
-					name = item.name, itemId = itemId, x = x, y = y,
+					name = seedName, itemId = itemId, x = x, y = y,
 					stock = vendNumber(vend.stock, true), cost = cost, per = per,
 				})
 			end
 		end
-		if #rows == 0 then return false, "Tidak ada vend berisi barang yang bisa diekspor di " .. world.name .. "." end
+		if #rows == 0 then return false, "Tidak ada vend berisi seed SSP di " .. world.name .. "." end
 		table.sort(rows, function(a, b)
 			if a.y == b.y then return a.x < b.x end
 			return a.y < b.y
@@ -6571,8 +6725,7 @@ do
 		local safeName = world.name:gsub("[^%w_-]", "_"):sub(1, 60)
 		local path = string.format("ssp-vend-%s-%d.json", safeName, captured.UnixTimestampMillis)
 		writefile(path, payload)
-		local skipped = unnamed > 0 and string.format(" %d vend tanpa nama barang dilewati.", unnamed) or ""
-		return true, string.format("%s · %d vend. File: %s. Buka Pembanding harga world → Impor data vend, lalu pilih file ini dari Workspace executor.%s", world.name, #rows, path, skipped), path
+		return true, string.format("%s · %d vend seed SSP. File: %s. Pilih file ini dari Workspace executor saat mengimpor di dashboard.", world.name, #rows, path), path
 	end
 end
 
@@ -8175,7 +8328,7 @@ do
 	local status = section:Paragraph({ Title = "Status ekspor", Desc = "Masuk ke world yang mau dibandingkan, lalu ekspor. Ulangi di world lain untuk mendapatkan file terpisah." })
 	section:Button({
 		Title = "Ekspor vend world ini",
-		Desc = "Simpan nama barang, harga, stok, dan waktu scan sebagai JSON untuk dashboard SSP.",
+		Desc = "Simpan harga dan stok vend yang berisi seed dalam Daftar Seed SSP dashboard.",
 		Callback = function()
 			local ok, success, message = pcall(Hub.exportVendSnapshot)
 			if not ok then
