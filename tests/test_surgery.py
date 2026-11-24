@@ -7,7 +7,7 @@ import tempfile
 root = Path(__file__).resolve().parents[1]
 source = (root / "hub.luau").read_text(encoding="utf-8-sig")
 module = source[source.index("local Surgery = {"):source.index("--// ===== 7c. EKSPOR HARGA VEND =====")]
-ui = source[source.index("-- ---- Tab Surgery ----"):source.index("-- ---- Tab Auto Farming ----")]
+ui = source[source.index("-- ---- Tab Surgery ----"):source.index("-- ---- Tab SSP ----")]
 fixture = (root / "tests" / "surgery_spec.luau").read_text(encoding="utf-8")
 prelude, checks = fixture.split("-- INSERT SURGERY HERE", 1)
 checks = checks.replace("-- INSERT SURGERY UI HERE", ui)

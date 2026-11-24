@@ -31,7 +31,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.146",
+	version = "0.4.147",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -7575,10 +7575,11 @@ do
 	})
 end
 
--- ---- Tab Auto Farming ----
+-- ---- Tab SSP ----
 do
 	local SSP = Hub.ssp
-	local section = pnbTab:Section({ Title = "Auto Open SSP", Opened = true })
+	local sspTab = Window:Tab({ Title = "SSP", Icon = "package-open" })
+	local section = sspTab:Section({ Title = "Auto Open SSP", Opened = true })
 	section:Paragraph({
 		Title = "Buka SSP dari backpack",
 		Desc = "Berdiri dan hadap ke tempat drop di tanah, lalu aktifkan. Seed SSP yang mencapai 200 di-drop lebih dulu. Jika slot jenis kurang untuk hasil pack, drop stack seed terkecil satu per satu sampai ada ruang. Selesai saat SSP habis.",
@@ -7615,6 +7616,7 @@ do
 	end)
 end
 
+-- ---- Tab Auto Farming ----
 local pnbSec = pnbTab:Section({ Title = "PNB (Place and Break)", Opened = true })
 local pnbStatusPara
 local pnbToggle
