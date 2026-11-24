@@ -31,7 +31,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.142",
+	version = "0.4.143",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -6509,6 +6509,73 @@ do
 	end)
 end
 
+--// ===== 7c. EKSPOR HARGA VEND =====
+do
+	local http = game:GetService("HttpService")
+
+	local function vendNumber(value, integer)
+		if type(value) ~= "number" or value ~= value or value < 0 or value > 1e12 then
+			return nil
+		end
+		if integer and value % 1 ~= 0 then return nil end
+		return value
+	end
+
+	function Hub.exportVendSnapshot()
+		if type(writefile) ~= "function" then
+			return false, "Executor ini tidak mendukung penyimpanan file."
+		end
+		local world = Bind.getW()
+		if worldPickerVisible() or not world or type(world.name) ~= "string"
+			or not world.name:find("%S") or type(world.fg) ~= "table" then
+			return false, "Masuk ke world dan tunggu sampai selesai dimuat."
+		end
+		local vends = world.vends
+		if type(vends) ~= "table" or type(vends.get) ~= "function" then
+			return false, "Data vend world belum siap. Coba lagi setelah world selesai dimuat."
+		end
+		local items = findItemDB()
+		if not items then return false, "Katalog barang belum siap. Coba lagi sebentar." end
+
+		-- Getter lokal berisi harga yang terpasang pada mesin vend world ini.
+		local rows = {}
+		local unnamed = 0
+		for y, tiles in pairs(world.fg) do
+			if not vendNumber(y, true) or type(tiles) ~= "table" then continue end
+			for x, tile in pairs(tiles) do
+				if not vendNumber(x, true) or type(tile) ~= "number" or tile <= 0 then continue end
+				local vend = vends.get(x, y)
+				if type(vend) ~= "table" then continue end
+				local itemId = vendNumber(vend.id, true)
+				local item = itemId and items[itemId]
+				if type(item) ~= "table" or type(item.name) ~= "string" or not item.name:find("%S") then
+					unnamed += 1
+					continue
+				end
+				local cost, per = vendNumber(vend.cost), vendNumber(vend.per)
+				if not cost or not per then cost, per = nil, nil end
+				table.insert(rows, {
+					name = item.name, itemId = itemId, x = x, y = y,
+					stock = vendNumber(vend.stock, true), cost = cost, per = per,
+				})
+			end
+		end
+		if #rows == 0 then return false, "Tidak ada vend berisi barang yang bisa diekspor di " .. world.name .. "." end
+		table.sort(rows, function(a, b)
+			if a.y == b.y then return a.x < b.x end
+			return a.y < b.y
+		end)
+
+		local captured = DateTime.now()
+		local payload = http:JSONEncode({world = world.name, capturedUtc = captured:ToIsoDate(), rows = rows})
+		local safeName = world.name:gsub("[^%w_-]", "_"):sub(1, 60)
+		local path = string.format("ssp-vend-%s-%d.json", safeName, captured.UnixTimestampMillis)
+		writefile(path, payload)
+		local skipped = unnamed > 0 and string.format(" %d vend tanpa nama barang dilewati.", unnamed) or ""
+		return true, string.format("%s · %d vend. File: %s. Buka Pembanding harga world → Impor data vend, lalu pilih file ini dari Workspace executor.%s", world.name, #rows, path, skipped), path
+	end
+end
+
 --// ===== 8. UI (WindUI) =====
 local WINDUI_URL = "https://github.com/Footagesus/WindUI/releases/latest/download/main.lua"
 local WINDUI_CACHE = "HumanHub_WindUI.lua"
@@ -8103,6 +8170,24 @@ task.spawn(function()
 end)
 
 -- ---- Tab Info ----
+do
+	local section = infoTab:Section({ Title = "Ekspor harga vend", Opened = true })
+	local status = section:Paragraph({ Title = "Status ekspor", Desc = "Masuk ke world yang mau dibandingkan, lalu ekspor. Ulangi di world lain untuk mendapatkan file terpisah." })
+	section:Button({
+		Title = "Ekspor vend world ini",
+		Desc = "Simpan nama barang, harga, stok, dan waktu scan sebagai JSON untuk dashboard SSP.",
+		Callback = function()
+			local ok, success, message = pcall(Hub.exportVendSnapshot)
+			if not ok then
+				log("Ekspor vend gagal: " .. tostring(success))
+				message = "Gagal mengekspor vend. Coba lagi dan periksa penyimpanan executor."
+			end
+			status:SetDesc(message)
+			WindUI:Notify({Title = ok and success and "File vend tersimpan" or "Ekspor vend", Content = message, Duration = 6})
+		end,
+	})
+end
+
 infoTab:Section({ Title = "Fitur", Opened = true }):Paragraph({
 	Title = "Sudah ada",
 	Desc = "1) Auto Factory: harvest hingga blok penuh/tak ada tree, PNB hingga blok habis/seed penuh, plant hingga seed habis, lalu ulangi. 2) Auto Harvest/Plant terpisah. 3) PNB. 4) Dirt Farm. 5) Auto Clear World.",
