@@ -31,7 +31,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.144",
+	version = "0.4.145",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -6676,21 +6676,18 @@ Swiss Cheese Block Seed
 		return value
 	end
 
-	function Hub.exportVendSnapshot()
-		if type(writefile) ~= "function" then
-			return false, "Executor ini tidak mendukung penyimpanan file."
-		end
+	local function scanVendRows()
 		local world = Bind.getW()
 		if worldPickerVisible() or not world or type(world.name) ~= "string"
 			or not world.name:find("%S") or type(world.fg) ~= "table" then
-			return false, "Masuk ke world dan tunggu sampai selesai dimuat."
+			return nil, "Masuk ke world dan tunggu sampai selesai dimuat."
 		end
 		local vends = world.vends
 		if type(vends) ~= "table" or type(vends.get) ~= "function" then
-			return false, "Data vend world belum siap. Coba lagi setelah world selesai dimuat."
+			return nil, "Data vend world belum siap. Coba lagi setelah world selesai dimuat."
 		end
 		local items = findItemDB()
-		if not items then return false, "Katalog barang belum siap. Coba lagi sebentar." end
+		if not items then return nil, "Katalog barang belum siap. Coba lagi sebentar." end
 
 		-- Getter lokal berisi harga yang terpasang pada mesin vend world ini.
 		local rows = {}
@@ -6714,18 +6711,84 @@ Swiss Cheese Block Seed
 				})
 			end
 		end
-		if #rows == 0 then return false, "Tidak ada vend berisi seed SSP di " .. world.name .. "." end
+		if #rows == 0 then return nil, "Tidak ada vend berisi seed SSP di " .. world.name .. "." end
 		table.sort(rows, function(a, b)
 			if a.y == b.y then return a.x < b.x end
 			return a.y < b.y
 		end)
+		return rows, world.name
+	end
 
+	function Hub.exportVendSnapshot()
+		if type(writefile) ~= "function" then
+			return false, "Executor ini tidak mendukung penyimpanan file."
+		end
+		local rows, world = scanVendRows()
+		if not rows then return false, world end
 		local captured = DateTime.now()
-		local payload = http:JSONEncode({world = world.name, capturedUtc = captured:ToIsoDate(), rows = rows})
-		local safeName = world.name:gsub("[^%w_-]", "_"):sub(1, 60)
+		local payload = http:JSONEncode({world = world, capturedUtc = captured:ToIsoDate(), rows = rows})
+		local safeName = world:gsub("[^%w_-]", "_"):sub(1, 60)
 		local path = string.format("ssp-vend-%s-%d.json", safeName, captured.UnixTimestampMillis)
 		writefile(path, payload)
-		return true, string.format("%s · %d vend seed SSP. File: %s. Pilih file ini dari Workspace executor saat mengimpor di dashboard.", world.name, #rows, path), path
+		return true, string.format("%s · %d vend seed SSP. File: %s. Pilih file ini dari Workspace executor saat mengimpor di dashboard.", world, #rows, path), path
+	end
+
+	local function priceText(cost, per)
+		if not cost or not per or cost == 0 or per == 0 then return "belum ada harga" end
+		if cost == 1 then return per .. " seed/WL" end
+		if per == 1 then return cost .. " WL/seed" end
+		return per .. " seed / " .. cost .. " WL"
+	end
+
+	function Hub.compareVendPrices(filename)
+		if type(readfile) ~= "function" or type(writefile) ~= "function" then
+			return false, "Executor ini tidak mendukung baca dan tulis file."
+		end
+		filename = filename:match("^%s*(.-)%s*$")
+		if #filename > 120 or not filename:match("^ssp%-harga%-vend[%w _()%-]*%.json$") then
+			return false, "Isi nama file ssp-harga-vend.json dari dashboard."
+		end
+		local okRead, raw = pcall(readfile, filename)
+		if not okRead then
+			return false, "File tidak ditemukan. Pindahkan " .. filename .. " dari Downloads ke Hasil Scan Vend (Real)."
+		end
+		if #raw > 256 * 1024 then return false, "File harga terlalu besar." end
+		local okDecode, data = pcall(function() return http:JSONDecode(raw) end)
+		if not okDecode or type(data) ~= "table" or data.format ~= "ssp-vend-prices-v1"
+			or type(data.prices) ~= "table" or #data.prices < 1 or #data.prices > 149 then
+			return false, "Format file harga tidak cocok. Unduh lagi dari Daftar Seed di dashboard."
+		end
+		local prices = {}
+		for _, price in ipairs(data.prices) do
+			local name = type(price) == "table" and type(price.name) == "string" and sspSeedNames[price.name:lower()]
+			if not name or prices[name] or not vendNumber(price.cost, true) or not vendNumber(price.per, true)
+				or price.cost < 1 or price.per < 1 or (price.cost ~= 1 and price.per ~= 1) then
+				return false, "File harga berisi seed duplikat atau harga yang tidak valid."
+			end
+			prices[name] = price
+		end
+
+		local rows, world = scanVendRows()
+		if not rows then return false, world end
+		local changes, same, unmatched = {}, 0, 0
+		for _, row in ipairs(rows) do
+			local price = prices[row.name]
+			if not price then
+				unmatched += 1
+			elseif row.cost == price.cost and row.per == price.per then
+				same += 1
+			else
+				table.insert(changes, string.format("%s (%d,%d): %s -> %s", row.name, row.x, row.y,
+					priceText(row.cost, row.per), priceText(price.cost, price.per)))
+			end
+		end
+		local summary = string.format("%s: %d perlu disesuaikan, %d sesuai, %d tanpa harga di file.",
+			world, #changes, same, unmatched)
+		if #changes == 0 then return true, summary end
+		local safeName = world:gsub("[^%w_-]", "_"):sub(1, 60)
+		local path = string.format("ssp-rencana-vend-%s-%d.txt", safeName, DateTime.now().UnixTimestampMillis)
+		writefile(path, summary .. "\nSumber: " .. filename .. "\n\n" .. table.concat(changes, "\n") .. "\n")
+		return true, summary .. "\n" .. changes[1] .. "\nDaftar lengkap: " .. path, path
 	end
 end
 
@@ -8337,6 +8400,27 @@ do
 			end
 			status:SetDesc(message)
 			WindUI:Notify({Title = ok and success and "File vend tersimpan" or "Ekspor vend", Content = message, Duration = 6})
+		end,
+	})
+	local priceFilename = "ssp-harga-vend.json"
+	section:Input({
+		Title = "File harga dashboard",
+		Desc = "Unduh dari Daftar Seed, lalu pindahkan file ke folder Hasil Scan Vend (Real).",
+		Value = priceFilename,
+		Placeholder = "ssp-harga-vend.json",
+		Callback = function(value) priceFilename = tostring(value or "") end,
+	})
+	section:Button({
+		Title = "Cocokkan harga vend",
+		Desc = "Lihat harga lama, harga dari dashboard, dan koordinat vend untuk diedit.",
+		Callback = function()
+			local ok, success, message = pcall(Hub.compareVendPrices, priceFilename)
+			if not ok then
+				log("Gagal mencocokkan harga: " .. tostring(success))
+				message = "Gagal mencocokkan harga. Pastikan world sudah dimuat dan file ada di Workspace Real."
+			end
+			status:SetDesc(message)
+			WindUI:Notify({Title = "Pencocokan harga vend", Content = message, Duration = 6})
 		end,
 	})
 end
