@@ -31,7 +31,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.148",
+	version = "0.4.149",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -6633,7 +6633,6 @@ Secret Passage Seed
 Sheet Music: Flat Piano Seed
 Sheet Music: Sax Note Seed
 Street Sign Seed
-Tangram Block Seed
 Dark Orange Block Seed
 Gargoyle Seed
 Portcullis Seed
@@ -6651,7 +6650,6 @@ Plumbing Seed
 Salt Block Seed
 Sandstone Seed
 Apple Seed
-Command - Move Seed
 For Sale Sign Seed
 Ice Crust Block Seed
 Purple Block Seed
@@ -6766,7 +6764,10 @@ Swiss Cheese Block Seed
 		end
 		local prices = {}
 		for _, price in ipairs(data.prices) do
-			local name = type(price) == "table" and type(price.name) == "string" and sspSeedNames[price.name:lower()]
+			local rawName = type(price) == "table" and type(price.name) == "string" and price.name:lower()
+			-- Older dashboard exports contained these two unverified SSP entries.
+			if rawName == "tangram block seed" or rawName == "tangram seed" or rawName == "command - move seed" then continue end
+			local name = rawName and sspSeedNames[rawName]
 			if not name or prices[name] or not vendNumber(price.cost, true) or not vendNumber(price.per, true)
 				or price.cost < 1 or price.per < 1 or (price.cost ~= 1 and price.per ~= 1) then
 				return false, "File harga berisi seed duplikat atau harga yang tidak valid."
