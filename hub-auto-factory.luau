@@ -31,7 +31,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.154",
+	version = "0.4.155",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -7534,6 +7534,147 @@ do
 	Hub.onUnload(function() Buy.stop("hub ditutup") end)
 end
 
+--// ===== 7h. AUTO COLLECT VEND WL =====
+do
+	local Collect={running=false,gen=0,collected=0,machines=0,status="nonaktif"}
+	Hub.vendCollect=Collect
+	local Stock=Hub.vendStock
+	local currency={[242]=1,[1796]=100,[7188]=10000,[20049]=100000,[20050]=1000000}
+	function Collect.say(message)
+		if Collect.status==message then return end
+		Collect.status=message
+		if Collect.onStatus then pcall(Collect.onStatus,message) end
+	end
+	function Collect.stop(reason)
+		Collect.running=false
+		Collect.gen+=1
+		Collect.say(reason or "Auto Collect WL dimatikan")
+	end
+	function Collect.valid(job)
+		return Stock.valid(job,Collect)
+	end
+	function Collect.received(result)
+		if type(result)~="table" then return nil end
+		local total=0
+		for _,entry in ipairs({{result.add or {},1},{result.remove or {},-1}}) do
+			if type(entry[1])~="table" then return nil end
+			for _,row in ipairs(entry[1]) do
+				if type(row)~="table" or type(row[1])~="number" or type(row[2])~="number"
+					or row[2]~=row[2] or row[2]<0 or row[2]%1~=0 or row[2]>1e12 then return nil end
+				total+=(currency[row[1]] or 0)*row[2]*entry[2]
+			end
+		end
+		return total
+	end
+	function Collect.quote(job,x,y)
+		local w=job.world
+		local tile=job.grid[y] and job.grid[y][x]
+		local machine=tile and job.context.Items[tile]
+		if not machine or not machine.vend or machine.gemMachine or not w.atTile(x,y) or not w.vendOwner(x,y) then return nil end
+		local vend=w.vends.get(x,y)
+		if not vend or vend.shop or type(vend.earned)~="number" or vend.earned~=vend.earned
+			or vend.earned<1 or vend.earned%1~=0 or vend.earned>1e12 then return nil end
+		return {x=x,y=y,tile=tile,earned=vend.earned,key=x..","..y}
+	end
+	function Collect.target(job)
+		if Collect.retryWorld~=job.world or Collect.retryName~=job.name or Collect.retryEntering~=job.entering then
+			Collect.retryWorld,Collect.retryName,Collect.retryEntering=job.world,job.name,job.entering
+			Collect.retry={}
+		end
+		local best,distance
+		for y=math.floor(job.context.py)-2,math.floor(job.context.py)+1 do
+			for x=math.floor(job.context.px)-2,math.floor(job.context.px)+1 do
+				if os.clock()<(Collect.retry[x..","..y] or 0) then continue end
+				local quote=Collect.quote(job,x,y)
+				if not quote then continue end
+				local d=(job.context.px-x-.5)^2+(job.context.py-y-1)^2
+				if not distance or d<distance then best,distance=quote,d end
+			end
+		end
+		return best
+	end
+	function Collect.step()
+		if Collect.pending then return end
+		if Stock.busy() then Collect.say("jeda selama farm, SSP, surgery, atau pemulihan aktif");return end
+		local job=Stock.current()
+		if not job then Collect.say("menunggu karakter dan world siap");return end
+		job.gen=Collect.gen
+		if job.world.__HumanHubVendPending then return end
+		local target=Collect.target(job)
+		if not target then
+			if os.clock()>=(Collect.showResultUntil or 0) then Collect.say("aktif: lewati vend milikmu yang memiliki hasil penjualan") end
+			return
+		end
+		local pending={done=false}
+		Collect.pending,job.world.__HumanHubVendPending=pending,pending
+		Collect.retry[target.key]=os.clock()+5
+		task.spawn(function()
+			local ok,err=pcall(function()
+				if not Collect.valid(job) or Stock.busy() then return end
+				local current=Collect.quote(job,target.x,target.y)
+				if not current or current.tile~=target.tile then return end
+				local before=Hub.vendBuy.balance(job.inv)
+				if not before then error("saldo backpack belum bisa dibaca",0) end
+				pending.sent=true
+				local success,result=job.world.vendCall("withdraw",target.x,target.y)
+				pending.success=success
+				if not success then return end
+				-- Native vendCall applies the ACK once, including denomination conversions.
+				local received=Collect.received(result)
+				local after=Hub.vendBuy.balance(job.inv)
+				pending.amount=received
+				pending.verified=received and received>0 and after and after-before==received
+				if not pending.verified then return end
+				-- Wait for earned to refresh so the next tick cannot withdraw a stale balance.
+				local untilUpdate=os.clock()+3
+				repeat
+					local vend=job.world.vends.get(target.x,target.y)
+					if vend and type(vend.earned)=="number" and vend.earned~=current.earned then pending.synced=true;break end
+					if not Collect.valid(job) then break end
+					task.wait(.05)
+				until os.clock()>=untilUpdate
+			end)
+			pending.error=not ok and tostring(err) or nil
+			pending.done=true
+			if Collect.pending==pending then Collect.pending=nil end
+			if job.world.__HumanHubVendPending==pending then job.world.__HumanHubVendPending=nil end
+		end)
+		local deadline=os.clock()+15
+		while not pending.done and os.clock()<deadline do
+			task.wait(.05)
+			if not Collect.valid(job) then return end
+		end
+		if not Collect.valid(job) then return end
+		if not pending.done then Collect.stop("server belum membalas penarikan; tunggu sebelum mengaktifkan lagi");return end
+		if pending.error then Collect.stop("Auto Collect WL gagal: "..pending.error);return end
+		if pending.success then
+			if not pending.verified then Collect.stop("penarikan diterima; saldo backpack belum cocok, periksa sebelum lanjut");return end
+			Collect.collected+=pending.amount
+			Collect.machines+=1
+			if not pending.synced then Collect.stop("WL masuk; saldo vend belum diperbarui, periksa sebelum lanjut");return end
+			Collect.showResultUntil=os.clock()+4
+			Collect.say(string.format("+%d WL dari vend (%d,%d) | total %d WL dari %d vend",pending.amount,target.x,target.y,Collect.collected,Collect.machines))
+		elseif pending.sent then Collect.say("penarikan ditolak; periksa ruang backpack, mencoba lagi setelah jeda") end
+	end
+	function Collect.start()
+		if Collect.running then return true end
+		if Collect.pending then Collect.say("tunggu penarikan sebelumnya selesai");return false end
+		Collect.gen+=1
+		Collect.running,Collect.collected,Collect.machines=true,0,0
+		Collect.say("Auto Collect WL aktif")
+		local gen=Collect.gen
+		task.spawn(function()
+			while not Hub.dead and Collect.running and Collect.gen==gen do
+				local ok,err=pcall(Collect.step)
+				if not ok and Collect.gen==gen then Collect.stop("Auto Collect WL berhenti: "..tostring(err)) end
+				task.wait(.25)
+			end
+		end)
+		return true
+	end
+	Hub.onUnload(function() Collect.stop("hub ditutup") end)
+end
+
 --// ===== 8. UI (WindUI) =====
 local WINDUI_URL = "https://github.com/Footagesus/WindUI/releases/latest/download/main.lua"
 local WINDUI_CACHE = "HumanHub_WindUI.lua"
@@ -9244,6 +9385,29 @@ do
 			if Buy.syncingUI then return end
 			if on then Buy.start() else Buy.stop("Auto Buy dimatikan") end
 			Buy.onStatus(Buy.status)
+		end})
+end
+
+-- ---- Vend Collect UI ----
+do
+	local Collect=Hub.vendCollect
+	local section=Hub.ui.vendTab:Section({Title="Auto Collect World Lock",Opened=true})
+	section:Paragraph({Title="Ambil hasil penjualan saat lewat",
+		Desc="Lewati vend milikmu untuk menarik hasil penjualan langsung ke backpack. Berjalan untuk Vending Machine dan DigiVend, termasuk mesin stok kosong yang masih punya hasil penjualan. Total dihitung setara WL, termasuk DL/BGL. Bisa aktif bersama fitur vend lainnya."})
+	local status=section:Paragraph({Title="Status Auto Collect WL",Desc=Collect.status})
+	local toggle
+	Collect.onStatus=function(message)
+		if status and status.SetDesc then pcall(status.SetDesc,status,message) end
+		if toggle and toggle.Set and toggle.Value~=Collect.running then
+			Collect.syncingUI=true;pcall(toggle.Set,toggle,Collect.running,false);Collect.syncingUI=false
+		end
+	end
+	toggle=section:Toggle({Title="Auto Collect WL Vend",Value=false,
+		Desc="Tarik otomatis hasil penjualan vend milikmu saat berada dalam jangkauan.",
+		Callback=function(on)
+			if Collect.syncingUI then return end
+			if on then Collect.start() else Collect.stop("Auto Collect WL dimatikan") end
+			Collect.onStatus(Collect.status)
 		end})
 end
 
