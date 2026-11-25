@@ -31,7 +31,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.153",
+	version = "0.4.154",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -7430,9 +7430,9 @@ do
 		end
 		if type(vend.cost) ~= "number" or type(vend.per) ~= "number" or type(vend.stock) ~= "number"
 			or vend.cost > 100000 or vend.per > 200 or vend.stock > 10398 then return nil end
-		-- Require a discount strictly greater than 15% of the reference WL per seed.
-		-- Integer products make exactly 15% ineligible in either selling unit.
-		if 100 * vend.cost * ref.per >= 85 * ref.cost * vend.per then return nil end
+		-- Require a discount of at least 25% of the reference WL per seed.
+		-- Integer products include exactly 25% without boundary rounding in either unit.
+		if 100 * vend.cost * ref.per > 75 * ref.cost * vend.per then return nil end
 		local money, room, count = Buy.balance(job.inv), job.inv:room(vend.id), job.inv:count(vend.id)
 		if not money or type(room) ~= "number" or room ~= room or room < 0 or room % 1 ~= 0
 			or type(count) ~= "number" or count ~= count or count < 0 or count > 200 or count % 1 ~= 0 then return nil end
@@ -7470,7 +7470,7 @@ do
 		if job.world.__HumanHubVendPending then return end
 		local target=Buy.target(job)
 		if not target then
-			if os.clock() >= (Buy.showResultUntil or 0) then Buy.say("aktif: cari seed lebih murah >15%; beli lot maksimal sesuai ruang, stok, dan saldo WL") end
+			if os.clock() >= (Buy.showResultUntil or 0) then Buy.say("aktif: cari seed minimal 25% lebih murah; beli lot maksimal sesuai ruang, stok, dan saldo WL") end
 			return
 		end
 		local pending={done=false}
@@ -7520,7 +7520,7 @@ do
 		if not Buy.load() then return false end
 		Buy.gen+=1
 		Buy.running,Buy.bought,Buy.spent=true,0,0
-		Buy.say("Auto Buy aktif: beli lot maksimal hanya jika lebih murah >15% dari acuan")
+		Buy.say("Auto Buy aktif: beli lot maksimal hanya jika minimal 25% lebih murah dari acuan")
 		local gen=Buy.gen
 		task.spawn(function()
 			while not Hub.dead and Buy.running and Buy.gen==gen do
@@ -9229,7 +9229,7 @@ do
 	local Buy=Hub.vendBuy
 	local section=Hub.ui.vendTab:Section({Title="Auto Buy seed murah",Opened=true})
 	section:Paragraph({Title="Beli di vend orang saat lewat",
-		Desc="Memakai File harga web di atas sebagai acuan harga jualmu. Hanya beli jika harga per seed lebih dari 15% lebih murah dari acuan. Selisih tepat 15% atau kurang dan vend milikmu dilewati. Lot maksimal mengikuti kelipatan paket vend, stok tersedia, saldo WL termasuk pecahannya, dan ruang backpack sampai 200 seed per jenis. File diperiksa ulang tiap 5 detik."})
+		Desc="Memakai File harga web di atas sebagai acuan harga jualmu. Hanya beli jika harga per seed minimal 25% lebih murah dari acuan, termasuk selisih tepat 25%. Selisih di bawah 25% dan vend milikmu dilewati. Lot maksimal mengikuti kelipatan paket vend, stok tersedia, saldo WL termasuk pecahannya, dan ruang backpack sampai 200 seed per jenis. File diperiksa ulang tiap 5 detik."})
 	local status=section:Paragraph({Title="Status Auto Buy",Desc=Buy.status})
 	local toggle
 	Buy.onStatus=function(message)
@@ -9239,7 +9239,7 @@ do
 		end
 	end
 	toggle=section:Toggle({Title="Auto Buy Vend Murah",Value=false,
-		Desc="Gunakan saldo WL untuk lot maksimal jika harga lebih dari 15% lebih murah dari harga jualmu.",
+		Desc="Gunakan saldo WL untuk lot maksimal jika harga minimal 25% lebih murah dari harga jualmu.",
 		Callback=function(on)
 			if Buy.syncingUI then return end
 			if on then Buy.start() else Buy.stop("Auto Buy dimatikan") end

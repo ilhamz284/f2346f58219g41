@@ -1,7 +1,7 @@
 local passed=0
 local function setup(o)
     o=o or {};o.raw=o.raw or 'v1'
-    o.data=o.data or {format='ssp-vend-prices-v1',prices={{name='Cliffside Seed',cost=1,per=80}}}
+    o.data=o.data or {format='ssp-vend-prices-v1',prices={{name='Cliffside Seed',cost=1,per=75}}}
     local clock,queue,calls=100,{},{}
     local inv={counts={[242]=o.money or 10,[13]=o.count or 0}}
     function inv:count(id)return self.counts[id] or 0 end
@@ -48,29 +48,29 @@ local function setup(o)
 end
 local function test(name,fn)fn();passed+=1;print('PASS '..name)end
 
-test('100/WL versus reference80 buys maximum200 for2WL, then skips full stack',function()
+test('100/WL versus reference75 buys maximum200 for2WL, then skips full stack',function()
     local t=setup();t.buy.step();assert(#t.calls==1 and t.calls[1].amount==200 and t.balance()==8 and t.inv:count(13)==200)
     assert(t.buy.bought==200 and t.buy.spent==2 and t.vend.stock==800)
     t.advance(6);t.buy.step();assert(#t.calls==1)
 end)
 test('same and more expensive unit prices are skipped',function()
-    for _,per in ipairs({80,70,1})do local t=setup({per=per});t.buy.step();assert(#t.calls==0)end
+    for _,per in ipairs({75,70,1})do local t=setup({per=per});t.buy.step();assert(#t.calls==0)end
 end)
-test('seed per WL: exactly15percent, below15percent and only above15percent boundary',function()
+test('seed per WL: below25percent skips, exactly25percent and above qualify',function()
     for _,per in ipairs({99,100,101})do
-        local t=setup({per=per,data={format='ssp-vend-prices-v1',prices={{name='Cliffside Seed',cost=1,per=85}}}})
-        t.buy.step();assert(#t.calls==(per==101 and 1 or 0))
+        local t=setup({per=per,data={format='ssp-vend-prices-v1',prices={{name='Cliffside Seed',cost=1,per=75}}}})
+        t.buy.step();assert(#t.calls==(per>=100 and 1 or 0))
     end
 end)
-test('WL per seed: exactly15percent is skipped and greater discount is bought',function()
-    for _,cost in ipairs({84,85,86})do
+test('WL per seed: exactly25percent qualifies while below25percent skips',function()
+    for _,cost in ipairs({74,75,76})do
         local t=setup({cost=cost,per=1,money=200,data={format='ssp-vend-prices-v1',prices={{name='Cliffside Seed',cost=100,per=1}}}})
-        t.buy.step();assert(#t.calls==(cost==84 and 1 or 0))
+        t.buy.step();assert(#t.calls==(cost<=75 and 1 or 0))
     end
 end)
-test('a queued discount that falls to15percent is rejected before sending',function()
-    local t=setup({per=101,data={format='ssp-vend-prices-v1',prices={{name='Cliffside Seed',cost=1,per=85}}}})
-    local first=true;t.o.onWait=function()if first then first=false;t.vend.per=100 end end
+test('a queued discount that falls below25percent is rejected before sending',function()
+    local t=setup({per=101,data={format='ssp-vend-prices-v1',prices={{name='Cliffside Seed',cost=1,per=75}}}})
+    local first=true;t.o.onWait=function()if first then first=false;t.vend.per=99 end end
     t.buy.step();assert(#t.calls==0)
 end)
 test('buys only complete lots that fit backpack, stock and funds',function()
@@ -131,7 +131,7 @@ test('accepted response with inconsistent inventory stops before another purchas
 end)
 test('updated file controls comparisons and missing or broken file stops stale references',function()
     local t=setup();t.o.raw='v2';t.o.data.prices[1].per=120;t.advance(6);t.buy.step();assert(#t.calls==0)
-    t.o.raw='v3';t.o.data.prices[1].per=80;t.advance(6);t.buy.step();assert(#t.calls==1)
+    t.o.raw='v3';t.o.data.prices[1].per=75;t.advance(6);t.buy.step();assert(#t.calls==1)
     t.o.missing=true;t.advance(6);t.buy.step();assert(not t.buy.running and not t.buy.prices)
 end)
 test('changing shared source while queued prevents purchase with old references',function()
