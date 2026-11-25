@@ -31,7 +31,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.151",
+	version = "0.4.152",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -7380,6 +7380,159 @@ do
 	Hub.onUnload(function() Price.stop("hub ditutup") end)
 end
 
+--// ===== 7g. AUTO BUY VEND =====
+do
+	local Buy = { running=false, gen=0, bought=0, spent=0, status="nonaktif" }
+	Hub.vendBuy = Buy
+	local Stock, Price = Hub.vendStock, Hub.vendPrice
+	function Buy.say(message)
+		if Buy.status == message then return end
+		Buy.status = message
+		if Buy.onStatus then pcall(Buy.onStatus, message) end
+	end
+	function Buy.stop(reason)
+		Buy.running = false
+		Buy.gen += 1
+		Buy.say(reason or "Auto Buy dimatikan")
+	end
+	function Buy.balance(inv)
+		-- The same currency denominations counted by the native vend purchase dialog.
+		local total = 0
+		for id, value in pairs({[242]=1, [1796]=100, [7188]=10000, [20049]=100000, [20050]=1000000}) do
+			local n = inv:count(id)
+			if type(n) ~= "number" or n ~= n or n < 0 or n % 1 ~= 0 or n > 200 then return nil end
+			total += n * value
+		end
+		return total
+	end
+	function Buy.load()
+		local filename = Price.filename
+		local prices, reason, raw = Hub.readVendPrices(filename)
+		if not prices then Buy.prices, Buy.raw = nil, nil; Buy.stop(reason); return false end
+		if raw ~= Buy.raw or filename ~= Buy.filename then Buy.prices, Buy.raw = prices, raw end
+		Buy.filename, Buy.checkAt = filename, os.clock() + 5
+		return true
+	end
+	function Buy.valid(job)
+		return Stock.valid(job, Buy)
+	end
+	function Buy.quote(job, x, y)
+		local w, c = job.world, job.context
+		local tile = job.grid[y] and job.grid[y][x]
+		local machine = tile and c.Items[tile]
+		if not machine or not machine.vend or machine.gemMachine or not w.atTile(x,y) or w.vendOwner(x,y) then return nil end
+		local vend = w.vends.get(x,y)
+		local item = vend and c.Items[vend.id]
+		local ref = item and item.kind == "seed" and Buy.prices[item.name]
+		if not ref or vend.shop or type(job.inv.room) ~= "function" then return nil end
+		for _, n in ipairs({vend.cost, vend.per, vend.stock}) do
+			if type(n) ~= "number" or n ~= n or n < 1 or n % 1 ~= 0 then return nil end
+		end
+		if type(vend.cost) ~= "number" or type(vend.per) ~= "number" or type(vend.stock) ~= "number"
+			or vend.cost > 100000 or vend.per > 200 or vend.stock > 10398 then return nil end
+		-- Compare WL per seed using integer products, including prices expressed in WL/seed.
+		if vend.cost * ref.per >= ref.cost * vend.per then return nil end
+		local money, room, count = Buy.balance(job.inv), job.inv:room(vend.id), job.inv:count(vend.id)
+		if not money or type(room) ~= "number" or room ~= room or room < 0 or room % 1 ~= 0
+			or type(count) ~= "number" or count ~= count or count < 0 or count > 200 or count % 1 ~= 0 then return nil end
+		local lots = math.min(math.floor(vend.stock / vend.per), math.floor(math.min(room, 200-count) / vend.per), math.floor(money / vend.cost))
+		if lots < 1 then return nil end
+		return {x=x, y=y, id=vend.id, tile=tile, name=item.name, cost=vend.cost, per=vend.per,
+			amount=lots*vend.per, payment=lots*vend.cost, count=count, money=money,
+			prices=Buy.prices, filename=Buy.filename, key=x..","..y}
+	end
+	function Buy.target(job)
+		if Buy.retryWorld ~= job.world or Buy.retryName ~= job.name or Buy.retryEntering ~= job.entering then
+			Buy.retryWorld, Buy.retryName, Buy.retryEntering = job.world, job.name, job.entering
+			Buy.retry = {}
+		end
+		local best, distance
+		for y=math.floor(job.context.py)-2,math.floor(job.context.py)+1 do
+			for x=math.floor(job.context.px)-2,math.floor(job.context.px)+1 do
+				if os.clock() < (Buy.retry[x..","..y] or 0) then continue end
+				local quote = Buy.quote(job,x,y)
+				if not quote then continue end
+				local d=(job.context.px-x-.5)^2+(job.context.py-y-1)^2
+				if not distance or d<distance then best,distance=quote,d end
+			end
+		end
+		return best
+	end
+	function Buy.step()
+		if Buy.pending then return end
+		if (Buy.filename ~= Price.filename or os.clock() >= (Buy.checkAt or 0)) and not Buy.load() then return end
+		if not Buy.prices then Buy.stop("muat file harga jualmu terlebih dahulu"); return end
+		if Stock.busy() then Buy.say("jeda selama farm, SSP, surgery, atau pemulihan aktif"); return end
+		local job = Stock.current()
+		if not job then Buy.say("menunggu karakter dan world siap"); return end
+		job.gen = Buy.gen
+		if job.world.__HumanHubVendPending then return end
+		local target=Buy.target(job)
+		if not target then
+			if os.clock() >= (Buy.showResultUntil or 0) then Buy.say("aktif: cari seed lebih murah; beli lot maksimal sesuai ruang, stok, dan saldo WL") end
+			return
+		end
+		local pending={done=false}
+		Buy.pending,job.world.__HumanHubVendPending=pending,pending
+		Buy.retry[target.key]=os.clock()+5
+		task.spawn(function()
+			local ok,err=pcall(function()
+				if not Buy.valid(job) or Stock.busy() or Buy.prices ~= target.prices or Price.filename ~= target.filename then return end
+				local current=Buy.quote(job,target.x,target.y)
+				if not current or current.id ~= target.id or current.tile ~= target.tile
+					or current.cost ~= target.cost or current.per ~= target.per then return end
+				-- Recalculate available lots immediately before sending, without increasing the original order.
+				local amount=math.min(target.amount,current.amount)
+				local payment=amount/current.per*current.cost
+				pending.amount,pending.payment=amount,payment
+				pending.sent=true
+				-- Native quoted-price protection rejects an intervening server price change.
+				pending.success=job.world.vendCall("buy",target.x,target.y,amount,{cost=current.cost,per=current.per})
+				if pending.success then
+					pending.verified=job.inv:count(target.id)==current.count+amount and Buy.balance(job.inv)==current.money-payment
+				end
+			end)
+			pending.error=not ok and tostring(err) or nil
+			pending.done=true
+			if Buy.pending==pending then Buy.pending=nil end
+			if job.world.__HumanHubVendPending==pending then job.world.__HumanHubVendPending=nil end
+		end)
+		local deadline=os.clock()+15
+		while not pending.done and os.clock()<deadline do
+			task.wait(.05)
+			if not Buy.valid(job) then return end
+		end
+		if not Buy.valid(job) then return end
+		if not pending.done then Buy.stop("server belum membalas pembelian; tunggu sebelum mengaktifkan lagi"); return end
+		if pending.error then Buy.stop("Auto Buy gagal: "..pending.error); return end
+		if pending.success then
+			if not pending.verified then Buy.stop("pembelian diterima; perubahan backpack/saldo belum cocok, periksa sebelum lanjut"); return end
+			Buy.bought+=pending.amount
+			Buy.spent+=pending.payment
+			Buy.showResultUntil=os.clock()+4
+			Buy.say(string.format("beli %d %s seharga %d WL | total %d seed, %d WL",pending.amount,target.name,pending.payment,Buy.bought,Buy.spent))
+		elseif pending.sent then Buy.say("pembelian ditolak atau harga berubah; mencoba lagi setelah jeda") end
+	end
+	function Buy.start()
+		if Buy.running then return true end
+		if Buy.pending then Buy.say("tunggu pembelian sebelumnya selesai"); return false end
+		if not Buy.load() then return false end
+		Buy.gen+=1
+		Buy.running,Buy.bought,Buy.spent=true,0,0
+		Buy.say("Auto Buy aktif: gunakan saldo WL untuk lot maksimal yang lebih murah")
+		local gen=Buy.gen
+		task.spawn(function()
+			while not Hub.dead and Buy.running and Buy.gen==gen do
+				local ok,err=pcall(Buy.step)
+				if not ok and Buy.gen==gen then Buy.stop("Auto Buy berhenti: "..tostring(err)) end
+				task.wait(.25)
+			end
+		end)
+		return true
+	end
+	Hub.onUnload(function() Buy.stop("hub ditutup") end)
+end
+
 --// ===== 8. UI (WindUI) =====
 local WINDUI_URL = "https://github.com/Footagesus/WindUI/releases/latest/download/main.lua"
 local WINDUI_CACHE = "HumanHub_WindUI.lua"
@@ -9068,6 +9221,29 @@ do
 			if on then Price.start() else Price.stop("Auto Change Price dimatikan") end
 			Price.onStatus(Price.status)
 		end })
+end
+
+-- ---- Vend Buy UI ----
+do
+	local Buy=Hub.vendBuy
+	local section=Hub.ui.vendTab:Section({Title="Auto Buy seed murah",Opened=true})
+	section:Paragraph({Title="Beli di vend orang saat lewat",
+		Desc="Memakai File harga web di atas sebagai acuan harga jualmu. Hanya beli seed yang harga per seed-nya lebih murah; harga sama/lebih mahal dan vend milikmu dilewati. Lot maksimal mengikuti kelipatan paket vend, stok tersedia, saldo WL termasuk pecahannya, dan ruang backpack sampai 200 seed per jenis. File diperiksa ulang tiap 5 detik."})
+	local status=section:Paragraph({Title="Status Auto Buy",Desc=Buy.status})
+	local toggle
+	Buy.onStatus=function(message)
+		if status and status.SetDesc then pcall(status.SetDesc,status,message) end
+		if toggle and toggle.Set and toggle.Value~=Buy.running then
+			Buy.syncingUI=true;pcall(toggle.Set,toggle,Buy.running,false);Buy.syncingUI=false
+		end
+	end
+	toggle=section:Toggle({Title="Auto Buy Vend Murah",Value=false,
+		Desc="Gunakan saldo WL untuk membeli lot maksimal saat melewati vend yang memenuhi acuan harga.",
+		Callback=function(on)
+			if Buy.syncingUI then return end
+			if on then Buy.start() else Buy.stop("Auto Buy dimatikan") end
+			Buy.onStatus(Buy.status)
+		end})
 end
 
 -- ---- Tab Info ----
