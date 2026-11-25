@@ -56,6 +56,23 @@ end)
 test('same and more expensive unit prices are skipped',function()
     for _,per in ipairs({80,70,1})do local t=setup({per=per});t.buy.step();assert(#t.calls==0)end
 end)
+test('seed per WL: exactly15percent, below15percent and only above15percent boundary',function()
+    for _,per in ipairs({99,100,101})do
+        local t=setup({per=per,data={format='ssp-vend-prices-v1',prices={{name='Cliffside Seed',cost=1,per=85}}}})
+        t.buy.step();assert(#t.calls==(per==101 and 1 or 0))
+    end
+end)
+test('WL per seed: exactly15percent is skipped and greater discount is bought',function()
+    for _,cost in ipairs({84,85,86})do
+        local t=setup({cost=cost,per=1,money=200,data={format='ssp-vend-prices-v1',prices={{name='Cliffside Seed',cost=100,per=1}}}})
+        t.buy.step();assert(#t.calls==(cost==84 and 1 or 0))
+    end
+end)
+test('a queued discount that falls to15percent is rejected before sending',function()
+    local t=setup({per=101,data={format='ssp-vend-prices-v1',prices={{name='Cliffside Seed',cost=1,per=85}}}})
+    local first=true;t.o.onWait=function()if first then first=false;t.vend.per=100 end end
+    t.buy.step();assert(#t.calls==0)
+end)
 test('buys only complete lots that fit backpack, stock and funds',function()
     for _,case in ipairs({{per=150,count=0,stock=1000,money=10,expected=150},{per=100,count=60,stock=1000,money=10,expected=100},{per=100,count=0,stock=150,money=10,expected=100},{per=100,count=0,stock=1000,money=1,expected=100}})do
         local t=setup(case);t.buy.step();assert(t.calls[1].amount==case.expected)
