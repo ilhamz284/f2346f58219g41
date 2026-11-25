@@ -31,7 +31,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.150",
+	version = "0.4.151",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -6744,36 +6744,49 @@ Swiss Cheese Block Seed
 		return per .. " seed / " .. cost .. " WL"
 	end
 
-	function Hub.compareVendPrices(filename)
-		if type(readfile) ~= "function" or type(writefile) ~= "function" then
-			return false, "Executor ini tidak mendukung baca dan tulis file."
+	function Hub.readVendPrices(filename)
+		if type(readfile) ~= "function" then
+			return nil, "Executor ini tidak mendukung baca file."
 		end
+		if type(filename) ~= "string" then return nil, "Isi nama file harga dashboard." end
 		filename = filename:match("^%s*(.-)%s*$")
 		if #filename > 120 or not filename:match("^ssp%-harga%-vend[%w _()%-]*%.json$") then
-			return false, "Isi nama file ssp-harga-vend.json dari dashboard."
+			return nil, "Isi nama file ssp-harga-vend.json dari dashboard."
 		end
 		local okRead, raw = pcall(readfile, filename)
 		if not okRead then
-			return false, "File tidak ditemukan. Pindahkan " .. filename .. " dari Downloads ke Hasil Scan Vend (Real)."
+			return nil, "File tidak ditemukan. Pindahkan " .. filename .. " dari Downloads ke Hasil Scan Vend (Real)."
 		end
-		if #raw > 256 * 1024 then return false, "File harga terlalu besar." end
+		if type(raw) ~= "string" or #raw > 256 * 1024 then return nil, "File harga terlalu besar atau tidak bisa dibaca." end
 		local okDecode, data = pcall(function() return http:JSONDecode(raw) end)
 		if not okDecode or type(data) ~= "table" or data.format ~= "ssp-vend-prices-v1"
 			or type(data.prices) ~= "table" or #data.prices < 1 or #data.prices > 149 then
-			return false, "Format file harga tidak cocok. Unduh lagi dari Daftar Seed di dashboard."
+			return nil, "Format file harga tidak cocok. Unduh lagi dari Daftar Seed di dashboard."
 		end
 		local prices = {}
 		for _, price in ipairs(data.prices) do
-			local rawName = type(price) == "table" and type(price.name) == "string" and price.name:lower()
+			local rawName = type(price) == "table" and type(price.name) == "string"
+				and price.name:lower():match("^%s*(.-)%s*$"):gsub("%s+", " ")
 			-- Older dashboard exports contained these two unverified SSP entries.
 			if rawName == "tangram block seed" or rawName == "tangram seed" or rawName == "command - move seed" then continue end
 			local name = rawName and sspSeedNames[rawName]
 			if not name or prices[name] or not vendNumber(price.cost, true) or not vendNumber(price.per, true)
 				or price.cost < 1 or price.per < 1 or (price.cost ~= 1 and price.per ~= 1) then
-				return false, "File harga berisi seed duplikat atau harga yang tidak valid."
+				return nil, "File harga berisi seed duplikat atau harga yang tidak valid."
 			end
-			prices[name] = price
+			if price.cost > 100000 or price.per > 200 then
+				return nil, name .. ": batas game adalah 200 seed/WL atau 100.000 WL/seed."
+			end
+			prices[name] = {name = name, cost = price.cost, per = price.per}
 		end
+		if not next(prices) then return nil, "File tidak berisi harga seed SSP yang didukung." end
+		return prices, nil, raw
+	end
+
+	function Hub.compareVendPrices(filename)
+		if type(writefile) ~= "function" then return false, "Executor ini tidak mendukung tulis file." end
+		local prices, reason = Hub.readVendPrices(filename)
+		if not prices then return false, reason end
 
 		local rows, world = scanVendRows()
 		if not rows then return false, world end
@@ -7100,9 +7113,10 @@ do
 		return { world = world, name = world.name, entering = world.entering,
 			context = context, inv = context.inv, grid = world.fg, gen = Stock.gen }
 	end
-	function Stock.valid(job)
+	function Stock.valid(job, owner)
+		owner = owner or Stock
 		local state = Bind.state()
-		return not Hub.dead and Stock.running and Stock.gen == job.gen
+		return not Hub.dead and owner.running and owner.gen == job.gen
 			and Bind.W == job.world and Bind.context == job.context and Bind.inv == job.inv
 			and job.context.world == job.world and job.context.inv == job.inv
 			and job.world.name == job.name and job.world.entering == job.entering
@@ -7219,6 +7233,151 @@ do
 		return true
 	end
 	Hub.onUnload(function() Stock.stop("hub ditutup") end)
+end
+
+--// ===== 7f. AUTO PRICE VEND =====
+do
+	local Price = { running = false, gen = 0, changed = 0, filename = "ssp-harga-vend.json", status = "belum memuat harga dashboard" }
+	Hub.vendPrice = Price
+	local Stock = Hub.vendStock
+	function Price.say(message)
+		if Price.status == message then return end
+		Price.status = message
+		if Price.onStatus then pcall(Price.onStatus, message) end
+	end
+	function Price.stop(reason)
+		Price.running = false
+		Price.gen += 1
+		Price.say(reason or "Auto Change Price dimatikan")
+	end
+	function Price.setFilename(filename)
+		filename = tostring(filename or ""):match("^%s*(.-)%s*$")
+		if filename == Price.filename then return end
+		Price.stop("file harga berubah; muat ulang sebelum mengaktifkan")
+		Price.filename, Price.prices, Price.raw = filename, nil, nil
+	end
+	function Price.load()
+		local prices, reason, raw = Hub.readVendPrices(Price.filename)
+		if not prices then
+			Price.prices, Price.raw = nil, nil
+			Price.stop(reason)
+			return false
+		end
+		if raw ~= Price.raw then Price.prices, Price.raw = prices, raw end
+		Price.checkAt = os.clock() + 5
+		local count = 0
+		for _ in pairs(Price.prices) do count += 1 end
+		Price.say(string.format("%d harga dashboard dimuat dari %s", count, Price.filename))
+		return true
+	end
+	function Price.valid(job)
+		return Stock.valid(job, Price)
+	end
+	function Price.target(job)
+		local world, context = job.world, job.context
+		if Price.retryWorld ~= world or Price.retryName ~= job.name or Price.retryEntering ~= job.entering then
+			Price.retryWorld, Price.retryName, Price.retryEntering = world, job.name, job.entering
+			Price.retry = {}
+		end
+		local best, distance
+		for y = math.floor(context.py) - 2, math.floor(context.py) + 1 do
+			for x = math.floor(context.px) - 2, math.floor(context.px) + 1 do
+				local tile = job.grid[y] and job.grid[y][x]
+				local machine = tile and context.Items[tile]
+				local key = x .. "," .. y
+				if not machine or not machine.vend or machine.gemMachine
+					or os.clock() < (Price.retry[key] or 0) or not world.atTile(x, y) or not world.vendOwner(x, y) then continue end
+				local vend = world.vends.get(x, y)
+				local item = vend and context.Items[vend.id]
+				local price = item and item.kind == "seed" and Price.prices[item.name]
+				if not price or (vend.cost == price.cost and vend.per == price.per) then continue end
+				local d = (context.px - x - .5)^2 + (context.py - y - 1)^2
+				if not distance or d < distance then
+					distance = d
+					best = {x=x, y=y, id=vend.id, tile=tile, key=key, price=price, prices=Price.prices}
+				end
+			end
+		end
+		return best
+	end
+	function Price.step()
+		if Price.pending then return end
+		if os.clock() >= (Price.checkAt or 0) and not Price.load() then return end
+		if not Price.prices then Price.stop("muat file harga dashboard terlebih dahulu"); return end
+		if Stock.busy() then Price.say("jeda selama fitur farm, SSP, surgery, atau pemulihan aktif"); return end
+		local job = Stock.current()
+		if not job then Price.say("menunggu karakter dan world siap"); return end
+		job.gen = Price.gen
+		if job.world.__HumanHubVendPending then return end
+		local target = Price.target(job)
+		if not target then
+			if os.clock() >= (Price.showResultUntil or 0) then Price.say("aktif: harga vend mengikuti file dashboard; file diperiksa tiap 5 detik") end
+			return
+		end
+		local pending = {done=false}
+		Price.pending, job.world.__HumanHubVendPending = pending, pending
+		Price.retry[target.key] = os.clock() + 5
+		task.spawn(function()
+			local ok, err = pcall(function()
+				if not Price.valid(job) or Stock.busy() or Price.prices ~= target.prices
+					or not job.world.atTile(target.x, target.y) or not job.world.vendOwner(target.x, target.y) then return end
+				local vend = job.world.vends.get(target.x, target.y)
+				if not vend or vend.id ~= target.id or not job.grid[target.y]
+					or job.grid[target.y][target.x] ~= target.tile
+					or (vend.cost == target.price.cost and vend.per == target.price.per) then return end
+				pending.sent = true
+				pending.success = job.world.vendCall("price", target.x, target.y, target.price.cost, target.price.per)
+				if not pending.success then return end
+				-- The price is replicated through VendChanged; wait briefly for confirmation.
+				local untilUpdate = os.clock() + 3
+				repeat
+					local current = job.world.vends.get(target.x, target.y)
+					if current and current.id == target.id and current.cost == target.price.cost and current.per == target.price.per then
+						pending.verified = true; break
+					end
+					if not Price.valid(job) then break end
+					task.wait(.05)
+				until os.clock() >= untilUpdate
+			end)
+			pending.error = not ok and tostring(err) or nil
+			pending.done = true
+			if Price.pending == pending then Price.pending = nil end
+			if job.world.__HumanHubVendPending == pending then job.world.__HumanHubVendPending = nil end
+		end)
+		local deadline = os.clock() + 15
+		while not pending.done and os.clock() < deadline do
+			task.wait(.05)
+			if not Price.valid(job) then return end
+		end
+		if not Price.valid(job) then return end
+		if not pending.done then Price.stop("server belum membalas harga; tunggu sebelum menyalakan kembali"); return end
+		if pending.error then Price.stop("gagal mengubah harga: " .. pending.error); return end
+		if pending.success then
+			if not pending.verified then Price.stop("server menerima request; harga belum terkonfirmasi, periksa vend"); return end
+			Price.changed += 1
+			Price.showResultUntil = os.clock() + 4
+			local text = target.price.cost == 1 and (target.price.per .. " seed/WL") or (target.price.cost .. " WL/seed")
+			Price.say(string.format("%s -> %s (%d,%d) | %d vend diubah", target.price.name, text, target.x, target.y, Price.changed))
+		elseif pending.sent then Price.say("vend menolak perubahan harga; mencoba lagi setelah jeda") end
+	end
+	function Price.start()
+		if Price.running then return true end
+		if Price.pending then Price.say("tunggu request harga sebelumnya selesai"); return false end
+		if not Price.load() then return false end
+		Price.gen += 1
+		Price.running, Price.changed = true, 0
+		local gen = Price.gen
+		Price.say("Auto Change Price aktif")
+		task.spawn(function()
+			while not Hub.dead and Price.running and Price.gen == gen do
+				local ok, err = pcall(Price.step)
+				if not ok and Price.gen == gen then Price.stop("Auto Change Price berhenti: " .. tostring(err)) end
+				task.wait(.25)
+			end
+		end)
+		return true
+	end
+	Hub.onUnload(function() Price.stop("hub ditutup") end)
 end
 
 --// ===== 8. UI (WindUI) =====
@@ -8860,6 +9019,7 @@ end)
 do
 	local Stock = Hub.vendStock
 	local vendTab = Window:Tab({ Title = "Vend", Icon = "store" })
+	Hub.ui.vendTab = vendTab
 	local section = vendTab:Section({ Title = "Auto Stock", Opened = true })
 	section:Paragraph({ Title = "Lewati vend untuk mengisi stok",
 		Desc = "Seed di backpack otomatis ditambahkan ke vend milikmu saat kamu lewat tepat di dekatnya. Jenis seed mengikuti isi vend, termasuk vend stok 0 yang masih menyimpan ID barang. Vend tanpa jenis barang dilewati. Jumlah mengikuti isi backpack dan kapasitas mesin. Jeda otomatis selama farm, Open SSP, atau surgery berjalan." })
@@ -8879,6 +9039,34 @@ do
 			if Stock.syncingUI then return end
 			if on then Stock.start() else Stock.stop("Auto Stock dimatikan") end
 			Stock.onStatus(Stock.status)
+		end })
+end
+
+-- ---- Vend Price UI ----
+do
+	local Price = Hub.vendPrice
+	local section = Hub.ui.vendTab:Section({ Title = "Harga dari dashboard", Opened = true })
+	section:Paragraph({ Title = "Samakan harga saat lewat",
+		Desc = "Di web, terapkan median/rata-rata jika diinginkan, lalu klik Unduh harga untuk Human Hub. Pindahkan ssp-harga-vend.json ke Hasil Scan Vend (Real), muat di sini, lalu aktifkan. Vend milikmu mengikuti harga Daftar Seed dalam file; seed tanpa harga dilewati. Ganti file saat harga web diperbarui; file diperiksa otomatis tiap 5 detik." })
+	local status = section:Paragraph({ Title = "Status Auto Change Price", Desc = Price.status })
+	local toggle
+	Price.onStatus = function(message)
+		if status and status.SetDesc then pcall(status.SetDesc, status, message) end
+		if toggle and toggle.Set and toggle.Value ~= Price.running then
+			Price.syncingUI = true
+			pcall(toggle.Set, toggle, Price.running, false)
+			Price.syncingUI = false
+		end
+	end
+	section:Input({ Title = "File harga web", Value = Price.filename, Placeholder = "ssp-harga-vend.json",
+		Callback = function(value) Price.setFilename(value) end })
+	section:Button({ Title = "Muat harga dashboard", Callback = function() Price.load() end })
+	toggle = section:Toggle({ Title = "Auto Change Price", Value = false,
+		Desc = "Saat melewati vend, ubah hanya harga yang berbeda. Bisa aktif bersama Auto Stock.",
+		Callback = function(on)
+			if Price.syncingUI then return end
+			if on then Price.start() else Price.stop("Auto Change Price dimatikan") end
+			Price.onStatus(Price.status)
 		end })
 end
 

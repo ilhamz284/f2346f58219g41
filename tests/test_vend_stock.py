@@ -3,10 +3,10 @@ from pathlib import Path
 import subprocess, sys, tempfile
 root=Path(__file__).resolve().parents[1]
 s=(root/'hub.luau').read_text(encoding='utf-8-sig')
-module=s.split('--// ===== 7e. AUTO STOCK VEND =====',1)[1].split('--// ===== 8. UI',1)[0]
-ui=s.split('-- ---- Tab Vend ----',1)[1].split('-- ---- Tab Info ----',1)[0]
+module=s.split('--// ===== 7e. AUTO STOCK VEND =====',1)[1].split('--// ===== 7f. AUTO PRICE VEND =====',1)[0]
+ui=s.split('-- ---- Tab Vend ----',1)[1].split('-- ---- Vend Price UI ----',1)[0]
 program='local function make(env)\nlocal Hub,Bind,Farm,PNB,Factory,Surgery,task,os,worldPickerVisible=env.Hub,env.Bind,env.Farm,env.PNB,env.Factory,env.Surgery,env.task,env.os,env.worldPickerVisible\n'+module+'\nreturn Hub.vendStock\nend\n'
-program+='local function makeUI(Hub,section)\nlocal Window={Tab=function(_,v)assert(v.Title=="Vend");return {Section=function()return section end}end}\n'+ui+'\nend\n'
+program+='local function makeUI(Hub,section)\nHub.ui={}\nlocal Window={Tab=function(_,v)assert(v.Title=="Vend");return {Section=function()return section end}end}\n'+ui+'\nend\n'
 program+=(root/'tests/vend_stock_spec.luau').read_text()
 with tempfile.TemporaryDirectory(prefix='humanhub-vend-') as directory:
     p=Path(directory)/'test.luau';p.write_text(program,encoding='utf-8')
