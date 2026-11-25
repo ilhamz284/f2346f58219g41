@@ -6,7 +6,7 @@ import tempfile
 
 root = Path(__file__).resolve().parents[1]
 source = (root / 'hub.luau').read_text(encoding='utf-8-sig')
-module = source.split('--// ===== 7d. AUTO OPEN SSP =====', 1)[1].split('--// ===== 8. UI', 1)[0]
+module = source.split('--// ===== 7d. AUTO OPEN SSP =====', 1)[1].split('--// ===== 7e. AUTO STOCK VEND =====', 1)[0]
 suite = (root / 'tests/open_ssp_spec.luau').read_text(encoding='utf-8')
 ui = source.split('-- ---- Tab SSP ----', 1)[1].split('-- ---- Tab Auto Farming ----', 1)[0]
 program = 'local function make(env)\nlocal Hub,Bind,Farm,PNB,Factory,Surgery,Move,task,os,worldPickerVisible,dropInReach = env.Hub,env.Bind,env.Farm,env.PNB,env.Factory,env.Surgery,env.Move,env.task,env.os,env.worldPickerVisible,env.dropInReach\n'+module+'\nreturn Hub.ssp\nend\n'

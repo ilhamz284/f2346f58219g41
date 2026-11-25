@@ -31,7 +31,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.149",
+	version = "0.4.150",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -7072,6 +7072,155 @@ do
 	Hub.onUnload(function() SSP.stop("hub ditutup") end)
 end
 
+--// ===== 7e. AUTO STOCK VEND =====
+do
+	local Stock = { running = false, gen = 0, stocked = 0, status = "nonaktif" }
+	Hub.vendStock = Stock
+	function Stock.say(message)
+		if Stock.status == message then return end
+		Stock.status = message
+		if Stock.onStatus then pcall(Stock.onStatus, message) end
+	end
+	function Stock.stop(reason)
+		Stock.running = false
+		Stock.gen += 1
+		Stock.say(reason or "Auto Stock dimatikan")
+	end
+	function Stock.current()
+		Bind.resolve()
+		local world, state, context = Bind.W, Bind.state(), Bind.context
+		if not world or not state or not state.active or state.dead or worldPickerVisible()
+			or not context or context.world ~= world or context.inv ~= Bind.inv
+			or type(context.Items) ~= "table" or type(context.inv) ~= "table"
+			or type(context.inv.count) ~= "function" or type(world.fg) ~= "table"
+			or type(world.vends) ~= "table" or type(world.vends.get) ~= "function"
+			or type(world.atTile) ~= "function" or type(world.vendOwner) ~= "function"
+			or type(world.vendCall) ~= "function" or type(context.px) ~= "number"
+			or type(context.py) ~= "number" then return nil end
+		return { world = world, name = world.name, entering = world.entering,
+			context = context, inv = context.inv, grid = world.fg, gen = Stock.gen }
+	end
+	function Stock.valid(job)
+		local state = Bind.state()
+		return not Hub.dead and Stock.running and Stock.gen == job.gen
+			and Bind.W == job.world and Bind.context == job.context and Bind.inv == job.inv
+			and job.context.world == job.world and job.context.inv == job.inv
+			and job.world.name == job.name and job.world.entering == job.entering
+			and job.world.fg == job.grid and state and state.active and not state.dead
+			and not worldPickerVisible()
+	end
+	function Stock.busy()
+		local saved = Hub.recovery.read()
+		return Farm.running or PNB.running or Factory.running or Surgery.running
+			or (Hub.ssp and Hub.ssp.running) or (saved and saved.world)
+	end
+	function Stock.target(job)
+		local world, context = job.world, job.context
+		if Stock.cooldownWorld ~= world or Stock.cooldownName ~= job.name or Stock.cooldownEntering ~= job.entering then
+			Stock.cooldownWorld, Stock.cooldownName, Stock.cooldownEntering = world, job.name, job.entering
+			Stock.retry = {}
+		end
+		local best, distance
+		-- Only examine the few tiles at the player's feet, using the native reach check.
+		for y = math.floor(context.py) - 2, math.floor(context.py) + 1 do
+			for x = math.floor(context.px) - 2, math.floor(context.px) + 1 do
+				local tile = job.grid[y] and job.grid[y][x]
+				local machine = tile and context.Items[tile]
+				if not machine or not machine.vend or machine.gemMachine then continue end
+				local key = x .. "," .. y
+				if os.clock() < (Stock.retry[key] or 0) or not world.atTile(x, y) or not world.vendOwner(x, y) then continue end
+				local vend = world.vends.get(x, y)
+				local item = vend and context.Items[vend.id]
+				-- A configured item ID is required even when the machine has zero stock.
+				if not item or item.kind ~= "seed" or type(vend.stock) ~= "number"
+					or vend.stock ~= vend.stock or vend.stock < 0 or vend.stock % 1 ~= 0 then continue end
+				local count = job.inv:count(vend.id)
+				local amount = math.min(count, (tile == 9268 and 10398 or 5199) - vend.stock)
+				if amount < 1 or amount % 1 ~= 0 then continue end
+				local d = (context.px - x - 0.5)^2 + (context.py - y - 1)^2
+				if not distance or d < distance then
+					distance = d
+					best = {x = x, y = y, id = vend.id, amount = amount, count = count,
+						tile = tile, stock = vend.stock, key = key, name = item.name}
+				end
+			end
+		end
+		return best
+	end
+	function Stock.step()
+		if Stock.pending then return end
+		if Stock.busy() then Stock.say("jeda selama fitur farm, SSP, surgery, atau pemulihan aktif"); return end
+		local job = Stock.current()
+		if not job then Stock.say("menunggu karakter dan world siap"); return end
+		if job.world.__HumanHubVendPending then Stock.say("menunggu stok dari proses sebelumnya selesai"); return end
+		local target = Stock.target(job)
+		if not target then
+			if os.clock() >= (Stock.showResultUntil or 0) then
+				Stock.say("aktif: lewati vend milikmu yang berisi seed sesuai backpack")
+			end
+			return
+		end
+		local pending = {done = false}
+		Stock.pending, job.world.__HumanHubVendPending = pending, pending
+		Stock.retry[target.key] = os.clock() + 5
+		task.spawn(function()
+			-- Recheck after scheduling: the player or the machine can change before this runs.
+			local ok, err = pcall(function()
+				if not Stock.valid(job) or Stock.busy() or not job.world.atTile(target.x, target.y)
+					or not job.world.vendOwner(target.x, target.y) then return end
+				local vend = job.world.vends.get(target.x, target.y)
+				if not vend or vend.id ~= target.id or vend.stock ~= target.stock
+					or not job.grid[target.y] or job.grid[target.y][target.x] ~= target.tile then return end
+				target.count = job.inv:count(target.id)
+				local amount = math.min(target.amount, target.count)
+				if amount < 1 then return end
+				pending.sent = true
+				pending.amount = amount
+				-- Native vendCall applies the server's remove/add inventory response once.
+				pending.success = job.world.vendCall("stock", target.x, target.y, target.id, amount)
+				pending.after = job.inv:count(target.id)
+			end)
+			pending.error = not ok and tostring(err) or nil
+			pending.done = true
+			if Stock.pending == pending then Stock.pending = nil end
+			if job.world.__HumanHubVendPending == pending then job.world.__HumanHubVendPending = nil end
+		end)
+		local deadline = os.clock() + 15
+		while not pending.done and os.clock() < deadline do
+			task.wait(0.05)
+			if not Stock.valid(job) then return end
+		end
+		if not Stock.valid(job) then return end
+		if not pending.done then Stock.stop("server belum membalas; tunggu sebelum menyalakan kembali"); return end
+		if pending.error then Stock.stop("gagal menambah stok: " .. pending.error); return end
+		if pending.success then
+			if pending.after ~= target.count - pending.amount then
+				Stock.stop("stok terproses; perubahan backpack belum cocok, periksa sebelum lanjut"); return
+			end
+			Stock.stocked += pending.amount
+			Stock.showResultUntil = os.clock() + 4
+			Stock.say(string.format("+%d %s ke vend (%d,%d) | total %d", pending.amount, target.name, target.x, target.y, Stock.stocked))
+		elseif pending.sent then Stock.say("vend menolak stok; mencoba lagi setelah jeda") end
+	end
+	function Stock.start()
+		if Stock.running then return true end
+		if Stock.pending then Stock.say("tunggu request stok sebelumnya selesai"); return false end
+		Stock.gen += 1
+		Stock.running, Stock.stocked = true, 0
+		Stock.say("Auto Stock aktif")
+		local gen = Stock.gen
+		task.spawn(function()
+			while not Hub.dead and Stock.running and Stock.gen == gen do
+				local ok, err = pcall(Stock.step)
+				if not ok and Stock.gen == gen then Stock.stop("Auto Stock berhenti: " .. tostring(err)) end
+				task.wait(0.25)
+			end
+		end)
+		return true
+	end
+	Hub.onUnload(function() Stock.stop("hub ditutup") end)
+end
+
 --// ===== 8. UI (WindUI) =====
 local WINDUI_URL = "https://github.com/Footagesus/WindUI/releases/latest/download/main.lua"
 local WINDUI_CACHE = "HumanHub_WindUI.lua"
@@ -8706,6 +8855,32 @@ task.spawn(function()
 		Guard.tick()
 	end
 end)
+
+-- ---- Tab Vend ----
+do
+	local Stock = Hub.vendStock
+	local vendTab = Window:Tab({ Title = "Vend", Icon = "store" })
+	local section = vendTab:Section({ Title = "Auto Stock", Opened = true })
+	section:Paragraph({ Title = "Lewati vend untuk mengisi stok",
+		Desc = "Seed di backpack otomatis ditambahkan ke vend milikmu saat kamu lewat tepat di dekatnya. Jenis seed mengikuti isi vend, termasuk vend stok 0 yang masih menyimpan ID barang. Vend tanpa jenis barang dilewati. Jumlah mengikuti isi backpack dan kapasitas mesin. Jeda otomatis selama farm, Open SSP, atau surgery berjalan." })
+	local status = section:Paragraph({ Title = "Status Auto Stock", Desc = Stock.status })
+	local toggle
+	Stock.onStatus = function(message)
+		if status and status.SetDesc then pcall(status.SetDesc, status, message) end
+		if toggle and toggle.Set and toggle.Value ~= Stock.running then
+			Stock.syncingUI = true
+			pcall(toggle.Set, toggle, Stock.running, false)
+			Stock.syncingUI = false
+		end
+	end
+	toggle = section:Toggle({ Title = "Auto Stock Vend", Value = false,
+		Desc = "Isi seluruh seed yang cocok tanpa membuka vend atau mengetik jumlah.",
+		Callback = function(on)
+			if Stock.syncingUI then return end
+			if on then Stock.start() else Stock.stop("Auto Stock dimatikan") end
+			Stock.onStatus(Stock.status)
+		end })
+end
 
 -- ---- Tab Info ----
 do
