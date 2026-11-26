@@ -31,7 +31,7 @@
 
 --// ===== 0. STATE HUB & BERSIH-BERSIH =====
 local Hub = {
-	version = "0.4.155",
+	version = "0.4.156",
 	conns = {},
 	unload = {},
 	ui = {},
@@ -7146,7 +7146,7 @@ do
 				local vend = world.vends.get(x, y)
 				local item = vend and context.Items[vend.id]
 				-- A configured item ID is required even when the machine has zero stock.
-				if not item or item.kind ~= "seed" or type(vend.stock) ~= "number"
+				if not item or item.kind == "tool" or type(vend.stock) ~= "number"
 					or vend.stock ~= vend.stock or vend.stock < 0 or vend.stock % 1 ~= 0 then continue end
 				local count = job.inv:count(vend.id)
 				local amount = math.min(count, (tile == 9268 and 10398 or 5199) - vend.stock)
@@ -7170,7 +7170,7 @@ do
 		local target = Stock.target(job)
 		if not target then
 			if os.clock() >= (Stock.showResultUntil or 0) then
-				Stock.say("aktif: lewati vend milikmu yang berisi seed sesuai backpack")
+				Stock.say("aktif: lewati vend milikmu yang berisi barang sesuai backpack")
 			end
 			return
 		end
@@ -9317,7 +9317,7 @@ do
 	Hub.ui.vendTab = vendTab
 	local section = vendTab:Section({ Title = "Auto Stock", Opened = true })
 	section:Paragraph({ Title = "Lewati vend untuk mengisi stok",
-		Desc = "Seed di backpack otomatis ditambahkan ke vend milikmu saat kamu lewat tepat di dekatnya. Jenis seed mengikuti isi vend, termasuk vend stok 0 yang masih menyimpan ID barang. Vend tanpa jenis barang dilewati. Jumlah mengikuti isi backpack dan kapasitas mesin. Jeda otomatis selama farm, Open SSP, atau surgery berjalan." })
+		Desc = "Barang di backpack otomatis ditambahkan ke vend milikmu saat kamu lewat tepat di dekatnya, termasuk seed, blok, pakaian, pack, dan alat surgery. Jenis barang mengikuti isi vend, termasuk vend stok 0 yang masih menyimpan ID barang. Vend tanpa jenis barang dan tool yang tidak bisa dijual dilewati. Jumlah mengikuti isi backpack dan kapasitas mesin. Jeda otomatis selama farm, Open SSP, atau surgery berjalan." })
 	local status = section:Paragraph({ Title = "Status Auto Stock", Desc = Stock.status })
 	local toggle
 	Stock.onStatus = function(message)
@@ -9329,7 +9329,7 @@ do
 		end
 	end
 	toggle = section:Toggle({ Title = "Auto Stock Vend", Value = false,
-		Desc = "Isi seluruh seed yang cocok tanpa membuka vend atau mengetik jumlah.",
+		Desc = "Isi seluruh barang yang cocok tanpa membuka vend atau mengetik jumlah.",
 		Callback = function(on)
 			if Stock.syncingUI then return end
 			if on then Stock.start() else Stock.stop("Auto Stock dimatikan") end

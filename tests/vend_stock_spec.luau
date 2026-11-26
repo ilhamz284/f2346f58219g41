@@ -48,10 +48,21 @@ end)
 test('zero-stock vend with known item can be refilled',function()
     local t=setup({stock=0});t.stock.step();assert(#t.calls==1 and t.vend.stock==9)
 end)
-test('unconfigured, full, wrong-item and currency machines are skipped',function()
-    for _,edit in ipairs({function(t)t.vend.id=nil end,function(t)t.vend.stock=5199 end,function(t)t.vend.id=17 end,function(t)t.vend.id=999;t.inv.counts[999]=20 end,function(t)t.vend.stock=-1 end})do
+test('unconfigured, full and wrong-item machines are skipped',function()
+    for _,edit in ipairs({function(t)t.vend.id=nil end,function(t)t.vend.stock=5199 end,function(t)t.vend.id=17 end,function(t)t.vend.stock=-1 end})do
         local t=setup();edit(t);t.stock.step();assert(#t.calls==0)
     end
+end)
+test('all vendable item categories including surgery and currency restock by matching ID',function()
+    for _,kind in ipairs({'consumable','misc','block','background','cloth','currency'})do
+        local t=setup();t.context.Items[13].kind=kind;t.context.Items[13].name='Surgical Clamp'
+        t.stock.step();assert(#t.calls==1 and t.inv:count(13)==0 and t.vend.stock==49)
+    end
+end)
+test('non-seed items respect capacity while non-vendable tool is skipped',function()
+    local t=setup({count=200,stock=5195});t.context.Items[13].kind='consumable'
+    t.stock.step();assert(t.calls[1][5]==4 and t.inv:count(13)==196)
+    t=setup();t.context.Items[13].kind='tool';t.stock.step();assert(#t.calls==0)
 end)
 test('foreign worlds, far machines, gem machines and non-vend tiles are skipped',function()
     for _,edit in ipairs({function(t)t.o.foreign=true end,function(t)t.context.px=5.4 end,function(t)t.world.fg[5][4]=123 end,function(t)t.world.fg[5][4]=0 end})do
